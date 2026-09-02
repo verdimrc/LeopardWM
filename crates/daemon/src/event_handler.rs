@@ -18,6 +18,12 @@ use tracing::{debug, info, warn};
 pub(crate) const SNAPBACK_SETTLE_AFTER_CREATE: std::time::Duration =
     std::time::Duration::from_millis(2000);
 
+/// Tolerance in pixels for the position-based spurious-event filter.
+/// Real user drags and app self-resizes are typically tens to hundreds of
+/// pixels off; DPI rounding and custom chrome create small deltas we don't
+/// want to chase.
+pub(crate) const POSITION_EPSILON_PX: i32 = 20;
+
 /// How recently a window must have been seen maximized to defer snapping it back
 /// while settling.
 pub(crate) const SNAPBACK_MAXIMIZE_GRACE: std::time::Duration =
@@ -2395,7 +2401,24 @@ impl AppState {
         if moved_or_resized_decision(lifecycle, self.should_suppress_moved_or_resized(hwnd))
             == MovedOrResizedDecision::Suppress
         {
-            return;
+            // The suppression window blocks echoes from our own SetWindowPos, but
+            // an app that resizes itself in response to WM_SIZE also arrives here
+            // within the same window. If the window has drifted from its placed
+            // rect in size, let it through so snap-back can correct it.
+            let expected = self.last_placed_layout_rects.get(&hwnd).copied();
+            let drifted = expected.is_some_and(|exp| {
+                leopardwm_platform_win32::get_window_visible_rect(hwnd).is_some_and(|actual| {
+                    (actual.width - exp.width).abs() > POSITION_EPSILON_PX
+                        || (actual.height - exp.height).abs() > POSITION_EPSILON_PX
+                })
+            });
+            if !drifted {
+                return;
+            }
+            debug!(
+                "Window {} resized during suppression window — overriding suppression for snap-back",
+                hwnd
+            );
         }
         // During active border resize: show ghost preview of the snap target
         // for tiled windows, or update border for floating windows.
@@ -2509,7 +2532,6 @@ impl AppState {
                 // all create small legitimate deltas we don't want to
                 // chase. Real user drags are typically tens to hundreds
                 // of pixels off, so 20px comfortably separates them.
-                const POSITION_EPSILON_PX: i32 = 20;
                 let expected = self.last_placed_layout_rects.get(&hwnd).copied();
                 let dwm_actual = leopardwm_platform_win32::get_window_visible_rect(hwnd);
                 // Cross-check with GetWindowRect — for Chromium /
