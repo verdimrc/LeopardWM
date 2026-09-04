@@ -507,6 +507,16 @@ pub(crate) struct AppState {
     /// doctor`). Kept until the window dies so it's never re-tiled and the user
     /// is notified only once. Session-only, never persisted.
     pub(crate) elevation_blocked: HashMap<u64, String>,
+    /// Windows whose Created event fired but lookup_window_info returned None
+    /// (transient race: zero size, WS_EX_NOACTIVATE still set, GetWindowRect
+    /// failure, etc.). Retried on the next MovedOrResized within 2 seconds.
+    /// Cleared on Destroyed to avoid stale entries.
+    pub(crate) pending_create_retry: HashMap<u64, std::time::Instant>,
+    /// After a cross-monitor window move, the target monitor and the time of
+    /// the move. Used to suppress spurious focus events that would otherwise
+    /// reset `focused_monitor` back to the source monitor while Windows
+    /// re-focuses the window on the destination.
+    pub(crate) move_to_monitor_target: Option<(MonitorId, std::time::Instant)>,
     /// Column width a tiled window had when it was hidden, keyed by HWND, so a
     /// window that disappears and reappears (e.g. a third-party virtual-desktop
     /// tool hiding/showing windows on switch) re-tiles at its prior width
@@ -860,6 +870,8 @@ impl AppState {
             recently_hidden_hwnds: HashMap::new(),
             pending_edit_config_pull: None,
             elevation_blocked: HashMap::new(),
+            pending_create_retry: HashMap::new(),
+            move_to_monitor_target: None,
             hidden_column_widths: HashMap::new(),
             move_origins: HashMap::new(),
             stashed_monitor_layouts: HashMap::new(),

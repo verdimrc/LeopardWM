@@ -360,6 +360,12 @@ impl Workspace {
         self.columns.get(index)
     }
 
+    /// Return the stored width of the tiled column containing `window_id`.
+    pub fn column_width_for_window(&self, window_id: WindowId) -> Option<i32> {
+        let (col_idx, _) = self.find_window_location(window_id)?;
+        self.columns.get(col_idx).map(|c| c.width)
+    }
+
     /// Find a window's location in the workspace.
     /// Returns (column_index, window_index_in_column) if found.
     pub fn find_window_location(&self, window_id: WindowId) -> Option<(usize, usize)> {

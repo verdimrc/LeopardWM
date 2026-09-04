@@ -765,9 +765,12 @@ impl AppState {
             match self.move_focused_window_to_monitor_transactional(target_id) {
                 Ok(Some(hwnd)) => {
                     info!("Moved window {} to monitor {}", hwnd, target_id);
+                    self.move_to_monitor_target =
+                        Some((target_id, std::time::Instant::now()));
                     if let Err(e) = self.apply_layout() {
                         return IpcResponse::error(format!("Failed to apply layout: {}", e));
                     }
+                    self.moved_or_resized_suppression.remove(&hwnd);
                     self.sync_foreground_window();
                 }
                 Ok(None) => info!("No focused window to move"),

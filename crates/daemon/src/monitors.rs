@@ -432,16 +432,22 @@ impl AppState {
                 .add_floating(window_id, translated_rect)
                 .map_err(|e| format!("Failed to add floating window to target: {}", e))?;
         } else {
+            let source_column_width = source_workspace.column_width_for_window(window_id);
             source_workspace
                 .remove_window(window_id)
                 .map_err(|e| format!("Failed to remove window: {}", e))?;
             target_workspace
-                .insert_window(window_id, None)
+                .insert_window(window_id, source_column_width)
                 .map_err(|e| format!("Failed to add window to target: {}", e))?;
         }
 
         let target_viewport = self.viewport_width_for(target_monitor);
         if !is_floating {
+            // Cancel any in-flight scroll animation so ensure_focused_visible's
+            // scroll_offset is what compute_placements_animated actually reads.
+            // If an animation is active, effective_scroll_offset() returns the
+            // animation's stale position instead of the newly computed offset.
+            target_workspace.stop_animation();
             target_workspace.ensure_focused_visible(target_viewport);
         }
 

@@ -549,6 +549,8 @@ impl AppState {
 
         // Try to get window info for filtering and monitor assignment
         if let Some(win_info) = self.lookup_window_info(hwnd) {
+            // Clear any pending retry — window is now ready, we'll manage it below.
+            self.pending_create_retry.remove(&hwnd);
             // Skip shell-cloaked windows (suspended UWP frames, windows
             // on other virtual desktops). These are valid HWNDs with
             // WS_VISIBLE but no rendered content.
@@ -861,6 +863,13 @@ impl AppState {
                     debug!("Failed to add window {} to workspace", hwnd);
                 }
             }
+        } else {
+            // lookup_window_info returned None: the window exists but isn't
+            // ready yet (zero size, WS_EX_NOACTIVATE still set, GetWindowRect
+            // failure, etc.). Queue a retry so the next time the window moves
+            // or resizes we get another creation attempt.
+            debug!("Window {} not ready at create time — queued for retry on next move/resize", hwnd);
+            self.pending_create_retry.insert(hwnd, std::time::Instant::now());
         }
     }
 
@@ -961,6 +970,7 @@ impl AppState {
         // entries for windows that no longer exist.
         self.last_placed_layout_rects.remove(&hwnd);
         self.application_fullscreen.remove(&hwnd);
+        self.pending_create_retry.remove(&hwnd);
 
         // Drop any cached overview snapshot for the same reason.
         leopardwm_platform_win32::snapshot::snapshot_remove(hwnd);
@@ -1278,7 +1288,26 @@ impl AppState {
         monitor_id: leopardwm_platform_win32::MonitorId,
         ws_idx: usize,
     ) {
-        self.focused_monitor = monitor_id;
+        const MOVE_FOCUS_LOCK_MS: u128 = 500;
+        match self.move_to_monitor_target {
+            Some((lock_monitor, locked_at))
+                if locked_at.elapsed().as_millis() < MOVE_FOCUS_LOCK_MS =>
+            {
+                if monitor_id != lock_monitor {
+                    debug!(
+                        "Suppressing focused_monitor update to {} (locked to {} after monitor move)",
+                        monitor_id, lock_monitor
+                    );
+                } else {
+                    self.move_to_monitor_target = None;
+                    self.focused_monitor = monitor_id;
+                }
+            }
+            _ => {
+                self.move_to_monitor_target = None;
+                self.focused_monitor = monitor_id;
+            }
+        }
 
         // Auto-switch workspace if the focused window is on an inactive workspace
         // (e.g., user Alt+Tabbed to it)
@@ -2333,6 +2362,19 @@ impl AppState {
 
     /// Handle a window move/resize notification.
     fn on_window_moved_or_resized(&mut self, hwnd: u64) {
+        const CREATE_RETRY_TTL: std::time::Duration = std::time::Duration::from_secs(2);
+        if let Some(queued_at) = self.pending_create_retry.remove(&hwnd) {
+            if queued_at.elapsed() < CREATE_RETRY_TTL {
+                debug!(
+                    "Retrying creation for window {} (queued {}ms ago)",
+                    hwnd,
+                    queued_at.elapsed().as_millis()
+                );
+                self.on_window_created(hwnd);
+            }
+            return;
+        }
+
         // Placement feedback stays suppressed, except a direct maximize of a
         // managed tiled window needs its timestamp and target-only visual cleanup
         // immediately so the later restore is classified correctly.
