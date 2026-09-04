@@ -457,6 +457,29 @@ impl AppState {
         Ok(Some(window_id))
     }
 
+    /// The monitor currently under the mouse cursor, if the cursor position
+    /// can be read and falls within a known monitor's bounds.
+    ///
+    /// Always `None` under `#[cfg(test)]`: the real cursor position on the
+    /// machine running the test suite is not hermetic, and test monitor
+    /// fixtures commonly use realistic screen rects (e.g. 1920x1080) that
+    /// could coincidentally contain it, making assertions depend on where
+    /// the physical mouse happens to be.
+    pub(crate) fn monitor_under_cursor(&self) -> Option<MonitorId> {
+        #[cfg(test)]
+        {
+            None
+        }
+        #[cfg(not(test))]
+        {
+            let (x, y) = leopardwm_platform_win32::get_cursor_pos()?;
+            self.monitors
+                .values()
+                .find(|m| m.contains_point(x, y))
+                .map(|m| m.id)
+        }
+    }
+
     /// The layout viewport for a monitor: its full work area. Single source of
     /// truth for the rect fed into `compute_placements*`; columns fill the work
     /// area edge to edge with no shared-edge inset.

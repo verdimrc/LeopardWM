@@ -643,12 +643,16 @@ impl AppState {
                 return;
             }
 
-            // New windows open on the focused monitor — the active monitor
-            // follows the focused window (see on_window_focused), so a new
-            // window lands where the user is working rather than wherever
-            // the app happened to spawn it.
+            // New windows open on the monitor under the mouse cursor at the
+            // moment they're created — this matches how launchers (e.g.
+            // PowerToys Run) themselves decide which monitor to appear on,
+            // so a window spawned from one lands where the user is actually
+            // pointing rather than wherever `focused_monitor` last landed
+            // via a (possibly stale or spuriously reset) focus event. Falls
+            // back to `focused_monitor` if the cursor can't be located or
+            // doesn't resolve to a known monitor.
             // A per-app rule's open_on_workspace can still redirect it below.
-            let monitor_id = self.focused_monitor;
+            let monitor_id = self.monitor_under_cursor().unwrap_or(self.focused_monitor);
 
             // Get floating rect before borrowing workspace mutably
             let floating_rect = if action == config::WindowAction::Float {
@@ -838,9 +842,16 @@ impl AppState {
                     // the user leaves fullscreen. (A floating window is meant to
                     // overlay, and a background one is parked off-screen, so this
                     // is tiled-and-active only.)
+                    // Check fullscreen state on the window's actual monitor
+                    // (monitor_id), not self.focused_monitor — the two can now
+                    // diverge (window placed by cursor position, e.g. when
+                    // focus_new_windows is off and the window opens without
+                    // moving self.focused_monitor).
                     let keep_fullscreen_on_top =
                         if matches!(action, config::WindowAction::Tile) && !opens_in_background {
-                            self.focused_workspace()
+                            self.workspaces
+                                .get(&monitor_id)
+                                .and_then(|workspaces| workspaces.get(active_idx))
                                 .filter(|ws| ws.is_fullscreen())
                                 .and_then(|ws| ws.fullscreen_window_id())
                                 .filter(|&fs| fs != hwnd)
@@ -857,7 +868,26 @@ impl AppState {
                         self.sync_foreground_window();
                     }
                     if let Some(fs_wid) = keep_fullscreen_on_top {
-                        self.reassert_fullscreen_focus(fs_wid);
+                        // Only steal OS foreground back to the fullscreen window
+                        // when the new window is on the monitor the daemon is
+                        // already tracking as focused (or focus_new_windows would
+                        // have stolen focus anyway). Otherwise the fullscreen
+                        // window is on an unrelated monitor from the user's
+                        // perspective — raise it without activating so it stays
+                        // on top there without yanking OS focus away from
+                        // wherever the new (unfocused, per config) window opened.
+                        if self.config.behavior.focus_new_windows
+                            || monitor_id == self.focused_monitor
+                        {
+                            self.reassert_fullscreen_focus(fs_wid);
+                        } else if let Err(e) =
+                            leopardwm_platform_win32::raise_window_no_activate(fs_wid)
+                        {
+                            debug!(
+                                "Could not raise fullscreen window {} without activation: {:?}",
+                                fs_wid, e
+                            );
+                        }
                     }
                 } else {
                     debug!("Failed to add window {} to workspace", hwnd);
