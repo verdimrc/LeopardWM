@@ -121,6 +121,13 @@ pub struct OverviewModel {
     /// configured `[animation] easing`).
     pub easing: Easing,
     pub rows: Vec<OverviewRow>,
+    /// Short device name of the monitor this overview is showing
+    /// (e.g. "DISPLAY12"), rendered above the first workspace row.
+    pub monitor_label: String,
+    /// Bounding rect for the monitor label text in overlay client coordinates.
+    /// `draw_shapes` fills it with sentinel alpha so `finish_alpha` can
+    /// promote the GDI text pixels to opaque (same mechanism as label strips).
+    pub monitor_label_rect: Rect,
 }
 
 /// Win11 default accent #0078D4 in BGR, used when no config color parses.
@@ -149,6 +156,8 @@ impl Default for OverviewModel {
             anim_ms: 0,
             easing: Easing::default(),
             rows: Vec::new(),
+            monitor_label: String::new(),
+            monitor_label_rect: Rect::new(0, 0, 0, 0),
         }
     }
 }
@@ -3460,6 +3469,17 @@ fn draw_shapes(pixels: &mut [u32], alpha: &mut [u8], w: i32, h: i32, input: &Fra
             chrome_a,
         );
     }
+    // Seed the monitor label region with sentinel alpha so finish_alpha can
+    // promote GDI text pixels there to opaque (same mechanism as label strips).
+    if !model.monitor_label.is_empty() {
+        let (x0, x1, y0, y1) = clip_rect(&model.monitor_label_rect, w, h);
+        for y in y0..y1 {
+            let row = (y * w) as usize;
+            for x in x0..x1 {
+                alpha[row + x as usize] = PANEL_ALPHA;
+            }
+        }
+    }
 }
 
 /// Force label-strip text pixels opaque (they'd dim with the panel
@@ -3481,6 +3501,18 @@ fn finish_alpha(pixels: &mut [u32], alpha: &mut [u8], w: i32, h: i32, model: &Ov
                 // The exact-strip-alpha guard skips anti-aliased corner
                 // and edge pixels so they aren't mistaken for text.
                 if alpha[i] == strip_a && pixels[i] & 0x00FF_FFFF != bg {
+                    alpha[i] = text_a;
+                }
+            }
+        }
+    }
+    // Monitor label: same sentinel-alpha promotion as label strips.
+    if !model.monitor_label.is_empty() {
+        let (x0, x1, y0, y1) = clip_rect(&model.monitor_label_rect, w, h);
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let i = (y * w + x) as usize;
+                if alpha[i] == strip_a && pixels[i] & 0x00FF_FFFF != BACKDROP_BG {
                     alpha[i] = text_a;
                 }
             }
@@ -3580,6 +3612,10 @@ unsafe fn draw_content(hdc: HDC, model: &OverviewModel, thumb_wids: &HashSet<u64
         }
     }
 
+    if !model.monitor_label.is_empty() {
+        draw_monitor_label(hdc, &model.monitor_label, model, label_font);
+    }
+
     let _ = DeleteObject(label_font.into());
     let _ = DeleteObject(card_font.into());
     let _ = DeleteObject(pill_font.into());
@@ -3605,6 +3641,19 @@ unsafe fn draw_row_label(hdc: HDC, row: &OverviewRow, label_font: HFONT) {
         &inset,
         text_color,
         DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
+    );
+    SelectObject(hdc, old_font);
+}
+
+/// Monitor name above the first workspace row, left-aligned with the panels.
+unsafe fn draw_monitor_label(hdc: HDC, label: &str, model: &OverviewModel, label_font: HFONT) {
+    let old_font = SelectObject(hdc, label_font.into());
+    draw_text_in(
+        hdc,
+        label,
+        &model.monitor_label_rect,
+        TEXT_SECONDARY,
+        DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX,
     );
     SelectObject(hdc, old_font);
 }

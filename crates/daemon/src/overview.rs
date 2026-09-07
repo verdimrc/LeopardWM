@@ -242,6 +242,29 @@ impl AppState {
             });
         }
 
+        let monitor_label = self
+            .monitors
+            .get(&monitor)
+            .map(|m| {
+                m.device_name
+                    .trim_start_matches(r"\\.\")
+                    .to_string()
+            })
+            .unwrap_or_default();
+        let label_h = 24;
+        let label_gap = 10; // visual breathing room between label and first row
+        let label_left = geoms.first().map(|g| g.panel.x).unwrap_or(12);
+        let label_y = geoms
+            .first()
+            .map(|g| g.panel.y - label_h - label_gap)
+            .unwrap_or(0)
+            .max(0);
+        let monitor_label_rect = Rect::new(
+            label_left,
+            label_y,
+            (work_area.width - label_left - 12).max(1),
+            label_h,
+        );
         let model = OverviewModel {
             backdrop: Rect::new(0, 0, work_area.width, work_area.height),
             accent_bgr: self.border_color_bgr().unwrap_or(DEFAULT_ACCENT_BGR),
@@ -251,6 +274,8 @@ impl AppState {
             anim_ms: self.overview_anim_ms(),
             easing: self.config.animation.easing,
             rows,
+            monitor_label,
+            monitor_label_rect,
         };
         Some((work_area, model))
     }
