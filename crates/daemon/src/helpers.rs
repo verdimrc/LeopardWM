@@ -193,6 +193,7 @@ impl AppState {
                 viewport_width,
             );
 
+            let device_name = self.monitors.get(&monitor_id).map(|m| m.device_name.clone()).unwrap_or_default();
             for workspace in ws_vec.iter_mut() {
                 // Read the previously-applied scaled gap values from the workspace
                 // (not the raw config values) so rescale_column_widths works correctly.
@@ -206,6 +207,7 @@ impl AppState {
 
                 workspace.set_centering_mode(self.config.layout.centering_mode.into());
                 workspace.set_center_past_edges(self.config.layout.center_past_edges);
+                workspace.set_rtl(self.config.layout.is_rtl_monitor(&device_name));
                 workspace.set_scroll_animation(
                     self.config.animation.scroll_duration_ms,
                     self.config.animation.easing,

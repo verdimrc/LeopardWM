@@ -154,6 +154,13 @@ pub struct LayoutConfig {
     #[serde(default = "default_height_presets")]
     pub height_presets: Vec<f64>,
 
+    /// Windows display indices (1-based, matching \\.\DISPLAY{N}) that use
+    /// right-anchor column fill: new columns insert LTR but content pins to
+    /// the right edge when it fits in the viewport.
+    /// Example: `rtl_monitor_indices = [2]` enables this on \\.\DISPLAY2.
+    #[serde(default)]
+    pub rtl_monitor_indices: Vec<u32>,
+
     // Legacy fields kept for backward-compatible deserialization; not used.
     #[serde(default, skip_serializing)]
     #[allow(dead_code)]
@@ -194,6 +201,7 @@ impl Default for LayoutConfig {
             width_presets: default_width_presets(),
             default_width_preset: default_width_preset(),
             height_presets: default_height_presets(),
+            rtl_monitor_indices: Vec::new(),
             outer_gap: None,
             default_column_width: None,
             min_column_width: None,
@@ -203,6 +211,17 @@ impl Default for LayoutConfig {
 }
 
 impl LayoutConfig {
+    /// Returns true if the monitor with the given device name (e.g. `\\.\DISPLAY2`)
+    /// should use right-anchor column fill.
+    pub fn is_rtl_monitor(&self, device_name: &str) -> bool {
+        if self.rtl_monitor_indices.is_empty() {
+            return false;
+        }
+        let name = device_name.trim_start_matches(r"\\.\").trim_start_matches("DISPLAY");
+        let n: u32 = name.parse().unwrap_or(0);
+        n != 0 && self.rtl_monitor_indices.contains(&n)
+    }
+
     /// The width fraction new columns open at: the `default_width_preset`-th
     /// preset (1-based), falling back to the first preset if out of range.
     pub fn default_width_fraction(&self) -> f64 {

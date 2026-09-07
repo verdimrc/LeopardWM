@@ -86,11 +86,19 @@ impl Workspace {
             }
         }
 
-        let max_scroll = (self.total_width() - vis_w).max(0);
-        if self.center_past_edges {
-            self.scroll_offset = self.scroll_offset.min(max_scroll as f64);
+        let raw_max = self.total_width() - vis_w;
+        if self.rtl && raw_max <= 0 {
+            // Content fits — right-anchor by allowing negative scroll_offset.
+            // Negative viewport_left shifts all columns right on screen, so
+            // the strip's right edge aligns with the viewport's right edge.
+            self.scroll_offset = raw_max as f64;
         } else {
-            self.scroll_offset = self.scroll_offset.clamp(0.0, max_scroll as f64);
+            let max_scroll = raw_max.max(0);
+            if self.center_past_edges {
+                self.scroll_offset = self.scroll_offset.min(max_scroll as f64);
+            } else {
+                self.scroll_offset = self.scroll_offset.clamp(0.0, max_scroll as f64);
+            }
         }
     }
 
@@ -445,8 +453,12 @@ impl Workspace {
     ) {
         // Clamp target to valid range (visible area = viewport minus outer padding)
         let vis_w = self.visible_width(viewport_width);
-        let max_scroll = (self.total_width() - vis_w).max(0);
-        let clamped_target = target.clamp(0.0, max_scroll as f64);
+        let raw_max = self.total_width() - vis_w;
+        // RTL right-anchor: when content fits, allow negative scroll_offset so
+        // the strip's right edge aligns with the viewport's right edge.
+        let min_scroll = if self.rtl { raw_max.min(0) as f64 } else { 0.0 };
+        let max_scroll = raw_max.max(0);
+        let clamped_target = target.clamp(min_scroll, max_scroll as f64);
 
         // Use current effective position as start (handles interrupting animations)
         let start = self.effective_scroll_offset();
@@ -518,7 +530,17 @@ impl Workspace {
 
         let vis_w = self.visible_width(viewport_width);
 
-        let target_offset = if self.should_center(col_width, vis_w) {
+        let raw_max = self.total_width() - vis_w;
+
+        let target_offset = if self.rtl && raw_max <= 0 {
+            // Content fits — right-anchor target (may be negative).
+            let target = raw_max as f64;
+            let current = self.effective_scroll_offset();
+            if (current - target).abs() < 0.5 {
+                return;
+            }
+            target
+        } else if self.should_center(col_width, vis_w) {
             let col_center = col_x.saturating_add(col_width / 2);
             (col_center.saturating_sub(vis_w / 2)) as f64
         } else {
@@ -532,8 +554,8 @@ impl Workspace {
             } else if col_right > scroll_right {
                 col_right.saturating_sub(vis_w) as f64
             } else {
-                let max_scroll = (self.total_width() - vis_w).max(0) as f64;
-                if current < -0.5 {
+                let max_scroll = raw_max.max(0) as f64;
+                if current < -0.5 && !self.rtl {
                     0.0
                 } else if current > max_scroll + 0.5 {
                     max_scroll

@@ -144,6 +144,12 @@ pub struct Workspace {
     /// off-screen above the work area.
     #[serde(skip)]
     pub(crate) tab_strip_reserve_px: i32,
+    /// Right-anchor mode: when content is narrower than the viewport, pin
+    /// it to the right edge instead of the left. New columns still insert
+    /// LTR (to the right of focused), so the strip accumulates rightward
+    /// while appearing anchored to the right screen edge.
+    #[serde(skip)]
+    pub(crate) rtl: bool,
 }
 
 /// State saved when a column is maximized to fill the viewport width.
@@ -183,6 +189,7 @@ impl Default for Workspace {
             center_past_edges: false,
             maximized_column: None,
             tab_strip_reserve_px: 0,
+            rtl: false,
         }
     }
 }
@@ -476,6 +483,17 @@ impl Workspace {
     /// Set whether center-column can scroll past content edges.
     pub fn set_center_past_edges(&mut self, allow: bool) {
         self.center_past_edges = allow;
+    }
+
+    /// Get whether right-anchor mode is active.
+    pub fn rtl(&self) -> bool {
+        self.rtl
+    }
+
+    /// Set right-anchor mode: content pins to the right edge when it fits
+    /// in the viewport, and accumulates leftward as columns are added.
+    pub fn set_rtl(&mut self, rtl: bool) {
+        self.rtl = rtl;
     }
 
     /// Calculate the x-coordinate of a column's left edge on the strip.

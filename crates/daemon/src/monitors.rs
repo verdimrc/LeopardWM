@@ -76,11 +76,13 @@ impl AppState {
                         scale,
                         viewport_width,
                     );
+                    let device_name = self.monitors.get(&monitor_id).map(|m| m.device_name.clone()).unwrap_or_default();
                     for workspace in ws_vec.iter_mut() {
                         let old_gap = workspace.gap();
                         let (old_ol, old_or, _, _) = workspace.outer_gaps();
                         params.apply_to(workspace);
                         workspace.rescale_column_widths(old_gap, old_ol, old_or, viewport_width);
+                        workspace.set_rtl(self.config.layout.is_rtl_monitor(&device_name));
                     }
                 }
                 return;
@@ -177,6 +179,7 @@ impl AppState {
                     self.config.animation.scroll_duration_ms,
                     self.config.animation.easing,
                 );
+                workspace.set_rtl(self.config.layout.is_rtl_monitor(&monitor.device_name));
                 self.workspaces.insert(monitor.id, vec![workspace]);
                 self.active_workspace.insert(monitor.id, 0);
                 info!("Created workspace for new monitor {}", monitor.id);
@@ -295,11 +298,13 @@ impl AppState {
                 viewport_width,
             );
 
+            let device_name = self.monitors.get(&monitor_id).map(|m| m.device_name.clone()).unwrap_or_default();
             for workspace in ws_vec.iter_mut() {
                 let old_gap = workspace.gap();
                 let (old_ol, old_or, _, _) = workspace.outer_gaps();
                 params.apply_to(workspace);
                 workspace.rescale_column_widths(old_gap, old_ol, old_or, viewport_width);
+                workspace.set_rtl(self.config.layout.is_rtl_monitor(&device_name));
             }
         }
 

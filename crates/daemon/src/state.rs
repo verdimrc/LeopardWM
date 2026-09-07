@@ -778,6 +778,7 @@ impl AppState {
             workspace.set_reduce_motion(initial_reduce_motion);
             workspace
                 .set_scroll_animation(config.animation.scroll_duration_ms, config.animation.easing);
+            workspace.set_rtl(config.layout.is_rtl_monitor(&monitor.device_name));
 
             if monitor.is_primary {
                 focused_monitor = monitor.id;
@@ -1241,6 +1242,8 @@ impl AppState {
             ws.set_center_past_edges(config.layout.center_past_edges);
             ws.set_reduce_motion(self.reduce_motion);
             ws.set_scroll_animation(config.animation.scroll_duration_ms, config.animation.easing);
+            let device_name = self.monitors.get(&monitor_id).map(|m| m.device_name.as_str()).unwrap_or("");
+            ws.set_rtl(self.config.layout.is_rtl_monitor(device_name));
             ws_vec.push(ws);
         }
         ws_vec.get_mut(idx)

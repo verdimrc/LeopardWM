@@ -291,6 +291,8 @@ impl AppState {
                 self.config.animation.scroll_duration_ms,
                 self.config.animation.easing,
             );
+            let device_name = self.monitors.get(&monitor_id).map(|m| m.device_name.as_str()).unwrap_or("");
+            ws.set_rtl(self.config.layout.is_rtl_monitor(device_name));
             // Preserve the saved scroll offset (it serializes, but set it
             // explicitly so a future skip on this field would not regress).
             ws.set_scroll_offset(ws_snapshot.workspace.scroll_offset());
@@ -315,6 +317,8 @@ impl AppState {
                     self.config.animation.scroll_duration_ms,
                     self.config.animation.easing,
                 );
+                let device_name = self.monitors.get(&monitor_id).map(|m| m.device_name.as_str()).unwrap_or("");
+                empty.set_rtl(self.config.layout.is_rtl_monitor(device_name));
                 entry.push(empty);
             }
             entry[ws_idx] = ws;
@@ -368,6 +372,7 @@ impl AppState {
                         scale,
                         vw,
                     );
+                    let device_name = self.monitors.get(&id).map(|m| m.device_name.clone()).unwrap_or_default();
                     while ws_vec.len() <= ws_idx {
                         let mut ws = Workspace::with_directional_gaps(
                             params.gap,
@@ -385,6 +390,7 @@ impl AppState {
                             self.config.animation.scroll_duration_ms,
                             self.config.animation.easing,
                         );
+                        ws.set_rtl(self.config.layout.is_rtl_monitor(&device_name));
                         ws_vec.push(ws);
                     }
                     // Restore scroll offset from saved workspace

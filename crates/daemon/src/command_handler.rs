@@ -1303,6 +1303,8 @@ impl AppState {
         // Ensure target workspace exists (lazy creation)
         self.ensure_workspace_exists(monitor, idx);
 
+        let target_viewport_width = self.viewport_width_for(monitor);
+
         // Insert into target workspace
         if let Some(workspace) = self
             .workspaces
@@ -1361,6 +1363,10 @@ impl AppState {
                 // matching the default insert.
                 let _ = workspace.focus_window(focused_hwnd);
             }
+            // Pre-adjust scroll so RTL (and centering) is correct when the
+            // user switches to the target workspace. Non-animated since the
+            // workspace is not currently visible.
+            workspace.ensure_focused_visible(target_viewport_width);
         }
 
         // Record where the window came from so moving it back restores its
