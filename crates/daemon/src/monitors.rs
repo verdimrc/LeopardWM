@@ -449,6 +449,9 @@ impl AppState {
             // scroll_offset is what compute_placements_animated actually reads.
             // If an animation is active, effective_scroll_offset() returns the
             // animation's stale position instead of the newly computed offset.
+            let source_viewport = self.viewport_width_for(source_monitor);
+            source_workspace.stop_animation();
+            source_workspace.ensure_focused_visible(source_viewport);
             target_workspace.stop_animation();
             target_workspace.ensure_focused_visible(target_viewport);
         }
