@@ -160,24 +160,19 @@ impl AppState {
         let ws_vec = self.workspaces.get(&monitor)?;
         let active_idx = self.active_workspace_idx(monitor);
 
-        // Only windows that yield cards count: a workspace whose every
-        // window is minimized would render an empty ghost row. The same
-        // pass collects every card-eligible window id for the icon
-        // prefetch below.
-        let mut non_empty: Vec<usize> = Vec::new();
+        if ws_vec.is_empty() {
+            return None;
+        }
+        // Prefetch icons for all visible (non-minimized) windows across every
+        // workspace. Empty workspaces still get a row in the overview (label
+        // strip + empty body), so the icon pass is no longer the gate for
+        // which workspaces appear.
         let mut icon_wids: Vec<u64> = Vec::new();
-        for (i, ws) in ws_vec.iter().enumerate() {
+        for ws in ws_vec.iter() {
             let ids = ws.all_window_ids();
-            if !ids.iter().any(|&wid| !ws.is_minimized(wid)) {
-                continue;
-            }
-            non_empty.push(i);
             icon_wids.extend(ids.into_iter().filter(|&wid| {
                 wid != crate::state::DRAG_PLACEHOLDER_HWND && !ws.is_minimized(wid)
             }));
-        }
-        if non_empty.is_empty() {
-            return None;
         }
         // Fill the icon cache before the row loop re-borrows the
         // workspaces: a `get_window_icon` miss costs up to two 50ms
@@ -191,14 +186,13 @@ impl AppState {
         }
         let ws_vec = self.workspaces.get(&monitor)?;
 
-        let geoms = layout_overview_rows(work_area.width, work_area.height, non_empty.len());
+        let geoms = layout_overview_rows(work_area.width, work_area.height, ws_vec.len());
         let focused_wid = ws_vec.get(active_idx).and_then(|ws| ws.focused_window());
         let accent_width = self.config.appearance.active_border_width.max(1);
 
-        let mut rows = Vec::with_capacity(non_empty.len());
-        for (slot, &ws_idx) in non_empty.iter().enumerate() {
-            let ws = &ws_vec[ws_idx];
-            let geom = &geoms[slot];
+        let mut rows = Vec::with_capacity(ws_vec.len());
+        for (ws_idx, ws) in ws_vec.iter().enumerate() {
+            let geom = &geoms[ws_idx];
             let is_active = ws_idx == active_idx;
             let selected_wid = if is_active { focused_wid } else { None };
             // Vertical symmetry: the 1px panel frame is stroked INSIDE
@@ -228,9 +222,12 @@ impl AppState {
             // The panel wraps its content: scaled strip width + inner
             // padding, left-aligned at the outer margin; the label strip
             // shares the panel width. Height per row is unchanged.
+            // Empty workspaces (no cards) use a compact width so the
+            // label badge doesn't span the full monitor width.
             let panel_w = match content_w {
                 Some(cw) => (cw + 2 * BODY_INSET).min(geom.panel.width),
-                None => geom.panel.width, // no visible content: keep full width
+                None if cards.is_empty() => (8 * LABEL_STRIP_H).min(geom.panel.width),
+                None => geom.panel.width,
             };
             let panel = Rect::new(geom.panel.x, geom.panel.y, panel_w, geom.panel.height);
             let label_strip = Rect::new(panel.x, panel.y, panel_w, geom.label_strip.height);
@@ -509,7 +506,7 @@ impl AppState {
         // stale frame for them.
         self.capture_overview_snapshots();
         let Some((overlay_rect, model)) = self.build_overview_model() else {
-            info!("Overview not shown: no non-empty workspaces on the focused monitor");
+            info!("Overview not shown: no workspaces on the focused monitor");
             return;
         };
         if self.overview_overlay.is_none() {
@@ -629,27 +626,36 @@ mod tests {
     }
 
     #[test]
-    fn test_build_overview_model_filters_empty_workspaces() {
+    fn test_build_overview_model_includes_empty_workspaces() {
         let mut state = test_state();
         add_windows(&mut state, 0, &[101]);
         add_windows(&mut state, 2, &[201, 202]);
-        // Workspace 1 stays empty and must not produce a row.
+        // Workspace 1 is empty but must still produce a labeled row.
         state.ensure_workspace_exists(1, 1);
 
         let (overlay_rect, model) = state.build_overview_model().expect("model");
         assert_eq!(overlay_rect, Rect::new(0, 0, 1920, 1040));
         let indices: Vec<usize> = model.rows.iter().map(|r| r.workspace_index).collect();
-        assert_eq!(indices, vec![0, 2], "non-empty rows in workspace order");
+        assert_eq!(indices, vec![0, 1, 2], "all workspaces produce rows");
         assert_eq!(model.rows[0].label, "1");
-        assert_eq!(model.rows[1].label, "3");
+        assert_eq!(model.rows[1].label, "2");
+        assert_eq!(model.rows[2].label, "3");
         assert_eq!(model.rows[0].cards.len(), 1);
-        assert_eq!(model.rows[1].cards.len(), 2);
+        assert_eq!(model.rows[1].cards.len(), 0, "empty workspace has no cards");
+        assert_eq!(model.rows[2].cards.len(), 2);
     }
 
     #[test]
-    fn test_build_overview_model_returns_none_when_all_empty() {
+    fn test_build_overview_model_returns_none_only_when_no_workspaces() {
+        // The monitor always has at least one workspace, so this path is
+        // only reachable if ws_vec is somehow empty (not a normal scenario).
+        // We verify the happy path: a single empty workspace still returns Some.
         let mut state = test_state();
-        assert!(state.build_overview_model().is_none());
+        let result = state.build_overview_model();
+        assert!(result.is_some(), "one empty workspace still yields a model");
+        let (_, model) = result.unwrap();
+        assert_eq!(model.rows.len(), 1);
+        assert_eq!(model.rows[0].cards.len(), 0);
     }
 
     #[test]
@@ -660,10 +666,12 @@ mod tests {
         state.active_workspace.insert(1, 2);
 
         let (_, model) = state.build_overview_model().expect("model");
+        // add_windows(state, 2, ...) auto-creates workspaces 0, 1, 2, so
+        // there are 3 rows; ws1 is empty and ws2 is active.
         let active: Vec<bool> = model.rows.iter().map(|r| r.is_active).collect();
-        assert_eq!(active, vec![false, true]);
+        assert_eq!(active, vec![false, false, true]);
         // Selection lives on the active row only (its focused window).
-        assert!(model.rows[1].cards.iter().any(|c| c.selected));
+        assert!(model.rows[2].cards.iter().any(|c| c.selected));
         assert!(model.rows[0].cards.iter().all(|c| !c.selected));
     }
 
@@ -1297,14 +1305,16 @@ mod tests {
     }
 
     #[test]
-    fn test_toggle_overview_no_op_when_all_workspaces_empty() {
+    fn test_toggle_overview_shows_on_all_empty_workspaces() {
         let mut state = test_state();
+        // Empty workspaces still get workspace-label rows, so the overview
+        // opens even when there are no windows on the monitor.
         state.toggle_overview();
-        assert!(!state.overview_open, "nothing to show on empty workspaces");
+        assert!(state.overview_open, "overview should open to show empty workspace rows");
     }
 
     #[test]
-    fn test_refresh_overview_model_hides_when_last_window_gone() {
+    fn test_refresh_overview_model_stays_open_when_last_window_gone() {
         let mut state = test_state();
         add_windows(&mut state, 0, &[101]);
         state.toggle_overview();
@@ -1318,7 +1328,9 @@ mod tests {
             .remove_window(101)
             .unwrap();
         state.refresh_overview_model();
-        assert!(!state.overview_open);
+        // Overview stays open after the last window is removed: the
+        // workspace-label row is still useful to the user.
+        assert!(state.overview_open);
     }
 
     #[test]
@@ -1358,19 +1370,29 @@ mod tests {
 
         let (_, model) = state.build_overview_model().expect("model");
         let indices: Vec<usize> = model.rows.iter().map(|r| r.workspace_index).collect();
-        assert_eq!(
-            indices,
-            vec![0],
-            "all-minimized workspaces must not produce ghost rows"
+        // All workspaces produce rows; all-minimized rows have no cards.
+        assert_eq!(indices, vec![0, 1, 2]);
+        assert!(!model.rows[0].cards.is_empty(), "ws0 has a visible window");
+        assert!(
+            model.rows[1].cards.is_empty(),
+            "ws1 all-minimized: no cards"
+        );
+        assert!(
+            model.rows[2].cards.is_empty(),
+            "ws2 all-minimized float: no cards"
         );
     }
 
     #[test]
-    fn test_model_none_when_every_window_minimized() {
+    fn test_model_shows_when_every_window_minimized() {
         let mut state = test_state();
         add_windows(&mut state, 0, &[101]);
         assert!(state.workspaces.get_mut(&1).unwrap()[0].mark_minimized(101));
-        assert!(state.build_overview_model().is_none());
+        // Even with every window minimized the workspace row still shows
+        // (just no cards) so the user can see which workspace is active.
+        let result = state.build_overview_model();
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().1.rows[0].cards.len(), 0);
     }
 
     // Overlay-creation failure (show_overview leaving overview_open false)
