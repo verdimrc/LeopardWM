@@ -436,8 +436,10 @@ impl AppState {
             source_workspace
                 .remove_window(window_id)
                 .map_err(|e| format!("Failed to remove window: {}", e))?;
+            let target_viewport_w = self.viewport_width_for(target_monitor);
+            let clamped_column_width = source_column_width.map(|w| w.min(target_viewport_w));
             target_workspace
-                .insert_window(window_id, source_column_width)
+                .insert_window(window_id, clamped_column_width)
                 .map_err(|e| format!("Failed to add window to target: {}", e))?;
         }
 

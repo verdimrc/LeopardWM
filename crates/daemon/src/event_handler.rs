@@ -2686,6 +2686,18 @@ impl AppState {
                     if let Err(e) = self.apply_layout() {
                         warn!("Failed to snap back layout after move/resize: {}", e);
                     }
+                    // Within the cross-monitor move window, clear suppression so
+                    // follow-on DPI events can also trigger snap-back. Going from
+                    // low→high DPI (e.g. laptop←external) some apps fire multiple
+                    // position events; the second one would otherwise be swallowed
+                    // by the suppression re-armed by apply_layout above.
+                    const MONITOR_MOVE_SNAP_MS: u128 = 500;
+                    if self
+                        .move_to_monitor_target
+                        .is_some_and(|(_, t)| t.elapsed().as_millis() < MONITOR_MOVE_SNAP_MS)
+                    {
+                        self.moved_or_resized_suppression.remove(&hwnd);
+                    }
                 }
             }
         }
