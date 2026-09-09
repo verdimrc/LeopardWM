@@ -465,6 +465,12 @@ pub struct BehaviorConfig {
     /// the one window it was toggled on.
     #[serde(default = "default_true")]
     pub fullscreen_follows_focus: bool,
+
+    /// Show a toast notification when a window is left floating because
+    /// it runs at a higher privilege level than the daemon. Set to false
+    /// to silence the pop-up.
+    #[serde(default = "default_true")]
+    pub notify_elevation_blocked: bool,
 }
 
 /// Placement for newly opened tiled windows.
@@ -496,6 +502,7 @@ impl Default for BehaviorConfig {
             workspace_edge_wrap: false,
             mouse_follows_focus: false,
             fullscreen_follows_focus: true,
+            notify_elevation_blocked: true,
         }
     }
 }

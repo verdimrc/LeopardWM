@@ -473,7 +473,9 @@ impl AppState {
                          administrator, so it's left floating for this session."
                     )
                 };
-                crate::notify::show_toast("Window left floating", &body);
+                if self.config.behavior.notify_elevation_blocked {
+                    crate::notify::show_toast("Window left floating", &body);
+                }
                 true
             }
             ElevationCheck::BlockedKnown => {

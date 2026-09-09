@@ -110,6 +110,11 @@ focus_follows_mouse = false
 # only affects the one window it was toggled on. Default true.
 # fullscreen_follows_focus = true
 
+# Show a toast notification when a window is left floating because it runs at a
+# higher privilege level than the daemon (e.g. as administrator). Set to false
+# to silence the pop-up. Default true.
+# notify_elevation_blocked = true
+
 [hotkeys]
 {hotkeys}
 [gestures]
