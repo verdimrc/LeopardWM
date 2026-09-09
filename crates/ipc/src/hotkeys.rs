@@ -292,6 +292,12 @@ pub fn hotkey_catalog() -> Vec<HotkeyAction> {
             "Workspaces",
         ),
         action(
+            "toggle_overview_all",
+            Some("Ctrl+Alt+Win+Space"),
+            "Toggle overview on all monitors",
+            "Workspaces",
+        ),
+        action(
             "workspace_prev",
             Some("Ctrl+Alt+Shift+Left"),
             "Previous workspace",
@@ -426,6 +432,7 @@ pub fn command_for_action(id: &str) -> Option<crate::IpcCommand> {
         "workspace_prev" => IpcCommand::WorkspacePrev,
         "workspace_next" => IpcCommand::WorkspaceNext,
         "toggle_overview" => IpcCommand::ToggleOverview,
+        "toggle_overview_all" => IpcCommand::ToggleOverviewAll,
         _ => return None,
     })
 }
@@ -539,6 +546,7 @@ mod tests {
             ("Ctrl+Alt+Shift+R", "reload"),
             ("Win+Ctrl+Escape", "panic_revert"),
             ("Ctrl+Alt+Space", "toggle_overview"),
+            ("Ctrl+Alt+Win+Space", "toggle_overview_all"),
             ("Ctrl+Alt+Shift+Left", "workspace_prev"),
             ("Ctrl+Alt+Shift+Right", "workspace_next"),
             ("Ctrl+Alt+Shift+PageUp", "move_to_workspace_prev"),

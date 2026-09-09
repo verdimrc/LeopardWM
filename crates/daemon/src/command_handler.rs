@@ -500,6 +500,10 @@ impl AppState {
                 self.toggle_overview();
                 IpcResponse::Ok
             }
+            IpcCommand::ToggleOverviewAll => {
+                self.toggle_overview_all();
+                IpcResponse::Ok
+            }
             IpcCommand::ToggleTabbed => self.execute_workspace_command(true, false, |ws, _vw| {
                 ws.toggle_focused_column_tabbed_mode();
                 info!("Toggled tabbed mode on focused column");

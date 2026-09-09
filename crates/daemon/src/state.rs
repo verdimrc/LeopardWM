@@ -412,10 +412,16 @@ pub(crate) struct AppState {
         Option<std::sync::mpsc::Sender<leopardwm_platform_win32::tab_strip::TabActionEvent>>,
     /// Whether the workspace overview overlay is currently shown.
     pub(crate) overview_open: bool,
+    /// Whether the all-monitors overview is currently shown.
+    pub(crate) overview_all_open: bool,
     /// Overview overlay. NOT constructed in `new` — lazily created on the
     /// first `show_overview` so tests (and headless runs) never spawn the
     /// interactive top-level window.
     pub(crate) overview_overlay: Option<leopardwm_platform_win32::overview::OverviewOverlay>,
+    /// Non-interactive secondary overlays shown on non-focused monitors
+    /// when `toggle_overview_all` is active.
+    pub(crate) overview_secondary_overlays:
+        Vec<leopardwm_platform_win32::overview::SecondaryOverlay>,
     /// Sender cloned into the overlay at lazy-init. Installed once during
     /// daemon startup (parallel to `tab_strip_action_tx`).
     pub(crate) overview_event_tx:
@@ -840,7 +846,9 @@ impl AppState {
             tab_strip_overlays: std::collections::HashMap::new(),
             tab_strip_action_tx: None,
             overview_open: false,
+            overview_all_open: false,
             overview_overlay: None,
+            overview_secondary_overlays: Vec::new(),
             overview_event_tx: None,
             overview_icon_cache: HashMap::new(),
             // Paused under cfg(test): placeholder hwnds collide with real

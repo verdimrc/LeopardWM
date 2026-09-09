@@ -481,6 +481,8 @@ pub enum IpcCommand {
     /// Toggle the workspace overview overlay (a map of the focused
     /// monitor's non-empty workspaces).
     ToggleOverview,
+    /// Toggle the workspace overview on every monitor simultaneously.
+    ToggleOverviewAll,
 
     /// Query whether the daemon is configured to auto-start with Windows.
     GetAutoStart,
@@ -760,6 +762,7 @@ mod tests {
             IpcCommand::ScratchpadToggle,
             IpcCommand::ToggleSticky,
             IpcCommand::ToggleOverview,
+            IpcCommand::ToggleOverviewAll,
             IpcCommand::ToggleNewWindowPlacement,
             IpcCommand::SetColumnWidth { fraction: 0.5 },
             IpcCommand::SetColumnWidth { fraction: 0.333 },

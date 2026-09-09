@@ -11,8 +11,8 @@
 use crate::state::AppState;
 use leopardwm_core_layout::{Rect, Visibility, Workspace};
 use leopardwm_platform_win32::overview::{
-    OverviewCard, OverviewModel, OverviewOverlay, OverviewRow, DEFAULT_ACCENT_BGR, PANEL_INNER_PAD,
-    SELECT_PAD, VIEWPORT_RING_PAD,
+    OverviewCard, OverviewModel, OverviewOverlay, OverviewRow, SecondaryOverlay,
+    DEFAULT_ACCENT_BGR, PANEL_INNER_PAD, SELECT_PAD, VIEWPORT_RING_PAD,
 };
 use tracing::{info, warn};
 
@@ -151,11 +151,18 @@ fn inset_card(r: &Rect) -> Rect {
 
 impl AppState {
     /// Build the overview display model for the focused monitor.
+    pub(crate) fn build_overview_model(&mut self) -> Option<(Rect, OverviewModel)> {
+        self.build_overview_model_for(self.focused_monitor)
+    }
+
+    /// Build the overview display model for the given monitor.
     ///
     /// Returns the overlay window rect (the monitor's work area) plus the
-    /// model, or `None` when every workspace on the monitor is empty.
-    pub(crate) fn build_overview_model(&mut self) -> Option<(Rect, OverviewModel)> {
-        let monitor = self.focused_monitor;
+    /// model, or `None` when the monitor has no workspaces.
+    pub(crate) fn build_overview_model_for(
+        &mut self,
+        monitor: isize,
+    ) -> Option<(Rect, OverviewModel)> {
         let work_area = self.monitors.get(&monitor)?.work_area;
         let ws_vec = self.workspaces.get(&monitor)?;
         let active_idx = self.active_workspace_idx(monitor);
@@ -542,6 +549,63 @@ impl AppState {
         }
     }
 
+    /// Toggle the overview on every monitor simultaneously. The focused
+    /// monitor gets the interactive overlay; all other monitors get
+    /// non-interactive secondary overlays.
+    pub(crate) fn toggle_overview_all(&mut self) {
+        if self.overview_all_open {
+            self.hide_overview_all(None);
+        } else {
+            self.show_overview_all();
+        }
+    }
+
+    /// Show the overview on all monitors. The focused monitor uses the
+    /// existing interactive overlay; other monitors get secondary overlays.
+    pub(crate) fn show_overview_all(&mut self) {
+        // Close any stale secondary overlays first.
+        self.hide_secondary_overlays();
+
+        // Spawn a secondary (non-interactive) overlay for every monitor
+        // other than the focused one.
+        let other_monitors: Vec<isize> = self
+            .monitors
+            .keys()
+            .copied()
+            .filter(|&id| id != self.focused_monitor)
+            .collect();
+        for mon_id in other_monitors {
+            let Some((rect, model)) = self.build_overview_model_for(mon_id) else {
+                continue;
+            };
+            match SecondaryOverlay::new() {
+                Ok(overlay) => {
+                    overlay.show(rect, model);
+                    self.overview_secondary_overlays.push(overlay);
+                }
+                Err(e) => warn!("Failed to create secondary overview overlay: {}", e),
+            }
+        }
+
+        // Show the primary interactive overlay on the focused monitor.
+        self.show_overview();
+        self.overview_all_open = true;
+    }
+
+    /// Hide all monitors' overviews (primary + secondaries).
+    pub(crate) fn hide_overview_all(&mut self, target_ws: Option<usize>) {
+        self.hide_secondary_overlays();
+        self.hide_overview_animated(target_ws);
+        self.overview_all_open = false;
+    }
+
+    /// Destroy all secondary (non-interactive) overlay windows.
+    fn hide_secondary_overlays(&mut self) {
+        for overlay in self.overview_secondary_overlays.drain(..) {
+            overlay.hide();
+        }
+    }
+
     /// Show the overview. No-op when every workspace is empty. Creates
     /// the overlay lazily on first use (skipped when no event sender is
     /// installed — tests and headless runs).
@@ -591,7 +655,9 @@ impl AppState {
         if let Some(overlay) = &self.overview_overlay {
             overlay.hide();
         }
+        self.hide_secondary_overlays();
         self.overview_open = false;
+        self.overview_all_open = false;
         if was_open {
             self.sync_foreground_window();
         }
@@ -611,7 +677,9 @@ impl AppState {
         if let Some(overlay) = &self.overview_overlay {
             overlay.hide_animated(target_workspace);
         }
+        self.hide_secondary_overlays();
         self.overview_open = false;
+        self.overview_all_open = false;
         if was_open {
             self.sync_foreground_window();
         }

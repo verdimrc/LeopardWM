@@ -1611,6 +1611,154 @@ impl Drop for OverviewOverlay {
     }
 }
 
+// --- Secondary (non-interactive) overlay ----------------------------------
+//
+// One per non-focused monitor when `toggle_overview_all` is active.
+// Uses the per-pixel-alpha UpdateLayeredWindow pipeline (AlphaDim path)
+// rendered once from the daemon thread; no animation, no interaction.
+
+/// Non-interactive overview window shown on monitors other than the focused
+/// one during an all-monitors overview (`Ctrl+Alt+Win+Space`).
+pub struct SecondaryOverlay {
+    hwnd: HWND,
+    _thread: Option<std::thread::JoinHandle<()>>,
+}
+
+unsafe extern "system" fn secondary_wnd_proc(
+    hwnd: HWND,
+    msg: u32,
+    wp: WPARAM,
+    lp: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_CLOSE => {
+            let _ = DestroyWindow(hwnd);
+            LRESULT(0)
+        }
+        WM_DESTROY => {
+            PostQuitMessage(0);
+            LRESULT(0)
+        }
+        _ => DefWindowProcW(hwnd, msg, wp, lp),
+    }
+}
+
+impl SecondaryOverlay {
+    /// Spawn the background thread and create the non-interactive overlay
+    /// window. Skipped in test builds (same guard as `OverviewOverlay::new`).
+    #[cfg_attr(test, allow(unused_variables))]
+    pub fn new() -> Result<Self, Win32Error> {
+        #[cfg(test)]
+        panic!("SecondaryOverlay::new spawns a top-level window; gate behind cfg(test)");
+        #[allow(unreachable_code)]
+        {
+            let (tx, rx) = mpsc::channel::<Result<isize, Win32Error>>();
+            let thread = std::thread::Builder::new()
+                .name("overview-secondary".into())
+                .spawn(move || unsafe {
+                    let class_name: Vec<u16> =
+                        "LeopardWMSecondaryOverview\0".encode_utf16().collect();
+                    let wc = WNDCLASSW {
+                        lpfnWndProc: Some(secondary_wnd_proc),
+                        lpszClassName: windows::core::PCWSTR(class_name.as_ptr()),
+                        ..Default::default()
+                    };
+                    // Ignore ERROR_CLASS_ALREADY_EXISTS from prior registrations.
+                    let _ = RegisterClassW(&wc);
+                    match CreateWindowExW(
+                        WS_EX_TOOLWINDOW
+                            | WS_EX_TOPMOST
+                            | WS_EX_LAYERED
+                            | WS_EX_TRANSPARENT
+                            | WS_EX_NOACTIVATE,
+                        windows::core::PCWSTR(class_name.as_ptr()),
+                        None,
+                        WS_POPUP,
+                        0,
+                        0,
+                        1,
+                        1,
+                        None,
+                        None,
+                        None,
+                        None,
+                    ) {
+                        Ok(h) => {
+                            let _ = tx.send(Ok(h.0 as isize));
+                            let mut msg = MSG::default();
+                            while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+                                let _ = DispatchMessageW(&msg);
+                            }
+                        }
+                        Err(e) => {
+                            let _ = tx.send(Err(Win32Error::HookInstallFailed(format!(
+                                "SecondaryOverlay: {}",
+                                e
+                            ))));
+                        }
+                    }
+                })
+                .map_err(|e| {
+                    Win32Error::HookInstallFailed(format!("SecondaryOverlay thread: {}", e))
+                })?;
+
+            let hwnd_raw = match rx.recv() {
+                Ok(Ok(raw)) => raw,
+                Ok(Err(e)) => return Err(e),
+                Err(_) => {
+                    return Err(Win32Error::HookInstallFailed(
+                        "SecondaryOverlay init failed".into(),
+                    ))
+                }
+            };
+
+            Ok(Self {
+                hwnd: HWND(hwnd_raw as *mut c_void),
+                _thread: Some(thread),
+            })
+        }
+    }
+
+    /// Position and paint the overlay on the given monitor rect. Renders
+    /// the model via `UpdateLayeredWindow` (AlphaDim path, no animation,
+    /// no interaction). Call from the daemon thread.
+    pub fn show(&self, rect: Rect, model: OverviewModel) {
+        unsafe {
+            let _ = SetWindowPos(
+                self.hwnd,
+                Some(HWND_TOPMOST),
+                rect.x,
+                rect.y,
+                rect.width,
+                rect.height,
+                SWP_NOACTIVATE | SWP_NOZORDER,
+            );
+            render_and_update(self.hwnd, rect, &model, None, None);
+            let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
+        }
+    }
+
+    /// Close the secondary overlay window.
+    pub fn hide(&self) {
+        unsafe {
+            let _ = PostMessageW(Some(self.hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+        }
+    }
+}
+
+impl Drop for SecondaryOverlay {
+    fn drop(&mut self) {
+        // WM_CLOSE → WM_DESTROY → PostQuitMessage breaks the message loop.
+        // Posting to an already-destroyed hwnd fails silently.
+        unsafe {
+            let _ = PostMessageW(Some(self.hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+        }
+        if let Some(t) = self._thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
 // --- Live thumbnails ------------------------------------------------------
 //
 // DWM composites registered thumbnails ON TOP of the window's painted
