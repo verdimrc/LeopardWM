@@ -189,6 +189,12 @@ impl AppState {
         let geoms = layout_overview_rows(work_area.width, work_area.height, ws_vec.len());
         let focused_wid = ws_vec.get(active_idx).and_then(|ws| ws.focused_window());
         let accent_width = self.config.appearance.active_border_width.max(1);
+        let device_name = self
+            .monitors
+            .get(&monitor)
+            .map(|m| m.device_name.as_str())
+            .unwrap_or("");
+        let rtl = self.config.layout.is_rtl_monitor(device_name);
 
         let mut rows = Vec::with_capacity(ws_vec.len());
         for (ws_idx, ws) in ws_vec.iter().enumerate() {
@@ -206,7 +212,7 @@ impl AppState {
                 geom.strip.width,
                 (geom.strip.height - 1).max(1),
             );
-            let (mut cards, viewport, content_w) =
+            let (mut cards, mut viewport, content_w) =
                 self.overview_cards_for(ws, work_area, strip, selected_wid, is_active);
             // The active row always carries a selection: fall back to its
             // first card when the focused window isn't represented.
@@ -229,7 +235,24 @@ impl AppState {
                 None if cards.is_empty() => (8 * LABEL_STRIP_H).min(geom.panel.width),
                 None => geom.panel.width,
             };
-            let panel = Rect::new(geom.panel.x, geom.panel.y, panel_w, geom.panel.height);
+            // RTL monitors right-anchor the panel within the full slot so
+            // content accumulates from the right edge, matching the strip.
+            let panel_x = if rtl {
+                geom.panel.x + geom.panel.width - panel_w
+            } else {
+                geom.panel.x
+            };
+            if rtl {
+                let dx = panel_x - geom.panel.x;
+                for card in &mut cards {
+                    card.rect.x += dx;
+                    if let Some(ref mut fr) = card.from_rect {
+                        fr.x += dx;
+                    }
+                }
+                viewport.x += dx;
+            }
+            let panel = Rect::new(panel_x, geom.panel.y, panel_w, geom.panel.height);
             let label_strip = Rect::new(panel.x, panel.y, panel_w, geom.label_strip.height);
             rows.push(OverviewRow {
                 workspace_index: ws_idx,
@@ -253,16 +276,16 @@ impl AppState {
             .unwrap_or_default();
         let label_h = 24;
         let label_gap = 10; // visual breathing room between label and first row
-        let label_left = geoms.first().map(|g| g.panel.x).unwrap_or(12);
+        let margin_x = geoms.first().map(|g| g.panel.x).unwrap_or(12);
         let label_y = geoms
             .first()
             .map(|g| g.panel.y - label_h - label_gap)
             .unwrap_or(0)
             .max(0);
         let monitor_label_rect = Rect::new(
-            label_left,
+            margin_x,
             label_y,
-            (work_area.width - label_left - 12).max(1),
+            (work_area.width - 2 * margin_x).max(1),
             label_h,
         );
         let model = OverviewModel {
@@ -276,6 +299,7 @@ impl AppState {
             rows,
             monitor_label,
             monitor_label_rect,
+            rtl,
         };
         Some((work_area, model))
     }
