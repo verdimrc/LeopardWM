@@ -1623,6 +1623,11 @@ impl Drop for OverviewOverlay {
 /// PostMessage tag: daemon ships a new Box<OverviewModel> via LPARAM so
 /// the overlay thread can update its thread-local hit-test model.
 const WM_SECONDARY_SET_MODEL: u32 = WM_USER + 7;
+/// PostMessage tag: hook signals the wnd proc to re-render with the current
+/// SEC_HOVERED value. Keeping GDI work out of the LL hook callback avoids
+/// the Windows low-level hook timeout (default ~300 ms) which would silently
+/// unhook us if render_and_update ever exceeds it.
+const WM_SECONDARY_RENDER: u32 = WM_USER + 8;
 
 // Thread-local state for the overlay thread.  Each SecondaryOverlay
 // spawns its own thread, so each instance gets an independent set.
@@ -1654,7 +1659,7 @@ unsafe extern "system" fn secondary_mouse_hook(
     let hook = HHOOK(SEC_HOOK.get() as *mut c_void);
     if code >= 0 {
         let msg_id = wp.0 as u32;
-        if msg_id == WM_LBUTTONUP || msg_id == WM_MOUSEMOVE {
+        if msg_id == WM_LBUTTONDOWN || msg_id == WM_LBUTTONUP || msg_id == WM_MOUSEMOVE {
             let info = &*(lp.0 as *const MSLLHOOKSTRUCT);
             let sx = info.pt.x;
             let sy = info.pt.y;
@@ -1668,18 +1673,24 @@ unsafe extern "system" fn secondary_mouse_hook(
                     && cx < wr.right - wr.left
                     && cy < wr.bottom - wr.top;
 
-                if msg_id == WM_LBUTTONUP && in_bounds {
-                    let event = SEC_MODEL
-                        .try_with(|m| m.borrow().as_ref().and_then(|mdl| secondary_hit_test(mdl, cx, cy)))
-                        .ok()
-                        .flatten();
-                    if let Some(ev) = event {
-                        let _ = SEC_TX.try_with(|tx| {
-                            if let Some(ref sender) = *tx.borrow() {
-                                let _ = sender.send(ev);
-                            }
-                        });
+                if in_bounds && (msg_id == WM_LBUTTONDOWN || msg_id == WM_LBUTTONUP) {
+                    if msg_id == WM_LBUTTONUP {
+                        let event = SEC_MODEL
+                            .try_with(|m| m.borrow().as_ref().and_then(|mdl| secondary_hit_test(mdl, cx, cy)))
+                            .ok()
+                            .flatten();
+                        if let Some(ev) = event {
+                            let _ = SEC_TX.try_with(|tx| {
+                                if let Some(ref sender) = *tx.borrow() {
+                                    let _ = sender.send(ev);
+                                }
+                            });
+                        }
                     }
+                    // Suppress the click so it doesn't pass through the transparent
+                    // overlay and directly focus a real window underneath, which
+                    // would race the daemon's set_foreground_window call.
+                    return LRESULT(1);
                 }
 
                 if msg_id == WM_MOUSEMOVE {
@@ -1694,14 +1705,10 @@ unsafe extern "system" fn secondary_mouse_hook(
                     let old_hover = SEC_HOVERED.get();
                     if new_hover != old_hover {
                         SEC_HOVERED.set(new_hover);
-                        let rect_opt = SEC_RECT.try_with(|r| *r.borrow()).ok().flatten();
-                        if let Some(rect) = rect_opt {
-                            let _ = SEC_MODEL.try_with(|m| {
-                                if let Some(ref mdl) = *m.borrow() {
-                                    render_and_update(hwnd, rect, mdl, new_hover, None);
-                                }
-                            });
-                        }
+                        // Post to the wnd proc rather than rendering here —
+                        // GDI work inside a LL hook callback can exceed the
+                        // Windows hook timeout and silently unhook us.
+                        let _ = PostMessageW(Some(hwnd), WM_SECONDARY_RENDER, WPARAM(0), LPARAM(0));
                     }
                 }
             }
@@ -1722,6 +1729,18 @@ unsafe extern "system" fn secondary_wnd_proc(
             let _ = SEC_MODEL.try_with(|m| { *m.borrow_mut() = Some(model); });
             let _ = SEC_RECT.try_with(|r| { *r.borrow_mut() = Some(rect); });
             SEC_HOVERED.set(None);
+            LRESULT(0)
+        }
+        WM_SECONDARY_RENDER => {
+            let hover = SEC_HOVERED.get();
+            let rect_opt = SEC_RECT.try_with(|r| *r.borrow()).ok().flatten();
+            if let Some(rect) = rect_opt {
+                let _ = SEC_MODEL.try_with(|m| {
+                    if let Some(ref mdl) = *m.borrow() {
+                        render_and_update(hwnd, rect, mdl, hover, None);
+                    }
+                });
+            }
             LRESULT(0)
         }
         WM_CLOSE => {
