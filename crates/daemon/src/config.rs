@@ -617,6 +617,12 @@ pub struct WindowRule {
     /// stays tiled and follows as a column. Opens on the active workspace.
     #[serde(default)]
     pub sticky: bool,
+
+    /// Tile the window on whichever monitor Windows initially placed it,
+    /// instead of the monitor under the cursor. Useful for apps that manage
+    /// their own monitor placement and should land where they asked to open.
+    #[serde(default)]
+    pub tile_on_os_monitor: bool,
 }
 
 /// Action to take for a matching window.
@@ -979,6 +985,8 @@ pub struct CompiledWindowRule {
     pub open_in_column: Option<usize>,
     /// Make the window sticky on open.
     pub sticky: bool,
+    /// Tile on the monitor Windows chose rather than the cursor's monitor.
+    pub tile_on_os_monitor: bool,
 }
 
 impl CompiledWindowRule {
@@ -1377,6 +1385,7 @@ impl Config {
                 column_width,
                 open_in_column,
                 sticky: rule.sticky,
+                tile_on_os_monitor: rule.tile_on_os_monitor,
             });
         }
 
@@ -1395,6 +1404,7 @@ impl Config {
                 column_width: None,
                 open_in_column: None,
                 sticky: false,
+                tile_on_os_monitor: false,
             });
         }
 

@@ -611,7 +611,7 @@ impl AppState {
             let action = matched
                 .map(|r| r.action)
                 .unwrap_or(config::WindowAction::Tile);
-            let (rule_workspace, rule_maximized, rule_column_width, rule_slot, rule_sticky) =
+            let (rule_workspace, rule_maximized, rule_column_width, rule_slot, rule_sticky, rule_tile_on_os_monitor) =
                 matched
                     .map(|r| {
                         (
@@ -620,9 +620,10 @@ impl AppState {
                             r.column_width,
                             r.open_in_column,
                             r.sticky,
+                            r.tile_on_os_monitor,
                         )
                     })
-                    .unwrap_or((None, false, None, None, false));
+                    .unwrap_or((None, false, None, None, false, false));
 
             if action == config::WindowAction::Ignore {
                 debug!(
@@ -654,7 +655,16 @@ impl AppState {
             // back to `focused_monitor` if the cursor can't be located or
             // doesn't resolve to a known monitor.
             // A per-app rule's open_on_workspace can still redirect it below.
-            let monitor_id = self.monitor_under_cursor().unwrap_or(self.focused_monitor);
+            // `tile_on_os_monitor = true` overrides this: the window's own
+            // rect (as reported by Windows at creation) picks the monitor.
+            let monitor_id = if rule_tile_on_os_monitor {
+                let monitors: Vec<_> = self.monitors.values().cloned().collect();
+                find_monitor_for_rect(&monitors, &win_info.rect)
+                    .map(|m| m.id)
+                    .unwrap_or(self.focused_monitor)
+            } else {
+                self.monitor_under_cursor().unwrap_or(self.focused_monitor)
+            };
 
             // Get floating rect before borrowing workspace mutably
             let floating_rect = if action == config::WindowAction::Float {
