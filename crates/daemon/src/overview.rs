@@ -578,7 +578,11 @@ impl AppState {
             let Some((rect, model)) = self.build_overview_model_for(mon_id) else {
                 continue;
             };
-            match SecondaryOverlay::new() {
+            let Some(tx) = self.overview_event_tx.clone() else {
+                warn!("Secondary overlay skipped: overview event channel not ready");
+                continue;
+            };
+            match SecondaryOverlay::new(tx) {
                 Ok(overlay) => {
                     overlay.show(rect, model);
                     self.overview_secondary_overlays.push(overlay);

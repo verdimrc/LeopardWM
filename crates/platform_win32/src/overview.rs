@@ -1611,17 +1611,69 @@ impl Drop for OverviewOverlay {
     }
 }
 
-// --- Secondary (non-interactive) overlay ----------------------------------
+// --- Secondary (display-only + hook-click) overlay ------------------------
 //
 // One per non-focused monitor when `toggle_overview_all` is active.
-// Uses the per-pixel-alpha UpdateLayeredWindow pipeline (AlphaDim path)
-// rendered once from the daemon thread; no animation, no interaction.
+// The window is WS_EX_TRANSPARENT so it never participates in focus or
+// cursor routing — no spinning cursor, no MA_NOACTIVATE dance. Clicks are
+// detected by a WH_MOUSE_LL hook installed in the overlay thread; the hook
+// hit-tests the latest model (stored in thread-local storage) and sends
+// OverviewEvents back to the daemon.
 
-/// Non-interactive overview window shown on monitors other than the focused
-/// one during an all-monitors overview (`Ctrl+Alt+Win+Space`).
-pub struct SecondaryOverlay {
-    hwnd: HWND,
-    _thread: Option<std::thread::JoinHandle<()>>,
+/// PostMessage tag: daemon ships a new Box<OverviewModel> via LPARAM so
+/// the overlay thread can update its thread-local hit-test model.
+const WM_SECONDARY_SET_MODEL: u32 = WM_USER + 7;
+
+// Thread-local state for the overlay thread.  Each SecondaryOverlay
+// spawns its own thread, so each instance gets an independent set.
+std::thread_local! {
+    static SEC_HWND:  std::cell::Cell<isize>                          = const { std::cell::Cell::new(0) };
+    static SEC_HOOK:  std::cell::Cell<isize>                          = const { std::cell::Cell::new(0) };
+    static SEC_MODEL: std::cell::RefCell<Option<OverviewModel>>       = const { std::cell::RefCell::new(None) };
+    static SEC_TX:    std::cell::RefCell<Option<mpsc::Sender<OverviewEvent>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// WH_MOUSE_LL callback — runs in the overlay thread during GetMessageW.
+/// Intercepts left-button-up events, converts screen→client coordinates,
+/// hit-tests against the stored model, and fires an OverviewEvent.
+/// Always calls CallNextHookEx so the click also reaches whatever window
+/// is beneath the transparent overlay.
+unsafe extern "system" fn secondary_mouse_hook(
+    code: i32,
+    wp: WPARAM,
+    lp: LPARAM,
+) -> LRESULT {
+    let hook = HHOOK(SEC_HOOK.get() as *mut c_void);
+    if code >= 0 && wp.0 as u32 == WM_LBUTTONUP {
+        let info = &*(lp.0 as *const MSLLHOOKSTRUCT);
+        let sx = info.pt.x;
+        let sy = info.pt.y;
+        let hwnd = HWND(SEC_HWND.get() as *mut c_void);
+        let mut wr = windows::Win32::Foundation::RECT::default();
+        if GetWindowRect(hwnd, &mut wr).is_ok() {
+            let cx = sx - wr.left;
+            let cy = sy - wr.top;
+            let in_bounds = cx >= 0
+                && cy >= 0
+                && cx < wr.right - wr.left
+                && cy < wr.bottom - wr.top;
+            if in_bounds {
+                // Resolve event first, then send — avoids nested try_with.
+                let event = SEC_MODEL
+                    .try_with(|m| m.borrow().as_ref().and_then(|mdl| secondary_hit_test(mdl, cx, cy)))
+                    .ok()
+                    .flatten();
+                if let Some(ev) = event {
+                    let _ = SEC_TX.try_with(|tx| {
+                        if let Some(ref sender) = *tx.borrow() {
+                            let _ = sender.send(ev);
+                        }
+                    });
+                }
+            }
+        }
+    }
+    CallNextHookEx(Some(hook), code, wp, lp)
 }
 
 unsafe extern "system" fn secondary_wnd_proc(
@@ -1631,11 +1683,23 @@ unsafe extern "system" fn secondary_wnd_proc(
     lp: LPARAM,
 ) -> LRESULT {
     match msg {
+        WM_SECONDARY_SET_MODEL => {
+            let new_model = Box::from_raw(lp.0 as *mut OverviewModel);
+            let _ = SEC_MODEL.try_with(|m| { *m.borrow_mut() = Some(*new_model); });
+            LRESULT(0)
+        }
         WM_CLOSE => {
             let _ = DestroyWindow(hwnd);
             LRESULT(0)
         }
         WM_DESTROY => {
+            let hook = SEC_HOOK.get();
+            if hook != 0 {
+                let _ = UnhookWindowsHookEx(HHOOK(hook as *mut c_void));
+                SEC_HOOK.set(0);
+            }
+            let _ = SEC_MODEL.try_with(|m| { *m.borrow_mut() = None; });
+            let _ = SEC_TX.try_with(|tx| { *tx.borrow_mut() = None; });
             PostQuitMessage(0);
             LRESULT(0)
         }
@@ -1643,11 +1707,34 @@ unsafe extern "system" fn secondary_wnd_proc(
     }
 }
 
+/// Hit-test (x, y) in overlay client coordinates against the model.
+/// Returns `ActivateWindow` for a card click, `SwitchWorkspace` for a
+/// label-strip or empty-panel click, `None` for background.
+fn secondary_hit_test(model: &OverviewModel, x: i32, y: i32) -> Option<OverviewEvent> {
+    for row in &model.rows {
+        for card in &row.cards {
+            if rect_contains(&card.rect, x, y) {
+                return Some(OverviewEvent::ActivateWindow(card.window_id));
+            }
+        }
+        if rect_contains(&row.panel, x, y) {
+            return Some(OverviewEvent::SwitchWorkspace(row.workspace_index));
+        }
+    }
+    None
+}
+
+/// Non-interactive display overlay for non-focused monitors. Clicks are
+/// detected by a WH_MOUSE_LL hook rather than the window proc, so the
+/// window can stay WS_EX_TRANSPARENT and never trigger focus machinery.
+pub struct SecondaryOverlay {
+    hwnd: HWND,
+    _thread: Option<std::thread::JoinHandle<()>>,
+}
+
 impl SecondaryOverlay {
-    /// Spawn the background thread and create the non-interactive overlay
-    /// window. Skipped in test builds (same guard as `OverviewOverlay::new`).
     #[cfg_attr(test, allow(unused_variables))]
-    pub fn new() -> Result<Self, Win32Error> {
+    pub fn new(event_tx: mpsc::Sender<OverviewEvent>) -> Result<Self, Win32Error> {
         #[cfg(test)]
         panic!("SecondaryOverlay::new spawns a top-level window; gate behind cfg(test)");
         #[allow(unreachable_code)]
@@ -1663,27 +1750,35 @@ impl SecondaryOverlay {
                         lpszClassName: windows::core::PCWSTR(class_name.as_ptr()),
                         ..Default::default()
                     };
-                    // Ignore ERROR_CLASS_ALREADY_EXISTS from prior registrations.
                     let _ = RegisterClassW(&wc);
                     match CreateWindowExW(
-                        WS_EX_TOOLWINDOW
-                            | WS_EX_TOPMOST
-                            | WS_EX_LAYERED
-                            | WS_EX_TRANSPARENT
-                            | WS_EX_NOACTIVATE,
+                        // WS_EX_TRANSPARENT: clicks pass through so this window
+                        // never touches the focus system (no spinning cursor).
+                        // Clicks are intercepted by the WH_MOUSE_LL hook below.
+                        // WS_EX_NOACTIVATE is omitted: WS_EX_TRANSPARENT already
+                        // prevents any mouse message from reaching this window.
+                        WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TRANSPARENT,
                         windows::core::PCWSTR(class_name.as_ptr()),
                         None,
                         WS_POPUP,
-                        0,
-                        0,
-                        1,
-                        1,
-                        None,
-                        None,
-                        None,
-                        None,
+                        0, 0, 1, 1,
+                        None, None, None, None,
                     ) {
                         Ok(h) => {
+                            SEC_HWND.set(h.0 as isize);
+                            let _ = SEC_TX.try_with(|slot| {
+                                *slot.borrow_mut() = Some(event_tx);
+                            });
+                            match SetWindowsHookExW(WH_MOUSE_LL, Some(secondary_mouse_hook), None, 0) {
+                                Ok(hook) => SEC_HOOK.set(hook.0 as isize),
+                                Err(e) => {
+                                    let _ = DestroyWindow(h);
+                                    let _ = tx.send(Err(Win32Error::HookInstallFailed(
+                                        format!("SecondaryOverlay hook: {e}"),
+                                    )));
+                                    return;
+                                }
+                            }
                             let _ = tx.send(Ok(h.0 as isize));
                             let mut msg = MSG::default();
                             while GetMessageW(&mut msg, None, 0, 0).as_bool() {
@@ -1691,15 +1786,14 @@ impl SecondaryOverlay {
                             }
                         }
                         Err(e) => {
-                            let _ = tx.send(Err(Win32Error::HookInstallFailed(format!(
-                                "SecondaryOverlay: {}",
-                                e
-                            ))));
+                            let _ = tx.send(Err(Win32Error::HookInstallFailed(
+                                format!("SecondaryOverlay: {e}"),
+                            )));
                         }
                     }
                 })
                 .map_err(|e| {
-                    Win32Error::HookInstallFailed(format!("SecondaryOverlay thread: {}", e))
+                    Win32Error::HookInstallFailed(format!("SecondaryOverlay thread: {e}"))
                 })?;
 
             let hwnd_raw = match rx.recv() {
@@ -1719,26 +1813,28 @@ impl SecondaryOverlay {
         }
     }
 
-    /// Position and paint the overlay on the given monitor rect. Renders
-    /// the model via `UpdateLayeredWindow` (AlphaDim path, no animation,
-    /// no interaction). Call from the daemon thread.
+    /// Position, render, and show the overlay; ship the model to the overlay
+    /// thread so the mouse hook can hit-test it.
     pub fn show(&self, rect: Rect, model: OverviewModel) {
         unsafe {
             let _ = SetWindowPos(
                 self.hwnd,
-                Some(HWND_TOPMOST),
-                rect.x,
-                rect.y,
-                rect.width,
-                rect.height,
+                None,
+                rect.x, rect.y, rect.width, rect.height,
                 SWP_NOACTIVATE | SWP_NOZORDER,
             );
             render_and_update(self.hwnd, rect, &model, None, None);
+            let raw = Box::into_raw(Box::new(model)) as isize;
+            let _ = PostMessageW(
+                Some(self.hwnd),
+                WM_SECONDARY_SET_MODEL,
+                WPARAM(0),
+                LPARAM(raw),
+            );
             let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
         }
     }
 
-    /// Close the secondary overlay window.
     pub fn hide(&self) {
         unsafe {
             let _ = PostMessageW(Some(self.hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
@@ -1748,8 +1844,6 @@ impl SecondaryOverlay {
 
 impl Drop for SecondaryOverlay {
     fn drop(&mut self) {
-        // WM_CLOSE → WM_DESTROY → PostQuitMessage breaks the message loop.
-        // Posting to an already-destroyed hwnd fails silently.
         unsafe {
             let _ = PostMessageW(Some(self.hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
         }
