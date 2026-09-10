@@ -1627,48 +1627,82 @@ const WM_SECONDARY_SET_MODEL: u32 = WM_USER + 7;
 // Thread-local state for the overlay thread.  Each SecondaryOverlay
 // spawns its own thread, so each instance gets an independent set.
 std::thread_local! {
-    static SEC_HWND:  std::cell::Cell<isize>                          = const { std::cell::Cell::new(0) };
-    static SEC_HOOK:  std::cell::Cell<isize>                          = const { std::cell::Cell::new(0) };
-    static SEC_MODEL: std::cell::RefCell<Option<OverviewModel>>       = const { std::cell::RefCell::new(None) };
-    static SEC_TX:    std::cell::RefCell<Option<mpsc::Sender<OverviewEvent>>> = const { std::cell::RefCell::new(None) };
+    static SEC_HWND:    std::cell::Cell<isize>                               = const { std::cell::Cell::new(0) };
+    static SEC_HOOK:    std::cell::Cell<isize>                               = const { std::cell::Cell::new(0) };
+    static SEC_MODEL:   std::cell::RefCell<Option<OverviewModel>>            = const { std::cell::RefCell::new(None) };
+    static SEC_TX:      std::cell::RefCell<Option<mpsc::Sender<OverviewEvent>>> = const { std::cell::RefCell::new(None) };
+    static SEC_RECT:    std::cell::RefCell<Option<Rect>>                     = const { std::cell::RefCell::new(None) };
+    static SEC_HOVERED: std::cell::Cell<Option<(usize, usize)>>              = const { std::cell::Cell::new(None) };
+}
+
+/// Payload for `WM_SECONDARY_SET_MODEL`: carries both the new model and the
+/// monitor rect so the hover re-render has everything it needs in one message.
+struct SecondaryModelUpdate {
+    model: OverviewModel,
+    rect:  Rect,
 }
 
 /// WH_MOUSE_LL callback — runs in the overlay thread during GetMessageW.
-/// Intercepts left-button-up events, converts screen→client coordinates,
-/// hit-tests against the stored model, and fires an OverviewEvent.
-/// Always calls CallNextHookEx so the click also reaches whatever window
-/// is beneath the transparent overlay.
+/// Handles WM_MOUSEMOVE (hover highlighting) and WM_LBUTTONUP (activation).
+/// Always calls CallNextHookEx so events also reach whatever is beneath the
+/// transparent overlay.
 unsafe extern "system" fn secondary_mouse_hook(
     code: i32,
     wp: WPARAM,
     lp: LPARAM,
 ) -> LRESULT {
     let hook = HHOOK(SEC_HOOK.get() as *mut c_void);
-    if code >= 0 && wp.0 as u32 == WM_LBUTTONUP {
-        let info = &*(lp.0 as *const MSLLHOOKSTRUCT);
-        let sx = info.pt.x;
-        let sy = info.pt.y;
-        let hwnd = HWND(SEC_HWND.get() as *mut c_void);
-        let mut wr = windows::Win32::Foundation::RECT::default();
-        if GetWindowRect(hwnd, &mut wr).is_ok() {
-            let cx = sx - wr.left;
-            let cy = sy - wr.top;
-            let in_bounds = cx >= 0
-                && cy >= 0
-                && cx < wr.right - wr.left
-                && cy < wr.bottom - wr.top;
-            if in_bounds {
-                // Resolve event first, then send — avoids nested try_with.
-                let event = SEC_MODEL
-                    .try_with(|m| m.borrow().as_ref().and_then(|mdl| secondary_hit_test(mdl, cx, cy)))
-                    .ok()
-                    .flatten();
-                if let Some(ev) = event {
-                    let _ = SEC_TX.try_with(|tx| {
-                        if let Some(ref sender) = *tx.borrow() {
-                            let _ = sender.send(ev);
+    if code >= 0 {
+        let msg_id = wp.0 as u32;
+        if msg_id == WM_LBUTTONUP || msg_id == WM_MOUSEMOVE {
+            let info = &*(lp.0 as *const MSLLHOOKSTRUCT);
+            let sx = info.pt.x;
+            let sy = info.pt.y;
+            let hwnd = HWND(SEC_HWND.get() as *mut c_void);
+            let mut wr = windows::Win32::Foundation::RECT::default();
+            if GetWindowRect(hwnd, &mut wr).is_ok() {
+                let cx = sx - wr.left;
+                let cy = sy - wr.top;
+                let in_bounds = cx >= 0
+                    && cy >= 0
+                    && cx < wr.right - wr.left
+                    && cy < wr.bottom - wr.top;
+
+                if msg_id == WM_LBUTTONUP && in_bounds {
+                    let event = SEC_MODEL
+                        .try_with(|m| m.borrow().as_ref().and_then(|mdl| secondary_hit_test(mdl, cx, cy)))
+                        .ok()
+                        .flatten();
+                    if let Some(ev) = event {
+                        let _ = SEC_TX.try_with(|tx| {
+                            if let Some(ref sender) = *tx.borrow() {
+                                let _ = sender.send(ev);
+                            }
+                        });
+                    }
+                }
+
+                if msg_id == WM_MOUSEMOVE {
+                    let new_hover = if in_bounds {
+                        SEC_MODEL
+                            .try_with(|m| m.borrow().as_ref().and_then(|mdl| secondary_card_at(mdl, cx, cy)))
+                            .ok()
+                            .flatten()
+                    } else {
+                        None
+                    };
+                    let old_hover = SEC_HOVERED.get();
+                    if new_hover != old_hover {
+                        SEC_HOVERED.set(new_hover);
+                        let rect_opt = SEC_RECT.try_with(|r| *r.borrow()).ok().flatten();
+                        if let Some(rect) = rect_opt {
+                            let _ = SEC_MODEL.try_with(|m| {
+                                if let Some(ref mdl) = *m.borrow() {
+                                    render_and_update(hwnd, rect, mdl, new_hover, None);
+                                }
+                            });
                         }
-                    });
+                    }
                 }
             }
         }
@@ -1684,8 +1718,10 @@ unsafe extern "system" fn secondary_wnd_proc(
 ) -> LRESULT {
     match msg {
         WM_SECONDARY_SET_MODEL => {
-            let new_model = Box::from_raw(lp.0 as *mut OverviewModel);
-            let _ = SEC_MODEL.try_with(|m| { *m.borrow_mut() = Some(*new_model); });
+            let SecondaryModelUpdate { model, rect } = *Box::from_raw(lp.0 as *mut SecondaryModelUpdate);
+            let _ = SEC_MODEL.try_with(|m| { *m.borrow_mut() = Some(model); });
+            let _ = SEC_RECT.try_with(|r| { *r.borrow_mut() = Some(rect); });
+            SEC_HOVERED.set(None);
             LRESULT(0)
         }
         WM_CLOSE => {
@@ -1700,6 +1736,8 @@ unsafe extern "system" fn secondary_wnd_proc(
             }
             let _ = SEC_MODEL.try_with(|m| { *m.borrow_mut() = None; });
             let _ = SEC_TX.try_with(|tx| { *tx.borrow_mut() = None; });
+            let _ = SEC_RECT.try_with(|r| { *r.borrow_mut() = None; });
+            SEC_HOVERED.set(None);
             PostQuitMessage(0);
             LRESULT(0)
         }
@@ -1719,6 +1757,20 @@ fn secondary_hit_test(model: &OverviewModel, x: i32, y: i32) -> Option<OverviewE
         }
         if rect_contains(&row.panel, x, y) {
             return Some(OverviewEvent::SwitchWorkspace(row.workspace_index));
+        }
+    }
+    None
+}
+
+/// Returns `Some((row_index, card_index))` if (x, y) in overlay client
+/// coordinates lands on a card thumbnail; `None` for background or panel.
+/// Used by the mouse hook to track hover state for highlighting.
+fn secondary_card_at(model: &OverviewModel, x: i32, y: i32) -> Option<(usize, usize)> {
+    for (ri, row) in model.rows.iter().enumerate() {
+        for (ci, card) in row.cards.iter().enumerate() {
+            if rect_contains(&card.rect, x, y) {
+                return Some((ri, ci));
+            }
         }
     }
     None
@@ -1824,7 +1876,7 @@ impl SecondaryOverlay {
                 SWP_NOACTIVATE | SWP_NOZORDER,
             );
             render_and_update(self.hwnd, rect, &model, None, None);
-            let raw = Box::into_raw(Box::new(model)) as isize;
+            let raw = Box::into_raw(Box::new(SecondaryModelUpdate { model, rect })) as isize;
             let _ = PostMessageW(
                 Some(self.hwnd),
                 WM_SECONDARY_SET_MODEL,
