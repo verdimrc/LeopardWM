@@ -1183,6 +1183,7 @@ impl AppState {
             self.snap_back_tiled(source_monitor, drag.source_workspace_idx);
             return;
         }
+        let source_viewport_w = self.layout_viewport(source_monitor).width;
         let target_viewport = self.layout_viewport(target_monitor);
 
         let tgt_idx = self.active_workspace_idx(target_monitor);
@@ -1255,6 +1256,16 @@ impl AppState {
             .get_mut(&target_monitor)
             .and_then(|v| v.get_mut(tgt_idx))
         {
+            // Scale column width to preserve the same fraction on the target monitor.
+            let scaled_w = if source_viewport_w > 0 {
+                ((column.width() as f64 / source_viewport_w as f64)
+                    * target_viewport.width as f64)
+                    .round() as i32
+            } else {
+                column.width()
+            };
+            let mut column = column;
+            column.set_width(scaled_w);
             target_ws.insert_column_at(column, insert_idx);
             for wid in &minimized_in_col {
                 target_ws.mark_minimized(*wid);
