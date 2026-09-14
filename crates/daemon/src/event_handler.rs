@@ -1644,6 +1644,24 @@ impl AppState {
             if self.should_suppress_workspace_switch_focus(hwnd, event_time_ms) {
                 return;
             }
+            // Drop stale focus events only during active layout work — apps that
+            // call SetForegroundWindow on themselves in response to being
+            // repositioned by SetWindowPos can queue a spurious Focused event.
+            // By the time the daemon processes it, sync_foreground_window has
+            // already re-asserted the correct foreground window, so
+            // GetForegroundWindow disagrees. Outside of layout work (e.g.
+            // overview activation) we let the event through normally.
+            if self.applying_layout || self.layout_transition.is_some() {
+                if let Some(fg) = leopardwm_platform_win32::get_foreground_window() {
+                    if fg != hwnd {
+                        debug!(
+                            "Dropping stale focus event for {} during layout (OS fg: {})",
+                            hwnd, fg
+                        );
+                        return;
+                    }
+                }
+            }
             self.follow_workspace_without_stealing_focus(monitor_id, ws_idx);
 
             let viewport_width = self.viewport_width_for(monitor_id);
