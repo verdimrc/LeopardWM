@@ -466,6 +466,14 @@ pub struct BehaviorConfig {
     #[serde(default = "default_true")]
     pub fullscreen_follows_focus: bool,
 
+    /// Treat Left and Right Ctrl/Alt as interchangeable in hotkeys.
+    /// Useful for one-handed operation (e.g. using only the right hand).
+    /// When on, only Left Ctrl + Right Alt together are suppressed as AltGr;
+    /// Right Alt alone or Right Ctrl + Right Alt work as normal modifiers.
+    /// Off by default to stay safe on international keyboard layouts.
+    #[serde(default = "default_false")]
+    pub symmetric_modifiers: bool,
+
     /// Show a toast notification when a window is left floating because
     /// it runs at a higher privilege level than the daemon. Set to false
     /// to silence the pop-up.
@@ -503,6 +511,7 @@ impl Default for BehaviorConfig {
             mouse_follows_focus: false,
             fullscreen_follows_focus: true,
             notify_elevation_blocked: true,
+            symmetric_modifiers: false,
         }
     }
 }

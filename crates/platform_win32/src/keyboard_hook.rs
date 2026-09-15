@@ -51,6 +51,9 @@ static HOOK_FN_MOD_MASK: std::sync::Mutex<u16> = std::sync::Mutex::new(0);
 /// Which masked F13–F24 modifiers are currently held. Maintained from the hook's
 /// own key-down/up events (a swallowed key never updates `GetAsyncKeyState`).
 static HOOK_FN_HELD: std::sync::Mutex<u16> = std::sync::Mutex::new(0);
+/// When true, Left and Right Ctrl/Alt are treated as interchangeable. See
+/// `BehaviorConfig::symmetric_modifiers`.
+static HOOK_SYMMETRIC_MODIFIERS: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
 
 // Modifier virtual-key codes (both the generic and left/right variants the
 // low-level hook reports).
@@ -130,6 +133,9 @@ impl Drop for KeyboardHookHandle {
         drop(mask);
         let mut fn_held = HOOK_FN_HELD.lock().unwrap_or_else(recover_poisoned_mutex);
         *fn_held = 0;
+        drop(fn_held);
+        let mut sym = HOOK_SYMMETRIC_MODIFIERS.lock().unwrap_or_else(recover_poisoned_mutex);
+        *sym = false;
         tracing::debug!("Keyboard hook stopped");
     }
 }
@@ -139,6 +145,7 @@ impl Drop for KeyboardHookHandle {
 /// must be kept alive and a receiver for matched binds.
 pub fn install_keyboard_hook(
     binds: Vec<HotkeyBind>,
+    symmetric_modifiers: bool,
 ) -> Result<(KeyboardHookHandle, mpsc::Receiver<HotkeyEvent>), Win32Error> {
     let count = binds.len();
     let (tx, rx) = mpsc::channel();
@@ -180,6 +187,12 @@ pub fn install_keyboard_hook(
             Win32Error::HookInstallFailed("Hook fn-held mutex poisoned".to_string())
         })?;
         *fn_held = 0;
+    }
+    {
+        let mut sym = HOOK_SYMMETRIC_MODIFIERS
+            .lock()
+            .map_err(|_| Win32Error::HookInstallFailed("Hook sym-mod mutex poisoned".to_string()))?;
+        *sym = symmetric_modifiers;
     }
 
     let (init_tx, init_rx) = std::sync::mpsc::channel::<Result<u32, Win32Error>>();
@@ -329,18 +342,19 @@ unsafe fn keyboard_ll_hook_inner(ncode: i32, wparam: WPARAM, lparam: LPARAM) -> 
         }
     };
 
-    // AltGr emits Left Ctrl + Right Alt. Treat any Right-Alt-down state as AltGr
-    // and never match a bind, so AltGr combos pass through and type normally on
-    // international layouts (the synthesized Left Ctrl would otherwise satisfy a
-    // Ctrl bind too).
-    if GetAsyncKeyState(VK_RMENU) < 0 {
+    let symmetric = *HOOK_SYMMETRIC_MODIFIERS
+        .lock()
+        .unwrap_or_else(recover_poisoned_mutex);
+    let right_alt = GetAsyncKeyState(VK_RMENU) < 0;
+    let left_ctrl = GetAsyncKeyState(VK_LCONTROL) < 0;
+    // AltGr = synthesized Left Ctrl + Right Alt. When symmetric_modifiers is off,
+    // also suppress any lone Right Alt to stay safe on international layouts.
+    if right_alt && (left_ctrl || !symmetric) {
         return CallNextHookEx(None, ncode, wparam, lparam);
     }
-    // Read the left/right-specific modifiers: Alt means Left Alt only (Right Alt
-    // is AltGr, handled above); Ctrl/Shift/Win accept either side.
     let held = Modifiers {
-        ctrl: GetAsyncKeyState(VK_LCONTROL) < 0 || GetAsyncKeyState(VK_RCONTROL) < 0,
-        alt: GetAsyncKeyState(VK_LMENU) < 0,
+        ctrl: left_ctrl || GetAsyncKeyState(VK_RCONTROL) < 0,
+        alt: GetAsyncKeyState(VK_LMENU) < 0 || (symmetric && right_alt),
         shift: GetAsyncKeyState(VK_LSHIFT) < 0 || GetAsyncKeyState(VK_RSHIFT) < 0,
         win: GetAsyncKeyState(VK_LWIN) < 0 || GetAsyncKeyState(VK_RWIN) < 0,
         // F13–F24 modifiers come from our own tracking, not GetAsyncKeyState:

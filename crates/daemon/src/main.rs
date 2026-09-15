@@ -418,8 +418,9 @@ fn protected_binds(bind_labels: &[BindInfo]) -> Vec<String> {
 fn install_hotkey_hook(
     binds: Vec<HotkeyBind>,
     event_tx: mpsc::Sender<DaemonEvent>,
+    symmetric_modifiers: bool,
 ) -> Option<KeyboardHookHandle> {
-    match install_keyboard_hook(binds) {
+    match install_keyboard_hook(binds, symmetric_modifiers) {
         Ok((handle, rx)) => {
             if let Err(e) = std::thread::Builder::new()
                 .name("hotkey-fwd".to_string())
@@ -529,7 +530,7 @@ fn setup_hotkeys(config: &Config, event_tx: mpsc::Sender<DaemonEvent>) -> Hotkey
         );
     }
 
-    let hook = install_hotkey_hook(binds, event_tx);
+    let hook = install_hotkey_hook(binds, event_tx, config.behavior.symmetric_modifiers);
     let registered_count = if hook.is_some() { requested_count } else { 0 };
     if hook.is_some() {
         info!(
