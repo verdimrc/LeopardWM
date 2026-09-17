@@ -545,23 +545,13 @@ impl AppState {
                 .map_err(|e| format!("Failed to add floating window to target: {}", e))?;
         } else {
             let source_column_width = source_workspace.column_width_for_window(window_id);
-            let source_viewport_w = self.viewport_width_for(source_monitor);
             source_workspace
                 .remove_window(window_id)
                 .map_err(|e| format!("Failed to remove window: {}", e))?;
             let target_viewport_w = self.viewport_width_for(target_monitor);
-            // Scale column width proportionally so the window occupies the same
-            // fraction of the target monitor as it did on the source.
-            let scaled_column_width = source_column_width.map(|w| {
-                if source_viewport_w > 0 {
-                    ((w as f64 / source_viewport_w as f64) * target_viewport_w as f64).round()
-                        as i32
-                } else {
-                    w
-                }
-            });
+            let clamped_column_width = source_column_width.map(|w| w.min(target_viewport_w));
             target_workspace
-                .insert_window(window_id, scaled_column_width)
+                .insert_window(window_id, clamped_column_width)
                 .map_err(|e| format!("Failed to add window to target: {}", e))?;
         }
 
