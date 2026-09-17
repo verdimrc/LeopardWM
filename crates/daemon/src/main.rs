@@ -14,16 +14,20 @@
 mod animation_worker;
 mod command_handler;
 mod config;
+#[cfg(test)]
+mod diagnostics_validation;
 mod drag;
 mod event_handler;
 mod events;
 mod helpers;
+mod hotkey_resolution;
 mod ipc_server;
 mod layout_apply;
 mod monitors;
 mod notify;
 mod overview;
 mod persistence;
+mod physical_placement;
 mod scratchpad;
 mod settings;
 mod startup;
@@ -44,15 +48,16 @@ use state::*;
 use anyhow::Result;
 use clap::Parser;
 use config::Config;
+use layout_apply::AnimationPlacementResult;
 use leopardwm_core_layout::Rect;
 use leopardwm_ipc::{pipe_name_candidates, preferred_pipe_name, IpcCommand, IpcResponse};
 use leopardwm_platform_win32::{
-    cascade_windows, enumerate_monitors, enumerate_windows, fn_mod_bit, install_event_hooks,
-    install_keyboard_hook, install_mouse_hook, overlay::OverlayWindow, parse_hotkey_string,
-    register_gestures, register_system_events, restore_windows_moved_offscreen,
-    set_display_change_sender, set_dpi_awareness, set_power_state_sender, set_session_end_handler,
-    uncloak_all_visible_windows, GestureEvent, Hotkey, HotkeyBind, HotkeyId, KeyboardHookHandle,
-    Modifiers, MonitorId, MonitorInfo, MouseHookHandle, WindowEvent,
+    cascade_windows, enumerate_monitors, enumerate_windows, format_hotkey, install_event_hooks,
+    install_keyboard_hook, install_mouse_hook, overlay::OverlayWindow, register_gestures,
+    register_system_events, restore_windows_moved_offscreen, set_display_change_sender,
+    set_dpi_awareness, set_power_state_sender, set_recording, set_session_end_handler,
+    uncloak_all_visible_windows, GestureEvent, HotkeyBind, HotkeyId, KeyboardHookEvent,
+    KeyboardHookHandle, Modifiers, MonitorId, MonitorInfo, MouseHookHandle, WindowEvent,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -305,9 +310,8 @@ struct HotkeyState {
     /// System-event window (display/work-area/power/session-end); kept alive for
     /// its message pump. Independent of hotkeys.
     handle: Option<leopardwm_platform_win32::SystemEventHandle>,
-    /// Low-level keyboard hook: LeopardWM's sole hotkey matcher. `None` when
-    /// there are no binds, the hook failed to install, or matching is
-    /// suspended for the Settings recorder.
+    /// Low-level keyboard hook: LeopardWM's sole hotkey matcher. `None` only
+    /// when installation failed.
     hook: Option<KeyboardHookHandle>,
     /// Mapping of hotkey IDs to commands.
     mapping: HashMap<HotkeyId, IpcCommand>,
@@ -364,6 +368,7 @@ async fn reload_config_and_hotkeys(
     // Drop both handles BEFORE setup_hotkeys rebuilds them: assignment drops the
     // old HotkeyState last, so an unhook-then-reinstall must happen here or the
     // keyboard hook's double-install guard would reject the new one.
+    let was_recording = hotkey_state.recording;
     hotkey_state.handle = None;
     hotkey_state.hook = None;
     let new_config = {
@@ -371,6 +376,10 @@ async fn reload_config_and_hotkeys(
         state.config.clone()
     };
     *hotkey_state = setup_hotkeys(&new_config, event_tx.clone());
+    if was_recording {
+        set_recording(true);
+        hotkey_state.recording = true;
+    }
     // Apply a focus-follows-mouse change from the reloaded config (e.g. the
     // Settings toggle) without waiting for a restart.
     sync_mouse_hook(
@@ -412,9 +421,8 @@ fn protected_binds(bind_labels: &[BindInfo]) -> Vec<String> {
         .collect()
 }
 
-/// Install the keyboard hook for the given binds and forward matched binds into
-/// the daemon loop as `DaemonEvent::Hotkey`. Returns `None` if the hook fails to
-/// install.
+/// Install the keyboard hook for the given binds and forward hook events into
+/// the daemon loop. Returns `None` if the hook fails to install.
 fn install_hotkey_hook(
     binds: Vec<HotkeyBind>,
     event_tx: mpsc::Sender<DaemonEvent>,
@@ -426,7 +434,13 @@ fn install_hotkey_hook(
                 .name("hotkey-fwd".to_string())
                 .spawn(move || {
                     while let Ok(event) = rx.recv() {
-                        if event_tx.blocking_send(DaemonEvent::Hotkey(event)).is_err() {
+                        let event = match event {
+                            KeyboardHookEvent::Hotkey(event) => DaemonEvent::Hotkey(event),
+                            KeyboardHookEvent::Recorded { modifiers, vk } => {
+                                DaemonEvent::RecordedHotkey { modifiers, vk }
+                            }
+                        };
+                        if event_tx.blocking_send(event).is_err() {
                             break;
                         }
                     }
@@ -454,72 +468,39 @@ fn setup_system_event_handle() -> Option<leopardwm_platform_win32::SystemEventHa
 }
 
 fn setup_hotkeys(config: &Config, event_tx: mpsc::Sender<DaemonEvent>) -> HotkeyState {
-    let config_hotkeys = &config.hotkeys.bindings;
-
-    // Build hook binds and command mapping. IDs are intrinsic to each
-    // (modifiers, vk) combo via `Hotkey::stable_id`, NOT sequential, so a
-    // config reload can never remap an existing ID to a different command.
+    let resolved = hotkey_resolution::resolve_hotkeys(&config.hotkeys);
     let mut binds: Vec<HotkeyBind> = Vec::new();
     let mut mapping = HashMap::new();
     let mut bind_labels: Vec<BindInfo> = Vec::new();
 
-    for (key_str, cmd_str) in config_hotkeys {
-        if let Some((modifiers, vk)) = parse_hotkey_string(key_str) {
-            if let Some(cmd) = config::parse_command(cmd_str) {
-                let id = Hotkey::stable_id(modifiers, vk);
-                if mapping.contains_key(&id) {
-                    warn!(
-                        "Duplicate hotkey combo for {} (id {}); ignoring the second binding",
-                        key_str, id
-                    );
-                    continue;
-                }
-                binds.push(HotkeyBind { modifiers, vk, id });
-                mapping.insert(id, cmd);
-                bind_labels.push((id, key_str.clone(), modifiers, vk));
-                debug!("Configured hotkey {}: {} -> {:?}", id, key_str, cmd_str);
-            } else {
-                warn!(
-                    "Unknown command in hotkey config: {} -> {}",
-                    key_str, cmd_str
-                );
-            }
-        } else {
-            warn!("Invalid hotkey string in config: {}", key_str);
-        }
+    for issue in &resolved.issues {
+        warn!(
+            "Hotkey {} -> {}: {}",
+            issue.binding, issue.action_id, issue.message
+        );
     }
-
+    // Include blocked F-key triggers to preserve the hook's modifier mask.
+    // Resolution already deduplicated physical IDs, including across aliases.
+    for entry in resolved.bindings {
+        let HotkeyBind { modifiers, vk, id } = entry.hook_binding;
+        debug!(
+            "Configured hotkey {}: {} -> {:?}",
+            id, entry.binding, entry.command
+        );
+        binds.push(entry.hook_binding);
+        mapping.insert(id, entry.command);
+        bind_labels.push((id, entry.binding, modifiers, vk));
+    }
     let requested_count = binds.len();
-
-    // An F13–F24 key used as a modifier is swallowed by the hook, so any bind
-    // whose trigger is that same F-key can never fire. Warn rather than fail.
-    let fn_mod_mask = binds.iter().fold(0u16, |m, b| m | b.modifiers.fn_mods);
-    for (_, key_str, _, vk) in &bind_labels {
-        if let Some(bit) = fn_mod_bit(*vk) {
-            if bit & fn_mod_mask != 0 {
-                warn!(
-                    "Hotkey {} uses an F-key that is also configured as a modifier; it will never fire",
-                    key_str
-                );
-            }
-        }
-    }
 
     // The system-event window (display/work-area/power/session-end) is
     // independent of hotkeys; create it regardless so notifications arrive.
     let handle = setup_system_event_handle();
 
     if binds.is_empty() {
-        info!("No hotkeys configured");
-        return HotkeyState {
-            handle,
-            hook: None,
-            mapping,
-            requested_count: 0,
-            registered_count: 0,
-            failed_binds: Vec::new(),
-            recording: false,
-        };
+        info!(
+            "No hotkeys configured; installing pass-through keyboard hook for Settings recording"
+        );
     }
 
     let failed_binds = protected_binds(&bind_labels);
@@ -532,7 +513,9 @@ fn setup_hotkeys(config: &Config, event_tx: mpsc::Sender<DaemonEvent>) -> Hotkey
 
     let hook = install_hotkey_hook(binds, event_tx, config.behavior.symmetric_modifiers);
     let registered_count = if hook.is_some() { requested_count } else { 0 };
-    if hook.is_some() {
+    if hook.is_some() && requested_count == 0 {
+        info!("Keyboard hook installed in pass-through mode for Settings recording");
+    } else if hook.is_some() {
         info!(
             "Matching {} global hotkeys via the keyboard hook",
             requested_count
@@ -769,6 +752,10 @@ async fn sync_pending_layout_apply_timeout_ui(
     );
 }
 
+fn prepare_initial_layout(state: &mut AppState) {
+    state.prepare_inactive_workspace_windows();
+}
+
 async fn apply_initial_layout(
     state: &Arc<Mutex<AppState>>,
     tray_manager: &Option<tray::TrayManager>,
@@ -776,7 +763,7 @@ async fn apply_initial_layout(
 ) {
     {
         let mut state = state.lock().await;
-        state.resync_minimized_from_os();
+        prepare_initial_layout(&mut state);
         if let Err(e) = state.apply_layout() {
             warn!("Failed to apply initial layout: {}", e);
         }
@@ -1655,6 +1642,7 @@ async fn process_window_event(ctx: &mut EventLoopCtx<'_>, win_event: WindowEvent
         {
             let mut state = ctx.state.lock().await;
             state.refresh_high_contrast();
+            state.invalidate_physical_display_change();
             state.display_change_pending = true;
             // A real topology/DPI change needs the full reconcile; a
             // work-area-only change (taskbar) does not. Sticky-true if a
@@ -1802,6 +1790,20 @@ async fn process_window_event(ctx: &mut EventLoopCtx<'_>, win_event: WindowEvent
                 }
             }
         }
+    }
+}
+
+fn handle_recorded_hotkey(hotkey_state: &mut HotkeyState, modifiers: Modifiers, vk: u32) {
+    if !hotkey_state.recording {
+        debug!("Dropping recorded hotkey after Settings recording ended");
+    } else if let Some(chord) = format_hotkey(modifiers, vk) {
+        settings::push_recorded_chord(&chord);
+        hotkey_state.recording = false;
+    } else {
+        debug!(
+            "Dropping recorded hotkey with unsupported virtual key {:#X}",
+            vk
+        );
     }
 }
 
@@ -2313,8 +2315,8 @@ async fn handle_persist_state_now(state: &Arc<Mutex<AppState>>) {
 
 /// Install the debounced save channel and spawn the coalescing task.
 ///
-/// `finalize_layout_success` posts a `()` request whenever a PERSISTED
-/// field changes; the task coalesces a burst into at most ~one
+/// `request_save_if_changed` posts a `()` request when its persisted-field
+/// signature changes; the task coalesces a burst into at most ~one
 /// persist/second. The task itself never touches `AppState` (which is
 /// not `Send`): after the quiet period it asks the main loop to persist
 /// via `DaemonEvent::PersistStateNow`, which builds the snapshot under
@@ -2361,29 +2363,40 @@ async fn handle_tab_action(
     tab_idx: usize,
     action: leopardwm_platform_win32::tab_strip::TabAction,
 ) {
+    handle_tab_action_with_restore(
+        state,
+        monitor,
+        workspace_idx,
+        column_idx,
+        tab_idx,
+        action,
+        leopardwm_platform_win32::restore_window_no_activate,
+    )
+    .await;
+}
+
+async fn handle_tab_action_with_restore(
+    state: &Arc<Mutex<AppState>>,
+    monitor: isize,
+    workspace_idx: usize,
+    column_idx: usize,
+    tab_idx: usize,
+    action: leopardwm_platform_win32::tab_strip::TabAction,
+    restore: impl FnOnce(u64) -> Result<(), leopardwm_platform_win32::Win32Error>,
+) {
     use leopardwm_platform_win32::tab_strip::TabAction;
     match action {
         TabAction::Activate => {
-            // Trust the strip's captured identity over current
-            // focus — focus may have changed between click and
-            // dispatch, and we want the click to apply to the
-            // column the user saw, not whatever is focused now.
             let mut s = state.lock().await;
-            let needs_focus_switch = s.focused_monitor != monitor
-                || s.active_workspace_idx(monitor) != workspace_idx
-                || s.focused_workspace()
-                    .is_none_or(|ws| ws.focused_column_index() != column_idx);
-            if needs_focus_switch {
-                s.focused_monitor = monitor;
-                if let Some(ws) = s.focused_workspace_mut() {
-                    let _ = ws.set_focus(column_idx, 0);
-                }
-            }
-            let resp = s.handle_command(IpcCommand::SetActiveTab {
-                column: column_idx,
-                tab: tab_idx,
-            });
-            if let IpcResponse::Error { message } = resp {
+            if let Some(IpcResponse::Error { message }) = s
+                .handle_tab_action_activation_with_restore(
+                    monitor,
+                    workspace_idx,
+                    column_idx,
+                    tab_idx,
+                    restore,
+                )
+            {
                 warn!("SetActiveTab from tab click failed: {}", message);
             }
         }
@@ -2542,6 +2555,138 @@ async fn handle_tab_action(
     }
 }
 
+// AppState is !Send/!Sync in every build: overlay fields store HWND
+// (BorderFrame, TabStripOverlay, OverviewOverlay). These tests still wrap
+// it in Arc<tokio::Mutex<AppState>> because handle_tab_action's production
+// signature requires that shape; Rc would change the event-loop API.
+#[allow(clippy::arc_with_non_send_sync)]
+#[cfg(test)]
+mod tab_action_tests {
+    use super::*;
+    use crate::state::PendingTabFocus;
+    use leopardwm_platform_win32::{TabAction, Win32Error};
+    use std::time::Instant;
+
+    fn monitor(id: isize, primary: bool) -> MonitorInfo {
+        MonitorInfo {
+            id,
+            rect: Rect::new((id - 1) as i32 * 1920, 0, 1920, 1080),
+            work_area: Rect::new((id - 1) as i32 * 1920, 0, 1920, 1040),
+            is_primary: primary,
+            device_name: format!("DISPLAY{id}"),
+            scale_factor: 1.0,
+        }
+    }
+
+    #[tokio::test]
+    async fn tab_activation_drops_stale_captured_workspace() {
+        let mut app = AppState::new_with_config(Config::default(), vec![monitor(1, true)]);
+        app.ensure_workspace_exists(1, 1);
+        let state = Arc::new(Mutex::new(app));
+
+        handle_tab_action(&state, 1, 1, 0, 0, TabAction::Activate).await;
+
+        let app = state.lock().await;
+        assert_eq!(app.focused_monitor, 1);
+        assert_eq!(app.active_workspace_idx(1), 0);
+        assert!(app.pending_tab_focus.is_none());
+    }
+
+    #[tokio::test]
+    async fn tab_activation_applies_valid_captured_monitor_and_column() {
+        let mut app =
+            AppState::new_with_config(Config::default(), vec![monitor(1, true), monitor(2, false)]);
+        let workspace = app.workspaces.get_mut(&2).unwrap().first_mut().unwrap();
+        workspace.insert_window(100, None).unwrap();
+        workspace.insert_window_in_column(200, 0).unwrap();
+        workspace.set_focus(0, 0).unwrap();
+        workspace.toggle_focused_column_tabbed_mode();
+        let state = Arc::new(Mutex::new(app));
+
+        handle_tab_action_with_restore(&state, 2, 0, 0, 1, TabAction::Activate, |_| Ok(())).await;
+
+        let app = state.lock().await;
+        assert_eq!(app.focused_monitor, 2);
+        let workspace = &app.workspaces[&2][0];
+        assert_eq!(workspace.column(0).unwrap().active_tab_idx(), Some(1));
+        assert_eq!(workspace.focused_window(), Some(200));
+    }
+
+    #[tokio::test]
+    async fn tab_activation_restore_failure_preserves_routing_state() {
+        let mut app =
+            AppState::new_with_config(Config::default(), vec![monitor(1, true), monitor(2, false)]);
+        let workspace = app.workspaces.get_mut(&2).unwrap().first_mut().unwrap();
+        workspace.insert_window(100, None).unwrap();
+        workspace.insert_window_in_column(200, 0).unwrap();
+        workspace.set_focus(0, 0).unwrap();
+        workspace.toggle_focused_column_tabbed_mode();
+        workspace.insert_window(300, None).unwrap();
+        workspace.set_focus(1, 0).unwrap();
+        workspace.mark_minimized(200);
+        app.previous_focused_hwnd = Some(100);
+        app.last_placed_layout_rects
+            .insert(100, Rect::new(1, 2, 3, 4));
+        app.pending_tab_focus = Some(PendingTabFocus {
+            monitor: 1,
+            workspace_idx: 0,
+            column_idx: 0,
+            tab_idx: 0,
+            set_at: Instant::now(),
+        });
+        let state = Arc::new(Mutex::new(app));
+
+        handle_tab_action_with_restore(&state, 2, 0, 0, 1, TabAction::Activate, |_| {
+            Err(Win32Error::WindowNotFound(200))
+        })
+        .await;
+
+        let app = state.lock().await;
+        assert_eq!(app.focused_monitor, 1);
+        assert_eq!(app.previous_focused_hwnd, Some(100));
+        assert_eq!(
+            app.last_placed_layout_rects.get(&100),
+            Some(&Rect::new(1, 2, 3, 4))
+        );
+        let pending = app.pending_tab_focus.unwrap();
+        assert_eq!(
+            (
+                pending.monitor,
+                pending.workspace_idx,
+                pending.column_idx,
+                pending.tab_idx
+            ),
+            (1, 0, 0, 0)
+        );
+        let workspace = &app.workspaces[&2][0];
+        assert!(workspace.is_minimized(200));
+        assert_eq!(workspace.column(0).unwrap().active_tab_idx(), Some(0));
+        assert_eq!(workspace.focused_column_index(), 1);
+        assert_eq!(workspace.focused_window(), Some(300));
+    }
+
+    #[tokio::test]
+    async fn tab_activation_drops_invalid_captured_column() {
+        let mut app =
+            AppState::new_with_config(Config::default(), vec![monitor(1, true), monitor(2, false)]);
+        let workspace = app.workspaces.get_mut(&2).unwrap().first_mut().unwrap();
+        workspace.insert_window(100, None).unwrap();
+        workspace.insert_window_in_column(200, 0).unwrap();
+        workspace.set_focus(0, 1).unwrap();
+        workspace.toggle_focused_column_tabbed_mode();
+        let state = Arc::new(Mutex::new(app));
+
+        handle_tab_action(&state, 2, 0, 1, 0, TabAction::Activate).await;
+
+        let app = state.lock().await;
+        assert_eq!(app.focused_monitor, 1);
+        let workspace = &app.workspaces[&2][0];
+        assert_eq!(workspace.focused_window(), Some(200));
+        assert_eq!(workspace.column(0).unwrap().active_tab_idx(), Some(1));
+        assert!(app.pending_tab_focus.is_none());
+    }
+}
+
 /// Handle an overview overlay action (mirrors `handle_tab_action`).
 async fn handle_overview_event(
     ctx: &mut EventLoopCtx<'_>,
@@ -2693,29 +2838,40 @@ async fn handle_settings_event(
             }
         }
         settings::SettingsEvent::SetRecording(true) => {
-            // Suspend hotkey matching while the user records a combo, so pressing
-            // it doesn't also fire its action (and so the key reaches the webview).
-            // Drop only the hook (the matcher); the system-event window stays up.
-            debug!("Settings: recording started, suspending hotkeys");
-            ctx.hotkey_state.hook = None;
+            debug!("Settings: recording started, capturing hotkeys");
+            set_recording(true);
             ctx.hotkey_state.recording = true;
         }
         settings::SettingsEvent::SetRecording(false) | settings::SettingsEvent::Closed => {
-            // Resume only if we suspended for recording. A normal close with the
-            // hook still installed is a no-op.
+            set_recording(false);
             if ctx.hotkey_state.recording {
-                debug!("Settings: recording ended, resuming hotkeys");
-                reload_config_and_hotkeys(
-                    ctx.state,
-                    ctx.hotkey_state,
-                    ctx.event_tx,
-                    ctx.tray_manager,
-                    ctx.snap_hint_overlay,
-                    ctx.mouse_hook_handle,
-                )
-                .await;
+                debug!("Settings: recording ended, resuming hotkey matching");
+                ctx.hotkey_state.recording = false;
             }
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum InterruptedAnimationFrameAction {
+    LeaveNewerFrame,
+    Resume,
+    ReapplyThenResume,
+}
+
+pub(crate) fn interrupted_animation_frame_action(
+    result: AnimationPlacementResult,
+    outstanding_animation_request_id: Option<u64>,
+) -> Option<InterruptedAnimationFrameAction> {
+    match result {
+        AnimationPlacementResult::Stale if outstanding_animation_request_id.is_some() => {
+            Some(InterruptedAnimationFrameAction::LeaveNewerFrame)
+        }
+        AnimationPlacementResult::Stale => Some(InterruptedAnimationFrameAction::Resume),
+        AnimationPlacementResult::InvalidatedCurrent => {
+            Some(InterruptedAnimationFrameAction::ReapplyThenResume)
+        }
+        AnimationPlacementResult::Current => None,
     }
 }
 
@@ -2724,9 +2880,37 @@ async fn handle_animation_frame_applied(
     ctx: &mut EventLoopCtx<'_>,
     frame_result: animation_worker::FrameResult,
 ) {
-    {
+    let (current_result, outstanding_animation_request_id) = {
         let mut state = ctx.state.lock().await;
-        state.handle_animation_placement_result(&frame_result);
+        let result = state.handle_animation_placement_result(&frame_result);
+        (result, state.animation_inflight_request_id)
+    };
+    if let Some(action) =
+        interrupted_animation_frame_action(current_result, outstanding_animation_request_id)
+    {
+        if action == InterruptedAnimationFrameAction::LeaveNewerFrame {
+            return;
+        }
+        let resumed = {
+            let mut state = ctx.state.lock().await;
+            if action == InterruptedAnimationFrameAction::ReapplyThenResume {
+                if let Err(error) = state.apply_layout() {
+                    warn!(
+                        "Current layout landing after invalidated animation frame failed: {}",
+                        error
+                    );
+                }
+            }
+            if state.is_animating() {
+                state.tick_animations(0);
+                matches!(state.send_animation_frame(ctx.animation_worker), Ok(true))
+            } else {
+                false
+            }
+        };
+        *ctx.animation_active = resumed;
+        *ctx.last_frame_instant = resumed.then(std::time::Instant::now);
+        return;
     }
     if let Err(ref e) = frame_result.apply_result {
         warn!("Animation frame failed: {}", e);
@@ -2798,12 +2982,9 @@ async fn handle_animation_frame_applied(
                 }
             }
 
-            // Uncloak surviving sources BEFORE apply_layout so
-            // the synchronous SetWindowPos hits a visible HWND.
-            for &wid in &surviving {
-                leopardwm_platform_win32::unmark_ghost_cloaked(wid);
-                leopardwm_platform_win32::apply_cloak_state(wid);
-            }
+            // Keep surviving sources cloaked through the synchronous landing.
+            // A thumbnail revocation must never expose the stale source before
+            // a current, confirmed non-parked landing.
 
             // Only this landing pass follows an async frame burst,
             // so it is the only `apply_layout` that needs to fire
@@ -2821,22 +3002,64 @@ async fn handle_animation_frame_applied(
                 );
             }
 
-            // If landing succeeded and we have ghosts,
-            // transfer their handles to the worker for an
-            // 8-frame ease-in-cubic crossfade. If landing
-            // failed, drop handles immediately (hard cut) —
-            // a fade over a misaligned source produces a
-            // visible duplicate.
-            if landing_ok && !surviving.is_empty() {
+            // Expose a source only after a successful current landing. A
+            // failed, parked, or invalidated landing remains blocked rather
+            // than briefly revealing the stale live HWND when its thumbnail
+            // is removed.
+            let mut exposed_ghosts = Vec::with_capacity(surviving.len());
+            if landing_ok {
+                for wid in &surviving {
+                    if state.physical_landing_is_safe_to_expose(*wid) {
+                        leopardwm_platform_win32::unmark_ghost_cloaked(*wid);
+                        leopardwm_platform_win32::apply_cloak_state(*wid);
+                        exposed_ghosts.push(*wid);
+                    } else {
+                        warn!(
+                            "Ghost source {} remains blocked after an unconfirmed physical landing",
+                            wid
+                        );
+                        state.ghost_sources_pending_safe_landing.insert(*wid);
+                    }
+                }
+                let pending: Vec<u64> = state
+                    .ghost_sources_pending_safe_landing
+                    .iter()
+                    .copied()
+                    .collect();
+                for wid in pending {
+                    if state.physical_landing_is_safe_to_expose(wid) {
+                        leopardwm_platform_win32::unmark_ghost_cloaked(wid);
+                        leopardwm_platform_win32::apply_cloak_state(wid);
+                        state.ghost_sources_pending_safe_landing.remove(&wid);
+                    }
+                }
+            } else {
+                state
+                    .ghost_sources_pending_safe_landing
+                    .extend(surviving.iter().copied());
+            }
+
+            // Crossfade only a current, confirmed physical destination. Stored
+            // logical thumbnail destinations are not reused after projection.
+            if landing_ok && !exposed_ghosts.is_empty() {
                 state.crossfade_epoch_counter = state.crossfade_epoch_counter.saturating_add(1);
                 let epoch = state.crossfade_epoch_counter;
                 let mut entries: Vec<animation_worker::CrossfadeEntry> =
-                    Vec::with_capacity(surviving.len());
+                    Vec::with_capacity(exposed_ghosts.len());
                 let mut sources: std::collections::HashSet<u64> =
-                    std::collections::HashSet::with_capacity(surviving.len());
-                for wid in &surviving {
+                    std::collections::HashSet::with_capacity(exposed_ghosts.len());
+                let host_origin = leopardwm_platform_win32::thumbnail::host().origin();
+                for wid in &exposed_ghosts {
                     if let Some(entry) = state.ghost_handles.remove(wid) {
-                        let dest = entry.final_dest_client_rect;
+                        let dest = state
+                            .expected_physical_rect(*wid)
+                            .map(|rect| {
+                                leopardwm_platform_win32::thumbnail::screen_to_host_client(
+                                    rect,
+                                    host_origin,
+                                )
+                            })
+                            .unwrap_or(entry.final_dest_client_rect);
                         entries.push(animation_worker::CrossfadeEntry {
                             window_id: *wid,
                             handle_isize: entry.take_isize(),
@@ -2860,7 +3083,21 @@ async fn handle_animation_frame_applied(
                     "ghost: crossfade epoch {} dispatched for {} source(s)",
                     epoch, entry_count
                 );
-                if let Err(e) = ctx.animation_worker.send_crossfade(epoch, entries, 8) {
+                let physical_invalidation_id = state
+                    .physical_invalidation_id
+                    .load(std::sync::atomic::Ordering::SeqCst);
+                if let Err(e) = ctx
+                    .animation_worker
+                    .send_crossfade_with_physical_invalidation(
+                        epoch,
+                        entries,
+                        8,
+                        Some((
+                            state.physical_invalidation_id.clone(),
+                            physical_invalidation_id,
+                        )),
+                    )
+                {
                     warn!("Failed to send crossfade to worker: {}", e);
                     // No worker: clear state so next transition
                     // isn't stuck waiting for a CrossfadeComplete
@@ -3219,6 +3456,9 @@ async fn main() -> Result<()> {
                 if handle_hotkey_event(&mut ctx, hotkey_event).await {
                     break;
                 }
+            }
+            DaemonEvent::RecordedHotkey { modifiers, vk } => {
+                handle_recorded_hotkey(ctx.hotkey_state, modifiers, vk);
             }
             DaemonEvent::Gesture(gesture_event) => {
                 if handle_gesture_event(&mut ctx, gesture_event).await {

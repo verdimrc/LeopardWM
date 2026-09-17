@@ -27,6 +27,8 @@ pub mod toast;
 
 pub use tab_strip::{TabAction, TabActionEvent, TabCloseAction};
 
+#[cfg(test)]
+mod clipping_proof;
 mod elevation;
 mod enumeration;
 mod event_hooks;
@@ -46,25 +48,31 @@ pub use keyboard_hook::*;
 pub use mouse_hook::*;
 
 // Re-export public API from submodules
-pub use elevation::{manage_block, window_manage_block, ManageBlock};
+pub use elevation::{
+    current_process_integrity, manage_block, window_manage_block, ManageBlock, INTEGRITY_HIGH,
+    INTEGRITY_MEDIUM,
+};
 pub use enumeration::{
     enumerate_monitors, enumerate_windows, find_monitor_by_id, find_monitor_for_rect,
     get_primary_monitor, get_process_executable, get_window_info, is_excluded_tool_window_hwnd,
-    monitor_above, monitor_below, monitor_to_left, monitor_to_right, monitors_by_position,
+    is_excluded_window_class_hwnd, monitor_above, monitor_below, monitor_to_left, monitor_to_right,
+    monitors_by_position,
 };
 pub use event_hooks::{install_event_hooks, EventHookHandle, WindowEvent};
 pub use focus::{
     close_window, current_event_time_ms, get_foreground_window, ms_since_last_user_input,
-    raise_window_no_activate, set_foreground_window, warp_cursor_to_window,
+    raise_window_no_activate, restore_window_no_activate, set_foreground_window,
+    warp_cursor_to_window,
 };
 pub use placement::apply_cloak_state;
 pub use placement::clear_suspected_oversize;
 pub use placement::{
     apply_placements, clear_inset_cache, drain_ghost_cloaked, dwm_cloak_window, dwm_uncloak_all,
-    dwm_uncloak_window, get_window_frame_insets, get_window_invisible_insets, is_placement_cloaked,
-    is_placement_parked, mark_ghost_cloaked, park_window_for_placement,
-    set_dwm_transitions_disabled, unmark_ghost_cloaked, visible_rect_to_frame_rect,
-    ApplyPlacementsResult, HeightViolation, PlacementCache, WidthViolation,
+    dwm_uncloak_window, get_window_frame_insets, get_window_invisible_insets,
+    get_window_style_bits, is_placement_cloaked, is_placement_parked, mark_ghost_cloaked,
+    park_window_for_placement, set_dwm_transitions_disabled, unmark_ghost_cloaked,
+    visible_rect_to_frame_rect, ApplyPlacementsResult, HeightViolation, PlacementCache,
+    PlacementLanding, WidthViolation,
 };
 pub use system::{
     are_animations_enabled, get_system_highlight_color_bgr, is_high_contrast_enabled,
@@ -95,7 +103,9 @@ use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::WindowsAndMessaging::WM_USER;
 
 /// Sentinel coordinate used by MoveOffScreen strategy.
-pub const MOVE_OFFSCREEN_SENTINEL_COORD: i32 = -100_000;
+/// USER32 clamps smaller positions to the signed 16-bit minimum; recovery must
+/// recognize the coordinates that GetWindowRect actually returns.
+pub const MOVE_OFFSCREEN_SENTINEL_COORD: i32 = i16::MIN as i32;
 
 /// Custom message to signal the gesture/mouse-hook thread to stop.
 pub(crate) const WM_QUIT_LLHOOK_THREAD: u32 = WM_USER + 2;

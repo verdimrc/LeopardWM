@@ -2,6 +2,105 @@
 
 All notable changes to LeopardWM will be documented in this file.
 
+## 0.2.9
+
+### Features
+
+- **Query effective hotkeys and export a PowerToys Shortcut Guide manifest.**
+  `lwm query hotkeys` lists resolved bindings and configuration diagnostics.
+  `lwm export-shortcut-guide` writes YAML to stdout, `--output PATH` writes a
+  file, and `--install` atomically replaces
+  `%LOCALAPPDATA%\Microsoft\WinGet\KeyboardShortcuts\LeopardWM.LeopardWM.en-US.yml`.
+  Matching CLI and daemon builds are required (IPC v3). The manifest is a
+  snapshot: reload LeopardWM and export again after changing bindings. Alternative
+  bindings appear as separate shortcuts. F13-F24 used as modifiers are skipped
+  with a warning; F13-F24 used as ordinary trigger keys can be exported.
+
+### Documentation
+
+- **The README now includes the official Scoop installation and update commands.**
+- **The README documents hotkey query and PowerToys Shortcut Guide export.**
+
+### Improvements
+
+- **The default width preset selector matches the other Settings dropdowns.** The "Default preset for new windows" control now uses the same custom combobox as Centering mode, keeping its dynamic preset list, selection tracking, and disabled empty state.
+- **Empty tiled layouts stop retrying a current physical request.** A genuinely empty apply consumes stale display stamps so the next layout can take the fast path, while filtered-empty batches still wait for a later landing.
+- **Doctor reports daemon and CLI integrity separately and lists privilege-blocked windows with their admission-time reason.**
+  Integrity is the observed mandatory level (Medium, High, a numeric RID, or unavailable), not an administrator proxy. Empty output says no privilege-blocked windows are currently recorded. Nonempty output keeps HWND, title, and reason; only higher-integrity windows get elevation-can-help advice.
+
+### Fixes
+
+- **The active window border follows its target in z-order.** Render and cached-move paths for tiled, drag, and floating windows stack the overlay immediately above that window. Ordinary targets keep the border out of the topmost band so it is not promoted over the taskbar; a topmost target still gets a matching overlay just above it.
+- **Inactive workspace windows stay offscreen after restart.** Startup parks restored tiled and floating windows on inactive workspaces after restoring each monitor's active workspace, without moving minimized windows.
+- **Inactive workspace windows stay offscreen after a monitor reconnects.** Display-change reconciliation parks restored tiled and floating windows on inactive workspaces after restoring a stashed layout, using the same no-size off-screen path as startup and without moving active, minimized, application-fullscreen, or unmanaged windows. While tiling is paused, minimized flags are still resynced and native windows are left in place.
+- **Hidden inactive tabs keep a stable off-screen origin across inset-cache restarts.** Zero-size tab placeholders use the layout coordinate instead of converting through warm or cold frame insets, so native dimensions stay unchanged and the parked origin does not jump after a restart. Visible and nonzero off-screen placements still apply insets.
+- **Taskbar buttons resync after display changes and after a successful resume.** Display reconciliation and a successful resume now run the same taskbar synchronization as startup. A failed resume stays paused and does not park inactive windows or change taskbar buttons.
+- **Inactive workspace windows are parked again after a successful resume.** Resume still applies only the active workspace, then catches up inactive tiled and floating windows. A failed resume rolls back to paused without moving those windows.
+- **Snap Layout suppression survives restarts.** Saved tiled windows regain the configured Snap Layout restriction when their workspace is restored, including inactive workspaces. Floating windows remain unchanged.
+- **Off-screen recovery recognizes Windows-clamped parking coordinates.** Parking now uses the native coordinate limit so cleanup can find and restore parked windows without mistaking ordinary minimized windows for parked ones. Recovery uses physical coordinates even when called from the CLI or watchdog, then restores the caller's DPI context.
+- **Partially visible tiled windows retain their requested native size.** At exactly adjacent monitor edges, positive partial placements now keep the full application rectangle during scrolling and at rest, preserving requested column widths, focus, and saved layout state. Bleed onto the adjacent monitor is accepted rather than resizing or parking the application.
+- **Owned decorations remain clipped at protected owner edges.** Borders and tab strips retain the conservative shared-edge projection even where their full-size application can bleed onto an adjacent monitor. Boundary-affected animation ghosts still wait for a current confirmed landing before their live source is exposed.
+- **Off-screen parking remains recoverable and current during transitions.** Inactive-workspace parking uses LeopardWM's shared off-screen recovery sentinel. Inactive tabs on the active workspace use raw zero-size off-screen placeholder coordinates with no-size native movement, not that sentinel. Parking confirmation still requires a readable actual outer rectangle that clears every monitor; logical target dimensions alone are not clearance proof.
+- **Failed native landings no longer strand transitions or discard ordinary size feedback.** Failed synchronous placement attempts remain unconfirmed for retry, while empty filtered batches retain that state until a later verified landing. Tracked parking suppresses size feedback; ordinary full-size placements continue to report it, and departing ghost cloaks release after their thumbnail has already been dropped.
+- **Column width changes trigger workspace saves without an unrelated layout change.**
+  Save detection tracks requested widths even when a native minimum keeps the effective
+  placement unchanged, while transient native constraints do not become saved width intent.
+- **Animations preserve their final native placement even when the layout is unchanged.**
+  A pending landing bypasses the unchanged-layout shortcut, and its exact endpoint is queued
+  after intermediate frames so delayed native moves cannot overwrite the resting position.
+- **Transient oversize measurements no longer immediately become native minimum sizes.**
+  The existing single placement retry requires excess widths and heights to repeat
+  unchanged before recording a minimum. Fitting measurements clear older suspects, and
+  new or changing sizes on the retry remain unconfirmed rather than inflating the layout.
+- **Office Click-to-Run dialogs no longer become tiled columns.** Their custom window class
+  is excluded even when Windows provides no dialog styles or owner. Restoring a saved layout
+  now honors built-in class exclusions without dropping hidden or minimized application windows.
+- **Runtime display changes preserve proportional column sizing.** Resolution and work-area
+  changes recalculate column widths against the new viewport and keep the focused column in view.
+- **Native minimum sizes no longer permanently inflate column proportions.** Requested widths
+  remain separate from enforced minimums, so shrinking and restoring a resolution does not
+  rebase a temporary minimum into a larger requested width. Returning to a workspace repairs
+  stale scroll bounds before its transition starts, and minimum-size changes preserve allowed
+  negative centering during animations.
+- **Activating a minimized tab restores it without stealing focus early.** The tab is restored
+  before layout and foreground synchronization, while stale tab-click actions are discarded
+  instead of being redirected to a changed workspace or column.
+- **Recording a hotkey in Settings now captures Windows shortcuts.** While a hotkey field is
+  recording, LeopardWM keeps its keyboard hook active and swallows the pressed combo before
+  Windows sees it, so `Win+Home`, `Win+Arrow`, and similar chords are recorded instead of
+  triggering the shell. Cancelling a recording no longer reloads the configuration.
+- **Equivalent hotkey spellings choose the same action after every reload.**
+  Registration and queries share physical-chord deduplication. The first valid
+  binding in lexicographic order wins; ignored collisions identify the retained
+  binding and action in diagnostics.
+
+### Known limitations
+
+- **Adjacent-monitor bleed is not fixed.** Partially visible tiled windows keep their full requested size while scrolling and after they stop at a partial position, so they can draw onto an adjacent monitor. That bleed is accepted in this release to retain full-size scrolling rather than clipping, resizing, or parking the window.
+- **Restart can change off-screen client-area and DWM frame geometry.** An application's outer bounds can stay the same while its client area or DWM frame insets change after a restart. This was observed with Beeper. It is accepted for 0.2.9; repair is deferred to 0.3.x. It is not proven harmless or exclusive to that application.
+
+### Internal
+
+- **IPC protocol v3 adds `QueryHotkeys` and `HotkeyList`.** Existing v1/v2
+  subscription clients remain supported; the new query/export commands require
+  a daemon implementing v3.
+- **Snap Layout remove and restore can emit numeric style-geometry diagnostics.** With debug logging enabled, maximize-box remove and restore log HWND, process/thread ids, style bits, and outer/client/DWM-frame/NC-rendering measurements at before-style, after-style, and after-frame boundaries. Failed geometry or style reads log numeric HRESULT codes instead of zeros. These queries are synchronous operation-boundary measurements, not proof of delayed application layout. Placement, style-change, and no-op behavior are unchanged.
+- **Opt-in framed-window clipping proofs record bounded native feasibility evidence.** The framed probe measured non-client rendering/frame changes while clipped despite unchanged native dimensions, so that presentation limitation remains separate from mechanical viability. A second ignored, hidden-fixture matrix covers known absent, empty, simple, and complex regions; LTR and right-origin RTL slices; retained-controller cancellation, restore-order, replacement, stale-identity, and native restore retry/terminal-repair boundaries. Both are test-only: no scrolling fix or compatibility acceptance is claimed.
+- **Diagnostics validation hosts are opt-in and isolated from ordinary tests.** A unique-pipe test host and exact-pipe CLI consumer can record Medium/High integrity evidence without starting the full daemon or falling back to the daily-driver pipe.
+- **Diagnostics validation uses a Medium controller with an isolated High side.** The controller builds the exact test artifacts at Medium, freezes their hashes and fixed High execution specification before one UAC request, and the High bootstrap copies and verifies only those bytes into fresh High-protected destinations. Hashes prove byte identity and transfer integrity for this user-consented local build, not independent provenance or safety.
+- **Diagnostics validation keeps its cross-integrity handoff bounded and cleans High-owned children locally.** A current-user-only Medium control pipe supplies High only a run-bound isolated pipe and server PID/creation identity after readiness; malformed or null identities are rejected before the High client launches, and audit-construction failures produce nonzero aggregate and runner results while retaining child exits. The High runner tears down retained children on completion, timeout, or controller loss. Native matrix evidence is produced only when the opt-in validation is run.
+- **Daemon clippy baseline warnings are cleared.** Test fixtures construct Config without Default reassignment, assert boolean eligibility directly, drop needless `return` in cfg(test) stubs, and iterate a one-element monitor array. Tab-action tests keep production `Arc<tokio::Mutex<AppState>>` because overlay fields hold HWND.
+- **Platform cloak-set tests serialize around the shared tracking sets.** Empty apply, shutdown uncloak, and parked-recovery fixtures no longer interleave process-global cloak membership.
+- **Desktop acceptance checks distinguish layout behavior from restoration failures.**
+  Offline helpers exclude fully minimized columns from strip extent and plan bounded
+  requested-width repairs without treating native minimums as intent changes. Synthetic
+  regression tests run in CI; private desktop evidence remains outside the repository.
+- **Scoop manifest maintenance now lives outside this repository.** The checked-in
+  manifest, dedicated validator, and post-release refresh process are removed
+  while the GitHub Release archive contract used by Scoop Extras remains
+  unchanged.
+- **Lockfile dependency updates:** serde 1.0.229, toml 1.1.5, and tokio 1.53.1.
+
 ## 0.2.8
 
 ### Features

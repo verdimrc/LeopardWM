@@ -95,10 +95,10 @@ impl AppState {
         Ok(json)
     }
 
-    /// Cheap deterministic hash of the PERSISTED state (everything
-    /// `build_state_json` would serialize): focused monitor, per-monitor
-    /// active workspace index, every workspace's column membership +
-    /// floating windows + rounded scroll offset, and tab title override
+    /// Cheap deterministic hash for save-request deduplication: focused
+    /// monitor, per-monitor active workspace index, every workspace's
+    /// requested column widths + membership + floating windows + rounded
+    /// scroll offset, and tab title override
     /// keys/value lengths. Used to dedup save requests so unchanged
     /// state (e.g. mid-animation frames with no structural delta) does
     /// not enqueue a write.
@@ -118,8 +118,8 @@ impl AppState {
             self.active_workspace_idx(monitor_id).hash(&mut hasher);
             if let Some(ws_vec) = self.workspaces.get(&monitor_id) {
                 for workspace in ws_vec {
-                    // Column window-id membership (Vec<Vec<u64>>).
                     for column in workspace.columns() {
+                        column.width().hash(&mut hasher);
                         column.windows().len().hash(&mut hasher);
                         for &wid in column.windows() {
                             wid.hash(&mut hasher);
@@ -205,19 +205,22 @@ impl AppState {
         &mut self,
         snapshot: &StateSnapshot,
     ) -> HashSet<(MonitorId, usize)> {
-        self.restore_workspace_structure_with(snapshot, |hwnd| {
+        let restored_slots = self.restore_workspace_structure_with(snapshot, |hwnd| {
             // Keep a saved window only if it's still alive AND manageable. An
             // elevated window a non-elevated daemon can't reposition would
             // otherwise restore as a column we can never fill (a ghost column);
             // dropping it here lets enumerate re-see it, record it, and notify.
             leopardwm_platform_win32::is_valid_window(hwnd)
+                && !leopardwm_platform_win32::is_excluded_window_class_hwnd(hwnd)
                 && !leopardwm_platform_win32::window_manage_block(hwnd).is_blocked()
-        })
+        });
+        self.disable_snap_for_all_tiled_windows();
+        restored_slots
     }
 
     /// Testable core of `restore_workspace_structure`: the `keep`
     /// predicate decides which HWNDs survive pruning. Production passes the
-    /// real `is_valid_window` + elevation check; tests pass a fake so the
+    /// real validity, class exclusion, and elevation checks; tests pass a fake so the
     /// structure-rebuild logic can be exercised without Win32.
     pub(crate) fn restore_workspace_structure_with(
         &mut self,

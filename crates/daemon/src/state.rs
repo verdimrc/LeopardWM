@@ -1,6 +1,7 @@
 //! AppState struct definition, constructor, and basic accessors.
 
 use crate::config::{self, Config};
+use crate::physical_placement::PhysicalPresentation;
 use leopardwm_core_layout::{Rect, Workspace};
 use leopardwm_platform_win32::{MonitorId, MonitorInfo, PlatformConfig};
 use serde::{Deserialize, Serialize};
@@ -165,6 +166,28 @@ pub(crate) enum TestApplyPlacementsBehavior {
         Vec<leopardwm_platform_win32::WidthViolation>,
         Vec<leopardwm_platform_win32::HeightViolation>,
     ),
+    Scripted(Vec<TestApplyPlacementsStep>),
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub(crate) struct TestApplyPlacementsStep {
+    pub(crate) delay: Duration,
+    pub(crate) outcome: TestApplyPlacementsOutcome,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub(crate) enum TestApplyPlacementsOutcome {
+    Succeed {
+        landings: Vec<leopardwm_platform_win32::PlacementLanding>,
+    },
+    SucceedWithFeedback {
+        width_violations: Vec<leopardwm_platform_win32::WidthViolation>,
+        height_violations: Vec<leopardwm_platform_win32::HeightViolation>,
+        landings: Vec<leopardwm_platform_win32::PlacementLanding>,
+    },
+    Fail,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -179,6 +202,13 @@ pub(crate) struct LayoutApplyTimeoutCandidate {
 pub(crate) struct LayoutApplyTimeoutReport {
     pub(crate) timeout: Duration,
     pub(crate) candidates: Vec<LayoutApplyTimeoutCandidate>,
+}
+
+/// Admission-time snapshot for a window the daemon left unmanaged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ElevationBlockedRecord {
+    pub title: String,
+    pub reason: leopardwm_platform_win32::ManageBlock,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -200,6 +230,11 @@ pub(crate) fn lerp_i32(a: i32, b: i32, t: f64) -> i32 {
     (a as f64 + (b as f64 - a as f64) * t).round() as i32
 }
 
+pub(crate) struct ExitProjectionProvenance {
+    pub(crate) owner: MonitorId,
+    pub(crate) eligible: bool,
+}
+
 /// Tracks an in-progress layout transition animation.
 /// Interpolates window positions from a pre-change snapshot to the new layout.
 pub(crate) struct LayoutTransition {
@@ -210,6 +245,8 @@ pub(crate) struct LayoutTransition {
     /// These windows are included in animation frames alongside entering windows.
     /// When the transition completes, they are moved offscreen.
     pub(crate) exit_rects: HashMap<u64, Rect>,
+    /// Pre-mutation owner and projection eligibility for synthetic exit placements.
+    pub(crate) exit_provenance: HashMap<u64, ExitProjectionProvenance>,
     /// Elapsed time in milliseconds.
     pub(crate) elapsed_ms: u64,
     /// Total duration in milliseconds.
@@ -326,6 +363,12 @@ impl LayoutTransition {
         self.elapsed_ms = self.elapsed_ms.saturating_add(delta_ms);
         !self.is_complete()
     }
+}
+
+pub(crate) struct StashedMonitorLayout {
+    pub(crate) workspaces: Vec<Workspace>,
+    pub(crate) active_workspace: usize,
+    pub(crate) source_viewport_width: i32,
 }
 
 /// Application state supporting multiple monitors.
@@ -485,6 +528,20 @@ pub(crate) struct AppState {
     /// rect within a few pixels, the layout is already correct and we skip
     /// the expensive full-retile snap-back.
     pub(crate) last_placed_layout_rects: HashMap<u64, leopardwm_core_layout::Rect>,
+    /// Intended/confirmed physical disposition keyed by HWND.
+    pub(crate) last_physical_presentations: HashMap<u64, PhysicalPresentation>,
+    pub(crate) pending_physical_presentations: HashMap<u64, PhysicalPresentation>,
+    pub(crate) inflight_origins: HashMap<u64, HashMap<u64, PhysicalPresentation>>,
+    pub(crate) physical_request_seq: u64,
+    pub(crate) physical_dispatch_request_id: Arc<AtomicU64>,
+    pub(crate) physical_invalidation_id: Arc<AtomicU64>,
+    pub(crate) inflight_request_id: Option<u64>,
+    /// The one physical request that can still produce an asynchronous animation completion.
+    pub(crate) animation_inflight_request_id: Option<u64>,
+    pub(crate) pending_physical_request_id: u64,
+    pub(crate) pending_physical_invalidation_id: u64,
+    pub(crate) last_applied_physical_invalidation: u64,
+    pub(crate) last_topology_signature: Vec<(MonitorId, i32, i32, i32, i32, u32)>,
     pub(crate) application_fullscreen: HashMap<u64, ApplicationFullscreenState>,
     /// Cooperative cancellation flag for placement workers during shutdown/revert.
     pub(crate) apply_worker_cancelled: Arc<AtomicBool>,
@@ -509,10 +566,11 @@ pub(crate) struct AppState {
     /// active workspace instead of following focus to it. Never persisted.
     pub(crate) pending_edit_config_pull: Option<(std::time::Instant, String)>,
     /// Windows skipped this session because UIPI blocks the non-elevated daemon
-    /// from managing them (an elevated window). HWND -> title (for `lwm
-    /// doctor`). Kept until the window dies so it's never re-tiled and the user
-    /// is notified only once. Session-only, never persisted.
-    pub(crate) elevation_blocked: HashMap<u64, String>,
+    /// from managing them (higher-integrity or protected). HWND-keyed admission
+    /// snapshot (title + reason) for `lwm doctor`. Kept until the window dies so
+    /// it's never re-tiled and the user is notified only once. Session-only,
+    /// never persisted.
+    pub(crate) elevation_blocked: HashMap<u64, ElevationBlockedRecord>,
     /// Windows whose Created event fired but lookup_window_info returned None
     /// (transient race: zero size, WS_EX_NOACTIVATE still set, GetWindowRect
     /// failure, etc.). Retried on the next MovedOrResized within 2 seconds.
@@ -540,7 +598,7 @@ pub(crate) struct AppState {
     /// restored, so a screen powering off overnight or an undock/redock no
     /// longer flattens the layout. Windows are migrated to primary while the
     /// monitor is gone and pulled back on return. Session-only, never persisted.
-    pub(crate) stashed_monitor_layouts: HashMap<String, (Vec<Workspace>, usize)>,
+    pub(crate) stashed_monitor_layouts: HashMap<String, StashedMonitorLayout>,
     /// Tracks when each managed window was added to a workspace. Used to
     /// distinguish transient popups (managed briefly) from real windows
     /// (managed for a long time, e.g., close-to-tray apps).
@@ -568,6 +626,9 @@ pub(crate) struct AppState {
     /// them into the worker for crossfade). Each `GhostEntry::Drop` calls
     /// `thumbnail::unregister_raw`, so every removal path is leak-safe.
     pub(crate) ghost_handles: HashMap<u64, GhostEntry>,
+    /// Ghost sources kept cloaked after their thumbnail is revoked until a
+    /// current synchronous physical landing proves their live HWND is safe.
+    pub(crate) ghost_sources_pending_safe_landing: HashSet<u64>,
     /// Set when a crossfade is in flight on the animation worker. The
     /// `epoch` lets us discriminate stale `CrossfadeComplete` events
     /// (from fades aborted by a newer transition).
@@ -622,6 +683,9 @@ pub(crate) struct AppState {
     pub(crate) injected_foreground_is_valid: Option<bool>,
     #[cfg(test)]
     pub(crate) injected_next_foreground_hwnd: Option<Option<u64>>,
+    /// Per-window native maximize responses for deterministic daemon tests.
+    #[cfg(test)]
+    pub(crate) injected_window_maximized: HashMap<u64, bool>,
     #[cfg(test)]
     pub(crate) departing_foreground_evidence_reads: usize,
     /// Optional test-only behavior override for placement application.
@@ -629,9 +693,20 @@ pub(crate) struct AppState {
     pub(crate) injected_apply_placements_behavior: Option<TestApplyPlacementsBehavior>,
     #[cfg(test)]
     pub(crate) injected_apply_placements_call_count: Arc<AtomicUsize>,
+    #[cfg(test)]
+    pub(crate) injected_apply_placements_batches: Arc<std::sync::Mutex<Vec<Vec<u64>>>>,
     /// Number of late-worker recovery passes executed after cancellation.
     #[cfg(test)]
     pub(crate) late_worker_recovery_count: Arc<AtomicUsize>,
+    /// Test-only display-change topology so `on_display_change` does not
+    /// enumerate the physical desktop.
+    #[cfg(test)]
+    pub(crate) injected_display_monitors: Option<Vec<MonitorInfo>>,
+    /// Recorded `sync_taskbar_buttons` intents (`true` = show, `false` = hide).
+    /// Production still calls the platform helpers, which no-op without a live
+    /// taskbar thread.
+    #[cfg(test)]
+    pub(crate) recorded_taskbar_commands: std::sync::Mutex<Vec<(u64, bool)>>,
     /// Fanout for IPC pub/sub. The IPC server's per-client task calls
     /// `subscribe()` on this to receive an `IpcEvent` stream.
     pub(crate) event_broadcaster: tokio::sync::broadcast::Sender<leopardwm_ipc::IpcEvent>,
@@ -869,6 +944,18 @@ impl AppState {
             pending_drag_hint: None,
             moved_or_resized_suppression: HashMap::new(),
             last_placed_layout_rects: HashMap::new(),
+            last_physical_presentations: HashMap::new(),
+            pending_physical_presentations: HashMap::new(),
+            inflight_origins: HashMap::new(),
+            physical_request_seq: 0,
+            physical_dispatch_request_id: Arc::new(AtomicU64::new(0)),
+            physical_invalidation_id: Arc::new(AtomicU64::new(0)),
+            inflight_request_id: None,
+            animation_inflight_request_id: None,
+            pending_physical_request_id: 0,
+            pending_physical_invalidation_id: 0,
+            last_applied_physical_invalidation: 0,
+            last_topology_signature: Vec::new(),
             application_fullscreen: HashMap::new(),
             apply_worker_cancelled: Arc::new(AtomicBool::new(false)),
             apply_epoch: Arc::new(AtomicU64::new(0)),
@@ -892,6 +979,7 @@ impl AppState {
             high_contrast: leopardwm_platform_win32::is_high_contrast_enabled(),
             layout_transition: None,
             ghost_handles: HashMap::new(),
+            ghost_sources_pending_safe_landing: HashSet::new(),
             active_crossfade: None,
             crossfade_sources: std::collections::HashMap::new(),
             crossfade_epoch_counter: 0,
@@ -908,13 +996,21 @@ impl AppState {
             #[cfg(test)]
             injected_next_foreground_hwnd: None,
             #[cfg(test)]
+            injected_window_maximized: HashMap::new(),
+            #[cfg(test)]
             departing_foreground_evidence_reads: 0,
             #[cfg(test)]
             injected_apply_placements_behavior: None,
             #[cfg(test)]
             injected_apply_placements_call_count: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
+            injected_apply_placements_batches: Arc::new(std::sync::Mutex::new(Vec::new())),
+            #[cfg(test)]
             late_worker_recovery_count: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            injected_display_monitors: None,
+            #[cfg(test)]
+            recorded_taskbar_commands: std::sync::Mutex::new(Vec::new()),
             // Capacity 256 is comfortable for human-rate events. A
             // subscriber that lags >256 events behind receives `Lagged`
             // and is expected to reconnect with a fresh Subscribe.
@@ -1022,7 +1118,7 @@ impl AppState {
             ws.focused_column_index().hash(&mut hasher);
             ws.columns().len().hash(&mut hasher);
             for col in ws.columns() {
-                col.width().hash(&mut hasher);
+                ws.effective_column_width(col).hash(&mut hasher);
                 col.windows().len().hash(&mut hasher);
                 for &w in col.windows() {
                     w.hash(&mut hasher);
@@ -1061,7 +1157,7 @@ impl AppState {
                     .iter()
                     .map(|col| leopardwm_ipc::ColumnSummary {
                         window_ids: col.windows().to_vec(),
-                        width_px: col.width(),
+                        width_px: ws.effective_column_width(col),
                         height_weights: col.height_weights().to_vec(),
                         mode: match col.mode() {
                             leopardwm_core_layout::ColumnMode::Vertical => {
@@ -1166,6 +1262,16 @@ impl AppState {
         self.save_request_tx = Some(tx);
     }
 
+    #[cfg(test)]
+    pub(crate) fn take_recorded_taskbar_commands(&self) -> Vec<(u64, bool)> {
+        std::mem::take(
+            &mut *self
+                .recorded_taskbar_commands
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        )
+    }
+
     /// Try to consume `pending_tab_focus` if it matches the given event
     /// (same monitor + workspace, and `hwnd` resolves to the expected tab
     /// in the expected column). Returns `true` if the flag was consumed
@@ -1258,14 +1364,12 @@ impl AppState {
     }
 
     pub(crate) fn invalidate_display_change_constraints(&mut self, needs_full: bool) {
-        for workspaces in self.workspaces.values_mut() {
-            for workspace in workspaces {
-                if needs_full {
-                    workspace.clear_all_min_widths();
-                }
-                workspace.clear_all_min_heights();
+        self.clear_min_size_constraints(|workspace| {
+            if needs_full {
+                workspace.clear_all_min_widths();
             }
-        }
+            workspace.clear_all_min_heights();
+        });
     }
 
     /// Get the focused monitor's viewport.

@@ -201,13 +201,18 @@ impl AppState {
                 let (old_ol, old_or, _, _) = workspace.outer_gaps();
 
                 params.apply_to(workspace);
-
-                // Rescale column widths to preserve fractions under new gap values
-                workspace.rescale_column_widths(old_gap, old_ol, old_or, viewport_width);
-
                 workspace.set_centering_mode(self.config.layout.centering_mode.into());
                 workspace.set_center_past_edges(self.config.layout.center_past_edges);
                 workspace.set_rtl(self.config.layout.is_rtl_monitor(&device_name));
+
+                // Rescale column widths to preserve fractions under new gap values
+                workspace.rescale_column_widths(
+                    old_gap,
+                    old_ol,
+                    old_or,
+                    viewport_width,
+                    viewport_width,
+                );
                 workspace.set_scroll_animation(
                     self.config.animation.scroll_duration_ms,
                     self.config.animation.easing,
@@ -275,6 +280,25 @@ impl AppState {
     pub(crate) fn sync_taskbar_buttons(&self) {
         use leopardwm_core_layout::Visibility;
         use leopardwm_platform_win32::taskbar::{taskbar_hide, taskbar_show};
+        let apply = |wid: u64, action: TaskbarButtonAction| match action {
+            TaskbarButtonAction::Show => {
+                #[cfg(test)]
+                self.recorded_taskbar_commands
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push((wid, true));
+                taskbar_show(wid);
+            }
+            TaskbarButtonAction::Hide => {
+                #[cfg(test)]
+                self.recorded_taskbar_commands
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push((wid, false));
+                taskbar_hide(wid);
+            }
+            TaskbarButtonAction::Unchanged => {}
+        };
         // Disabled: make sure no button stays hidden (restores any we hid before
         // the user turned the option off), then leave the taskbar alone.
         if !self.config.behavior.hide_offscreen_taskbar_buttons {
@@ -284,7 +308,7 @@ impl AppState {
                         if taskbar_button_action(self.is_application_fullscreen(wid), true)
                             == TaskbarButtonAction::Show
                         {
-                            taskbar_show(wid);
+                            apply(wid, TaskbarButtonAction::Show);
                         }
                     }
                 }
@@ -297,11 +321,10 @@ impl AppState {
             for (idx, workspace) in ws_vec.iter().enumerate() {
                 if idx != active {
                     for wid in workspace.all_window_ids() {
-                        match taskbar_button_action(self.is_application_fullscreen(wid), false) {
-                            TaskbarButtonAction::Show => taskbar_show(wid),
-                            TaskbarButtonAction::Hide => taskbar_hide(wid),
-                            TaskbarButtonAction::Unchanged => {}
-                        }
+                        apply(
+                            wid,
+                            taskbar_button_action(self.is_application_fullscreen(wid), false),
+                        );
                     }
                     continue;
                 }
@@ -318,11 +341,10 @@ impl AppState {
                     let keep = workspace.is_floating(wid)
                         || workspace.is_minimized(wid)
                         || visible.contains(&wid);
-                    match taskbar_button_action(self.is_application_fullscreen(wid), keep) {
-                        TaskbarButtonAction::Show => taskbar_show(wid),
-                        TaskbarButtonAction::Hide => taskbar_hide(wid),
-                        TaskbarButtonAction::Unchanged => {}
-                    }
+                    apply(
+                        wid,
+                        taskbar_button_action(self.is_application_fullscreen(wid), keep),
+                    );
                 }
             }
         }
@@ -339,7 +361,7 @@ impl AppState {
     pub(crate) fn prune_stale_windows(&mut self) -> StalePruneLayout {
         #[cfg(test)]
         {
-            return StalePruneLayout::Unchanged;
+            StalePruneLayout::Unchanged
         }
 
         #[cfg(not(test))]
@@ -674,8 +696,12 @@ impl AppState {
                 );
                 return Err(err);
             }
+            // Park inactive workspaces only after a successful active apply so a
+            // failed resume cannot move them while rolling back to paused.
+            self.prepare_inactive_workspace_windows();
             // Re-apply snap suppression after resuming
             self.disable_snap_for_all_tiled_windows();
+            self.sync_taskbar_buttons();
             self.sync_foreground_window();
         }
         Ok(())

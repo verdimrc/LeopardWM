@@ -58,6 +58,7 @@ A few deliberate **non-features**, so you know what you're getting:
 
 - Multi-monitor workspaces with monitor-aware focus and move (9 workspaces per monitor)
 - Global hotkeys with live config reload
+- **PowerToys Shortcut Guide export** — `lwm query hotkeys` lists effective bindings; `lwm export-shortcut-guide` writes a user manifest (stdout, `--output PATH`, or `--install`)
 - Smooth scroll animations with layout transition effects (vsync-locked)
 - Touchpad gestures with configurable swipe actions
 - Drag-and-drop column reorder (Shift+drag to merge windows)
@@ -87,9 +88,12 @@ A few deliberate **non-features**, so you know what you're getting:
 
 ```powershell
 winget install jcardama.LeopardWM         # Windows Package Manager
+
+scoop bucket add extras                   # Scoop (first time only)
+scoop install extras/leopardwm
 ```
 
-This installs LeopardWM and puts `leopardwm`, `leopardwm-cli`, and `lwm` on your PATH. Use `winget upgrade` to install the latest release.
+This installs LeopardWM and puts `leopardwm`, `leopardwm-cli`, and `lwm` on your PATH. Use `winget upgrade jcardama.LeopardWM` or `scoop update leopardwm` to install the latest release.
 
 ### Via MSI installer
 
@@ -219,7 +223,34 @@ lwm status             # show version, monitor count, window count, uptime
 lwm query workspace    # current workspace placements as JSON
 lwm query focused      # focused window info
 lwm query all-windows  # every managed window across all workspaces
+lwm query hotkeys      # effective bindings plus config diagnostics
 ```
+
+### PowerToys Shortcut Guide
+
+Export the daemon's effective hotkeys as a PowerToys Shortcut Guide user manifest:
+
+```bash
+lwm export-shortcut-guide                 # YAML to stdout
+lwm export-shortcut-guide --output PATH   # write a file
+lwm export-shortcut-guide --install       # replace the user manifest
+```
+
+`--output` and `--install` are mutually exclusive. `--install` writes
+`%LOCALAPPDATA%\Microsoft\WinGet\KeyboardShortcuts\LeopardWM.LeopardWM.en-US.yml`.
+
+Use matching CLI and daemon builds; query and export require IPC v3. The
+manifest is a snapshot: after changing bindings, reload LeopardWM and export
+again, then reopen Shortcut Guide. Query and export report resolved
+configuration, not proof that the keyboard hook is installed or active; safe
+mode can still list configured bindings.
+
+Each alternative binding is a separate shortcut. Equivalent spellings of the
+same physical chord resolve consistently: the lexicographically first valid
+configured binding wins, and warnings identify ignored collisions. F13-F24 used
+as modifiers cannot be represented by PowerToys and are skipped with a warning;
+F13-F24 used as ordinary trigger keys can be exported. Warnings go to stderr so
+stdout remains usable YAML.
 
 ### Layout commands
 
@@ -352,6 +383,13 @@ If you find LeopardWM useful, consider supporting development:
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## ✨ Contributors
+
+Thanks to everyone who has helped shape LeopardWM.
+
+<a href="https://github.com/Mihir-Null" title="Mihir Talati"><img src="https://avatars.githubusercontent.com/u/86654551?v=4&s=96" width="72" alt="Mihir Talati" /></a><br />
+<a href="https://github.com/Mihir-Null"><b>Mihir Talati</b></a> (<a href="https://github.com/Mihir-Null">@Mihir-Null</a>)
 
 ## License
 

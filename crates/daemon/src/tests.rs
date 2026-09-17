@@ -70,7 +70,7 @@ fn test_application_fullscreen_detector_uses_monitor_rect_tolerance() {
         scale_factor: 4.0,
     };
     let expected_rect = monitor.rect;
-    let monitors = vec![monitor];
+    let monitors = [monitor];
     assert_eq!(
         detect_application_fullscreen(
             monitors.iter(),
@@ -467,6 +467,229 @@ fn test_placement_parked_maximized_target_reaches_sync_and_animation_dispatch() 
 }
 
 #[test]
+fn test_empty_abandoned_request_preserves_unconfirmed_physical_context() {
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    state.workspaces.get_mut(&1).unwrap()[0]
+        .insert_window(100, Some(800))
+        .unwrap();
+    let placement = leopardwm_core_layout::WindowPlacement {
+        window_id: 100,
+        rect: Rect::new(0, 0, 800, 1040),
+        visibility: leopardwm_core_layout::Visibility::Visible,
+        column_index: 0,
+    };
+
+    state.apply_physical_projection(vec![placement.clone()]);
+    let (failed_request_id, failed_invalidation_id) = state.physical_request_ids();
+    state.abandon_physical_request(failed_request_id, failed_invalidation_id);
+    let failed_presentation = state.last_physical_presentations[&100].clone();
+    assert!(!failed_presentation.confirmed);
+    let applied_invalidation = state.last_applied_physical_invalidation;
+    let applied_topology = state.last_topology_signature.clone();
+    assert!(!state.physical_fast_path_ok());
+
+    state.bump_physical_invalidation();
+    state.monitors.get_mut(&1).unwrap().rect.width += 64;
+    let current_invalidation = state.physical_invalidation_id.load(Ordering::SeqCst);
+    let current_topology = crate::physical_placement::topology_signature(&state.monitors);
+    assert_ne!(applied_invalidation, current_invalidation);
+    assert_ne!(applied_topology, current_topology);
+
+    let now = std::time::Instant::now();
+    state.window_managed_at.insert(100, now);
+    state.window_last_maximized_at.insert(100, now);
+    assert!(
+        state
+            .prepare_physical_placements_with_parked(
+                vec![placement],
+                &std::collections::HashSet::from([100]),
+                |_| true,
+            )
+            .is_empty(),
+        "a temporarily settling visible window is filtered before physical dispatch"
+    );
+    let (empty_request_id, empty_invalidation_id) = state.physical_request_ids();
+    assert_ne!(empty_request_id, failed_request_id);
+    assert_ne!(empty_invalidation_id, failed_invalidation_id);
+    state.abandon_physical_request(empty_request_id, empty_invalidation_id);
+
+    assert_eq!(
+        state.last_applied_physical_invalidation,
+        applied_invalidation
+    );
+    assert_eq!(state.last_topology_signature, applied_topology);
+    assert_ne!(
+        state.last_applied_physical_invalidation,
+        current_invalidation
+    );
+    assert_ne!(
+        state.last_topology_signature,
+        crate::physical_placement::topology_signature(&state.monitors)
+    );
+    let retained = state.last_physical_presentations.get(&100).unwrap();
+    assert_eq!(retained.request_id, failed_presentation.request_id);
+    assert_eq!(
+        retained.invalidation_id,
+        failed_presentation.invalidation_id
+    );
+    assert_ne!(retained.request_id, empty_request_id);
+    assert_ne!(retained.invalidation_id, empty_invalidation_id);
+    assert!(!retained.confirmed);
+    assert_eq!(
+        retained.physical.window_id,
+        failed_presentation.physical.window_id
+    );
+    assert_eq!(retained.physical.rect, failed_presentation.physical.rect);
+    assert_eq!(
+        retained.physical.visibility,
+        failed_presentation.physical.visibility
+    );
+    assert_eq!(
+        retained.physical.column_index,
+        failed_presentation.physical.column_index
+    );
+    assert_eq!(state.pending_physical_request_id, 0);
+    assert_eq!(state.pending_physical_invalidation_id, 0);
+    assert_eq!(state.inflight_request_id, None);
+    assert!(state.inflight_origins.is_empty());
+    assert!(state.pending_physical_presentations.is_empty());
+    assert!(
+        !state.physical_fast_path_ok(),
+        "an unchanged layout must still require a current landing after an empty abandoned request"
+    );
+}
+
+#[test]
+fn test_empty_layout_apply_consumes_stale_stamps_for_fast_path() {
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    state.paused = false;
+    state.bump_physical_invalidation();
+    assert!(
+        !state.physical_fast_path_ok(),
+        "a fresh empty layout starts with stale topology/invalidation stamps"
+    );
+    let seq_before = state.physical_request_seq;
+
+    assert!(state.apply_layout().is_ok());
+    assert!(
+        state.physical_fast_path_ok(),
+        "a genuinely empty apply must consume stale stamps so the next layout can take the fast path"
+    );
+    assert_eq!(state.pending_physical_request_id, 0);
+    assert_eq!(state.inflight_request_id, None);
+    assert!(state.inflight_origins.is_empty());
+    assert!(state.last_physical_presentations.is_empty());
+    let seq_after_first = state.physical_request_seq;
+    assert!(
+        seq_after_first > seq_before,
+        "the first empty apply still allocates a current physical request"
+    );
+
+    assert!(state.apply_layout().is_ok());
+    assert_eq!(
+        state.physical_request_seq, seq_after_first,
+        "a current empty layout must not allocate another physical request"
+    );
+    assert_eq!(state.pending_physical_request_id, 0);
+    assert!(state.physical_fast_path_ok());
+}
+
+fn arm_settling_window(state: &mut AppState, window_id: u64) {
+    let now = std::time::Instant::now();
+    state.window_managed_at.insert(window_id, now);
+    state.window_last_maximized_at.insert(window_id, now);
+}
+
+#[test]
+fn test_filtered_empty_apply_with_empty_prior_evidence_retains_retry() {
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    state.paused = false;
+    state.workspaces.get_mut(&1).unwrap()[0]
+        .insert_window(100, Some(800))
+        .unwrap();
+    state.bump_physical_invalidation();
+    arm_settling_window(&mut state, 100);
+    let applied_invalidation = state.last_applied_physical_invalidation;
+    let applied_topology = state.last_topology_signature.clone();
+    let seq_before = state.physical_request_seq;
+    assert!(state.last_physical_presentations.is_empty());
+    assert!(!state.physical_fast_path_ok());
+
+    assert!(state.apply_layout().is_ok());
+    assert_eq!(
+        state.last_applied_physical_invalidation,
+        applied_invalidation
+    );
+    assert_eq!(state.last_topology_signature, applied_topology);
+    assert!(
+        !state.physical_fast_path_ok(),
+        "filtered-empty work with no prior presentation must keep retrying"
+    );
+    let seq_after_first = state.physical_request_seq;
+    assert!(seq_after_first > seq_before);
+
+    arm_settling_window(&mut state, 100);
+    assert!(state.apply_layout().is_ok());
+    assert!(
+        state.physical_request_seq > seq_after_first,
+        "a later filtered-empty apply must allocate a fresh request instead of taking the fast path"
+    );
+    assert!(!state.physical_fast_path_ok());
+}
+
+#[test]
+fn test_filtered_empty_apply_with_unconfirmed_prior_evidence_retains_retry() {
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    state.paused = false;
+    state.workspaces.get_mut(&1).unwrap()[0]
+        .insert_window(100, Some(800))
+        .unwrap();
+    let placement = leopardwm_core_layout::WindowPlacement {
+        window_id: 100,
+        rect: Rect::new(0, 0, 800, 1040),
+        visibility: leopardwm_core_layout::Visibility::Visible,
+        column_index: 0,
+    };
+    state.apply_physical_projection(vec![placement]);
+    let (failed_request_id, failed_invalidation_id) = state.physical_request_ids();
+    state.abandon_physical_request(failed_request_id, failed_invalidation_id);
+    let failed_presentation = state.last_physical_presentations[&100].clone();
+    let applied_invalidation = state.last_applied_physical_invalidation;
+    let applied_topology = state.last_topology_signature.clone();
+
+    state.bump_physical_invalidation();
+    state.monitors.get_mut(&1).unwrap().rect.width += 64;
+    arm_settling_window(&mut state, 100);
+    let seq_before = state.physical_request_seq;
+    assert!(!state.physical_fast_path_ok());
+
+    assert!(state.apply_layout().is_ok());
+    assert_eq!(
+        state.last_applied_physical_invalidation,
+        applied_invalidation
+    );
+    assert_eq!(state.last_topology_signature, applied_topology);
+    let retained = state.last_physical_presentations.get(&100).unwrap();
+    assert_eq!(retained.request_id, failed_presentation.request_id);
+    assert_eq!(
+        retained.invalidation_id,
+        failed_presentation.invalidation_id
+    );
+    assert!(!retained.confirmed);
+    assert!(!state.physical_fast_path_ok());
+    let seq_after_first = state.physical_request_seq;
+    assert!(seq_after_first > seq_before);
+
+    arm_settling_window(&mut state, 100);
+    assert!(state.apply_layout().is_ok());
+    assert!(
+        state.physical_request_seq > seq_after_first,
+        "unconfirmed prior evidence must not become current through a filtered-empty apply"
+    );
+    assert!(!state.physical_fast_path_ok());
+}
+
+#[test]
 fn test_animation_maximized_skip_result_invalidates_daemon_bookkeeping() {
     let mut state = AppState::new_with_config(test_config(), test_monitors());
     state.applying_layout = true;
@@ -482,6 +705,7 @@ fn test_animation_maximized_skip_result_invalidates_daemon_bookkeeping() {
         width_violations: Vec::new(),
         height_violations: Vec::new(),
         maximized_skipped_window_ids: vec![100],
+        landings: Vec::new(),
     };
     let frame_result =
         animation_worker::FrameResult::from_platform(platform_result, std::time::Duration::ZERO);
@@ -491,6 +715,275 @@ fn test_animation_maximized_skip_result_invalidates_daemon_bookkeeping() {
     assert!(!state.applying_layout);
     assert!(!state.should_suppress_moved_or_resized(100));
     assert!(!state.last_placed_layout_rects.contains_key(&100));
+}
+
+#[test]
+fn test_width_feedback_preserves_requested_resolution_round_trip() {
+    for invalidate in [false, true] {
+        let mut state = AppState::new_with_config(test_config(), test_monitors());
+        let monitor = state.focused_monitor;
+        let mut workspace = Workspace::with_gaps(10, 10);
+        workspace.insert_window(100, Some(1267)).unwrap();
+        workspace.insert_window(200, Some(1267)).unwrap();
+        state.workspaces.get_mut(&monitor).unwrap()[0] = workspace;
+
+        for (old_width, new_width, requested) in
+            [(5120, 2560, 627), (2560, 1920, 467), (1920, 5120, 1266)]
+        {
+            if invalidate {
+                state.monitors.get_mut(&monitor).unwrap().rect.width = old_width;
+                state.monitors.get_mut(&monitor).unwrap().work_area.width = old_width;
+                state.invalidate_display_change_constraints(true);
+                let mut monitors = test_monitors();
+                monitors[0].rect.width = new_width;
+                monitors[0].work_area.width = new_width;
+                state.reconcile_monitors(monitors);
+            } else {
+                state.workspaces.get_mut(&monitor).unwrap()[0]
+                    .rescale_column_widths(10, 10, 10, old_width, new_width);
+            }
+            let workspace = &state.workspaces[&monitor][0];
+            if invalidate {
+                assert_eq!(
+                    workspace.compute_placements(Rect::new(0, 0, new_width, 1040))[0]
+                        .rect
+                        .width,
+                    requested
+                );
+            }
+            if new_width < 5120 {
+                state.propagate_size_violations(
+                    &[leopardwm_platform_win32::WidthViolation {
+                        window_id: 100,
+                        min_width: 842,
+                    }],
+                    &[],
+                );
+            }
+
+            let workspace = &state.workspaces.get(&monitor).unwrap()[0];
+            assert_eq!(workspace.columns()[0].width(), requested);
+            assert_eq!(workspace.columns()[1].width(), requested);
+            let placements = workspace.compute_placements(Rect::new(0, 0, new_width, 1040));
+            assert_eq!(placements[0].rect.width, requested.max(842));
+            assert_eq!(placements[1].rect.width, requested);
+        }
+    }
+}
+
+#[test]
+fn test_width_feedback_noop_preserves_animation_and_effective_subscription() {
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    let workspace = state.focused_workspace_mut().unwrap();
+    workspace.insert_window(100, Some(467)).unwrap();
+    workspace.insert_window(200, Some(1600)).unwrap();
+    workspace.set_reduce_motion(false);
+    let original_sig = state.focused_layout_signature();
+    let feedback = [leopardwm_platform_win32::WidthViolation {
+        window_id: 100,
+        min_width: 842,
+    }];
+    assert!(state.propagate_size_violations(&feedback, &[]));
+    let effective_sig = state.focused_layout_signature();
+    assert_ne!(effective_sig, original_sig);
+    assert_eq!(state.focused_layout_columns()[0].width_px, 842);
+    match state.handle_command(IpcCommand::QueryWorkspace) {
+        IpcResponse::WorkspaceState { total_width, .. } => assert_eq!(total_width, 2452),
+        other => panic!("Expected WorkspaceState, got {other:?}"),
+    }
+    let workspace = state.focused_workspace_mut().unwrap();
+    workspace.start_scroll_animation(300.0, 1920, Some(1000), None);
+    workspace.tick_animation(400);
+    let mut expected = workspace.clone();
+    assert!(!state.propagate_size_violations(&feedback, &[]));
+    assert!(!state.propagate_size_violations(
+        &[leopardwm_platform_win32::WidthViolation {
+            window_id: 200,
+            min_width: 700
+        }],
+        &[]
+    ));
+    assert_eq!(state.focused_layout_signature(), effective_sig);
+    state.focused_workspace_mut().unwrap().tick_animation(600);
+    expected.tick_animation(600);
+    assert_eq!(
+        state.focused_workspace().unwrap().effective_scroll_offset(),
+        expected.effective_scroll_offset()
+    );
+    assert!(!state.focused_workspace().unwrap().is_animating());
+    let workspace = state.focused_workspace_mut().unwrap();
+    workspace.focus_window(100).unwrap();
+    workspace.set_focused_column_width_fraction(0.3, 1920);
+    workspace.focus_window(200).unwrap();
+    assert_eq!(state.focused_layout_signature(), effective_sig);
+    assert_eq!(state.focused_layout_columns()[0].width_px, 842);
+
+    state.paused = false;
+    state.injected_apply_placements_behavior = Some(
+        TestApplyPlacementsBehavior::SucceedWithSizeViolations(feedback.to_vec(), Vec::new()),
+    );
+    state.apply_layout().unwrap();
+    assert_eq!(
+        state
+            .injected_apply_placements_call_count
+            .load(Ordering::SeqCst),
+        1
+    );
+}
+
+#[test]
+fn test_deferred_minimum_clear_reconciles_apply_and_animation_boundaries() {
+    for frame_boundary in [false, true] {
+        for animated in [false, true] {
+            for center in [false, true] {
+                let mut monitors = test_monitors();
+                monitors[0].rect.width = 1000;
+                monitors[0].work_area.width = 1000;
+                let mut state = AppState::new_with_config(test_config(), monitors);
+                state.paused = false;
+                let mut workspace = Workspace::with_gaps(10, 10);
+                workspace.set_reduce_motion(false);
+                workspace.set_centering_mode(if center {
+                    leopardwm_core_layout::CenteringMode::Center
+                } else {
+                    leopardwm_core_layout::CenteringMode::JustInView
+                });
+                workspace.set_center_past_edges(center);
+                workspace.insert_window(100, Some(467)).unwrap();
+                workspace
+                    .insert_window(200, Some(if center { 1000 } else { 467 }))
+                    .unwrap();
+                let constrained = if center { 100 } else { 200 };
+                let column = if center { 0 } else { 1 };
+                workspace.focus_window(constrained).unwrap();
+                workspace.set_window_min_width(constrained, 842);
+                workspace.ensure_focused_visible(1000);
+                if animated {
+                    workspace.set_scroll_offset(100.0);
+                    workspace.ensure_focused_visible_animated(1000);
+                    workspace.tick_animation(10);
+                }
+                workspace.insert_window_in_column(300, column).unwrap();
+                let before = workspace.effective_scroll_offset();
+                let mut inactive = workspace.clone();
+                inactive.cancel_animation();
+                inactive.set_scroll_offset(137.0);
+                state.workspaces.insert(1, vec![workspace, inactive]);
+                if frame_boundary {
+                    for id in [100, 200, 300] {
+                        state.application_fullscreen.insert(
+                            id,
+                            crate::state::ApplicationFullscreenState {
+                                monitor_id: 1,
+                                rect: Rect::new(0, 0, 1000, 1040),
+                            },
+                        );
+                    }
+                    let (tx, _rx) = tokio::sync::mpsc::channel(4);
+                    let worker = animation_worker::AnimationWorkerHandle::spawn(
+                        tx,
+                        state.apply_worker_cancelled.clone(),
+                    )
+                    .unwrap();
+                    state.send_animation_frame(&worker).unwrap();
+                    drop(worker);
+                } else {
+                    state.injected_apply_placements_behavior =
+                        Some(TestApplyPlacementsBehavior::SleepAndSucceed(Duration::ZERO));
+                    state.apply_layout().unwrap();
+                }
+                let workspace = &mut state.workspaces.get_mut(&1).unwrap()[0];
+                assert_eq!(
+                    workspace.effective_column_width(&workspace.columns()[column]),
+                    467
+                );
+                if animated {
+                    assert!((workspace.effective_scroll_offset() - before).abs() < 0.5);
+                }
+                workspace.tick_animation(1000);
+                assert_eq!(workspace.scroll_offset(), if center { -257.0 } else { 0.0 });
+                let placed = workspace.compute_placements(Rect::new(0, 0, 1000, 1040));
+                let focused = placed.iter().find(|p| p.window_id == 300).unwrap();
+                assert!(focused.rect.x >= 10 && focused.rect.x + focused.rect.width <= 990);
+                let inactive = &state.workspaces[&1][1];
+                assert_eq!(
+                    inactive.effective_column_width(&inactive.columns()[column]),
+                    467
+                );
+                assert_eq!(inactive.scroll_offset(), 137.0);
+                assert_eq!(state.active_workspace_idx(1), 0);
+            }
+        }
+    }
+}
+
+#[test]
+fn test_full_display_invalidation_reconciles_binding_minimum_without_viewport_change() {
+    for animated in [false, true] {
+        let mut state = AppState::new_with_config(test_config(), test_monitors());
+        let workspace = state.focused_workspace_mut().unwrap();
+        workspace.set_centering_mode(leopardwm_core_layout::CenteringMode::JustInView);
+        workspace.set_reduce_motion(false);
+        for id in [100, 200, 300] {
+            workspace.insert_window(id, Some(800)).unwrap();
+        }
+        workspace.set_window_min_width(300, 1500);
+        workspace.set_scroll_offset(1000.0);
+        if animated {
+            workspace.start_scroll_animation(1200.0, 1920, Some(1000), None);
+            workspace.tick_animation(10);
+        }
+        let before = workspace.effective_scroll_offset();
+        state.invalidate_display_change_constraints(true);
+        state.reconcile_monitors(test_monitors());
+        let workspace = state.focused_workspace_mut().unwrap();
+        if animated {
+            assert!((workspace.effective_scroll_offset() - before).abs() < 0.5);
+        }
+        workspace.tick_animation(1000);
+        assert_eq!(workspace.scroll_offset(), 520.0);
+        assert_eq!(workspace.columns()[2].width(), 800);
+    }
+}
+
+#[test]
+fn test_deferred_nonbinding_minimum_clear_preserves_manual_scroll_and_animation() {
+    for min_width in [0, 400] {
+        for animated in [false, true] {
+            let mut state = AppState::new_with_config(test_config(), test_monitors());
+            state.paused = false;
+            let workspace = state.focused_workspace_mut().unwrap();
+            workspace.set_reduce_motion(false);
+            for id in [100, 200, 300] {
+                workspace.insert_window(id, Some(800)).unwrap();
+            }
+            workspace.set_window_min_width(200, min_width);
+            workspace.set_window_min_height(200, 600);
+            workspace.insert_window_in_column(400, 1).unwrap();
+            workspace.set_scroll_offset(137.0);
+            if animated {
+                workspace.start_scroll_animation(300.0, 1920, Some(1000), None);
+                workspace.tick_animation(400);
+            }
+            let mut expected = workspace.clone();
+            state.injected_apply_placements_behavior =
+                Some(TestApplyPlacementsBehavior::SleepAndSucceed(Duration::ZERO));
+            state.apply_layout().unwrap();
+            let workspace = state.focused_workspace_mut().unwrap();
+            assert!(!workspace.commit_pending_min_size_clears());
+            assert_eq!(
+                workspace.effective_scroll_offset(),
+                expected.effective_scroll_offset()
+            );
+            workspace.tick_animation(600);
+            expected.tick_animation(600);
+            assert_eq!(
+                workspace.effective_scroll_offset(),
+                expected.effective_scroll_offset()
+            );
+            assert_eq!(workspace.is_animating(), expected.is_animating());
+        }
+    }
 }
 
 #[test]
@@ -522,13 +1015,18 @@ fn test_width_feedback_retargets_an_existing_scroll_animation() {
             }],
             height_violations: Vec::new(),
             maximized_skipped_window_ids: Vec::new(),
+            landings: Vec::new(),
         },
         Duration::ZERO,
     );
     state.handle_animation_placement_result(&frame_result);
 
     let workspace = &state.workspaces.get(&monitor).unwrap()[0];
-    assert_eq!(workspace.columns()[2].width(), usable_width - 1);
+    assert_eq!(workspace.columns()[2].width(), 300);
+    assert_eq!(
+        workspace.effective_column_width(&workspace.columns()[2]),
+        usable_width - 1
+    );
     assert!(workspace.is_animating(), "the existing pump is retargeted");
     assert_eq!(
         workspace.scroll_offset(),
@@ -587,19 +1085,46 @@ fn test_width_feedback_widens_inactive_workspace_without_changing_scroll() {
             }],
             height_violations: Vec::new(),
             maximized_skipped_window_ids: Vec::new(),
+            landings: Vec::new(),
         },
         Duration::ZERO,
     );
     state.handle_animation_placement_result(&frame_result);
 
     let workspace = &state.workspaces.get(&monitor).unwrap()[1];
-    assert_eq!(workspace.columns()[2].width(), 1_500);
+    assert_eq!(workspace.columns()[2].width(), 300);
+    assert_eq!(
+        workspace.effective_column_width(&workspace.columns()[2]),
+        1_500
+    );
     assert_eq!(workspace.scroll_offset(), 137.0);
     assert!(!workspace.is_animating());
     assert_eq!(
         state.active_workspace_idx(monitor),
         0,
         "feedback must not animate an inactive workspace"
+    );
+}
+
+#[test]
+fn test_post_animation_landing_applies_unchanged_layout() {
+    let window_id = u64::MAX - 1;
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    state.paused = false;
+    state
+        .focused_workspace_mut()
+        .unwrap()
+        .insert_window(window_id, Some(800))
+        .unwrap();
+    state.apply_layout().unwrap();
+    assert!(state.last_placed_layout_rects.contains_key(&window_id));
+
+    state.post_animation_nudge_pending = true;
+    state.apply_layout().unwrap();
+
+    assert!(
+        !state.post_animation_nudge_pending,
+        "the final landing must reach the worker even when the logical layout is unchanged"
     );
 }
 
@@ -639,7 +1164,11 @@ fn test_sync_size_violation_reapplies_once_and_reveals_widened_focus() {
         "synchronous feedback has one guarded corrective reapply"
     );
     let workspace = &state.workspaces.get(&monitor).unwrap()[0];
-    assert_eq!(workspace.columns()[2].width(), usable_width - 1);
+    assert_eq!(workspace.columns()[2].width(), 300);
+    assert_eq!(
+        workspace.effective_column_width(&workspace.columns()[2]),
+        usable_width - 1
+    );
     assert!(
         !workspace.is_animating(),
         "no pump means immediate correction"
@@ -654,6 +1183,503 @@ fn test_sync_size_violation_reapplies_once_and_reveals_widened_focus() {
         leopardwm_core_layout::Visibility::Visible,
         "the widened focused column is re-derived into view before the reapply"
     );
+}
+
+#[test]
+fn test_physical_feedback_allows_full_placements_and_suppresses_parking() {
+    let mut state = AppState::new_with_config(test_config(), two_monitors());
+    state.workspaces.get_mut(&1).unwrap()[0]
+        .insert_window(100, Some(800))
+        .unwrap();
+    let partial = leopardwm_core_layout::WindowPlacement {
+        window_id: 100,
+        rect: Rect::new(1800, 0, 400, 600),
+        visibility: leopardwm_core_layout::Visibility::Visible,
+        column_index: 0,
+    };
+    state.apply_physical_projection(vec![partial]);
+    let (request_id, _) = state.physical_request_ids();
+    assert!(
+        state.allows_core_size_feedback(request_id, 100),
+        "a positive partial placement retains its full native geometry and ordinary feedback"
+    );
+
+    let parked = leopardwm_core_layout::WindowPlacement {
+        window_id: 100,
+        rect: Rect::new(1920, 0, 400, 600),
+        visibility: leopardwm_core_layout::Visibility::Visible,
+        column_index: 0,
+    };
+    state.apply_physical_projection(vec![parked]);
+    let (request_id, _) = state.physical_request_ids();
+    assert!(
+        !state.allows_core_size_feedback(request_id, 100),
+        "a tracked parked placement must not teach logical minimums"
+    );
+    assert!(
+        state.allows_core_size_feedback(request_id, 999),
+        "an untracked window keeps the existing ordinary-feedback behavior"
+    );
+}
+
+#[test]
+fn test_stale_animation_result_does_not_release_newer_physical_latch() {
+    let mut state = AppState::new_with_config(test_config(), two_monitors());
+    state.workspaces.get_mut(&1).unwrap()[0]
+        .insert_window(100, Some(800))
+        .unwrap();
+    let placement = leopardwm_core_layout::WindowPlacement {
+        window_id: 100,
+        rect: Rect::new(1800, 0, 400, 600),
+        visibility: leopardwm_core_layout::Visibility::Visible,
+        column_index: 0,
+    };
+    state.apply_physical_projection(vec![placement.clone()]);
+    let (stale_request, stale_invalidation) = state.physical_request_ids();
+    state.apply_physical_projection(vec![placement]);
+    let (current_request, current_invalidation) = state.physical_request_ids();
+    state.applying_layout = true;
+
+    let stale = animation_worker::FrameResult {
+        apply_result: Ok(()),
+        frame_time: std::time::Duration::ZERO,
+        width_violations: Vec::new(),
+        height_violations: Vec::new(),
+        maximized_skipped_window_ids: Vec::new(),
+        physical_request_id: stale_request,
+        physical_invalidation_id: stale_invalidation,
+        landings: Vec::new(),
+    };
+    assert!(matches!(
+        state.handle_animation_placement_result(&stale),
+        crate::layout_apply::AnimationPlacementResult::Stale
+    ));
+    assert!(state.applying_layout);
+    assert_eq!(state.inflight_request_id, Some(current_request));
+
+    let current = animation_worker::FrameResult {
+        physical_request_id: current_request,
+        physical_invalidation_id: current_invalidation,
+        ..stale
+    };
+    assert!(matches!(
+        state.handle_animation_placement_result(&current),
+        crate::layout_apply::AnimationPlacementResult::Current
+    ));
+    assert!(
+        !state.applying_layout,
+        "a current acknowledgement with no native landings still releases its latch"
+    );
+}
+
+#[test]
+fn test_outer_animation_pump_preserves_newer_frame_and_resumes_after_sync_supersession() {
+    use crate::layout_apply::AnimationPlacementResult;
+    use crate::{interrupted_animation_frame_action, InterruptedAnimationFrameAction};
+
+    let mut state = AppState::new_with_config(test_config(), two_monitors());
+    state.workspaces.get_mut(&1).unwrap()[0]
+        .insert_window(100, Some(800))
+        .unwrap();
+    let placement = leopardwm_core_layout::WindowPlacement {
+        window_id: 100,
+        rect: Rect::new(1800, 0, 400, 600),
+        visibility: leopardwm_core_layout::Visibility::Visible,
+        column_index: 0,
+    };
+    state.apply_physical_projection(vec![placement.clone()]);
+    let (old_request, old_invalidation) = state.physical_request_ids();
+    state.animation_inflight_request_id = Some(old_request);
+    let newer = state.apply_physical_projection(vec![placement]);
+    let (new_request, new_invalidation) = state.physical_request_ids();
+    state.animation_inflight_request_id = Some(new_request);
+    let stale = animation_worker::FrameResult {
+        apply_result: Ok(()),
+        frame_time: std::time::Duration::ZERO,
+        width_violations: Vec::new(),
+        height_violations: Vec::new(),
+        maximized_skipped_window_ids: Vec::new(),
+        physical_request_id: old_request,
+        physical_invalidation_id: old_invalidation,
+        landings: Vec::new(),
+    };
+
+    let result = state.handle_animation_placement_result(&stale);
+    assert!(matches!(result, AnimationPlacementResult::Stale));
+    assert_eq!(state.inflight_request_id, Some(new_request));
+    assert_eq!(
+        interrupted_animation_frame_action(
+            AnimationPlacementResult::Stale,
+            state.animation_inflight_request_id
+        ),
+        Some(InterruptedAnimationFrameAction::LeaveNewerFrame),
+        "an old completion must not supersede the newer outstanding frame"
+    );
+
+    state.consume_physical_landings(
+        new_request,
+        new_invalidation,
+        &[leopardwm_platform_win32::PlacementLanding {
+            window_id: 100,
+            requested_rect: newer[0].rect,
+            requested_visibility: newer[0].visibility,
+            actual_visible_rect: Some(newer[0].rect),
+            actual_outer_rect: Some(newer[0].rect),
+            failed: false,
+            unreadable: false,
+        }],
+    );
+    assert_eq!(state.inflight_request_id, None);
+    state.animation_inflight_request_id = None;
+    assert_eq!(
+        interrupted_animation_frame_action(
+            AnimationPlacementResult::Stale,
+            state.animation_inflight_request_id,
+        ),
+        Some(InterruptedAnimationFrameAction::Resume),
+        "after synchronous apply consumes the newer request, the stale acknowledgement restarts the pump"
+    );
+    assert_eq!(
+        interrupted_animation_frame_action(AnimationPlacementResult::InvalidatedCurrent, None),
+        Some(InterruptedAnimationFrameAction::ReapplyThenResume),
+        "a matching invalidated frame re-lands before progressing"
+    );
+    assert_eq!(
+        interrupted_animation_frame_action(AnimationPlacementResult::Current, None),
+        None
+    );
+}
+
+#[test]
+fn test_stale_animation_result_resumes_after_unconsumed_sync_supersession() {
+    use crate::layout_apply::AnimationPlacementResult;
+    use crate::{interrupted_animation_frame_action, InterruptedAnimationFrameAction};
+
+    let mut state = AppState::new_with_config(test_config(), two_monitors());
+    state.workspaces.get_mut(&1).unwrap()[0]
+        .insert_window(100, Some(800))
+        .unwrap();
+    let placement = leopardwm_core_layout::WindowPlacement {
+        window_id: 100,
+        rect: Rect::new(1800, 0, 400, 600),
+        visibility: leopardwm_core_layout::Visibility::Visible,
+        column_index: 0,
+    };
+    state.apply_physical_projection(vec![placement.clone()]);
+    let (old_request, old_invalidation) = state.physical_request_ids();
+    state.animation_inflight_request_id = Some(old_request);
+    state.apply_physical_projection(vec![placement]);
+    state.animation_inflight_request_id = None;
+
+    let stale = animation_worker::FrameResult {
+        apply_result: Ok(()),
+        frame_time: std::time::Duration::ZERO,
+        width_violations: Vec::new(),
+        height_violations: Vec::new(),
+        maximized_skipped_window_ids: Vec::new(),
+        physical_request_id: old_request,
+        physical_invalidation_id: old_invalidation,
+        landings: Vec::new(),
+    };
+    assert!(matches!(
+        state.handle_animation_placement_result(&stale),
+        AnimationPlacementResult::Stale
+    ));
+    assert_eq!(
+        interrupted_animation_frame_action(
+            AnimationPlacementResult::Stale,
+            state.animation_inflight_request_id,
+        ),
+        Some(InterruptedAnimationFrameAction::Resume),
+        "a synchronous supersession without an async completion must not strand the animation pump"
+    );
+}
+
+#[test]
+fn test_invalidated_animation_result_releases_only_matching_latch() {
+    let mut state = AppState::new_with_config(test_config(), two_monitors());
+    state.workspaces.get_mut(&1).unwrap()[0]
+        .insert_window(100, Some(800))
+        .unwrap();
+    let placement = leopardwm_core_layout::WindowPlacement {
+        window_id: 100,
+        rect: Rect::new(100, 0, 400, 600),
+        visibility: leopardwm_core_layout::Visibility::Visible,
+        column_index: 0,
+    };
+    state.apply_physical_projection(vec![placement]);
+    let (request_id, invalidation_id) = state.physical_request_ids();
+    state.applying_layout = true;
+    state.bump_physical_invalidation();
+
+    let invalidated = animation_worker::FrameResult {
+        apply_result: Ok(()),
+        frame_time: std::time::Duration::ZERO,
+        width_violations: vec![leopardwm_platform_win32::WidthViolation {
+            window_id: 100,
+            min_width: 1900,
+        }],
+        height_violations: Vec::new(),
+        maximized_skipped_window_ids: Vec::new(),
+        physical_request_id: request_id,
+        physical_invalidation_id: invalidation_id,
+        landings: Vec::new(),
+    };
+    assert!(matches!(
+        state.handle_animation_placement_result(&invalidated),
+        crate::layout_apply::AnimationPlacementResult::InvalidatedCurrent
+    ));
+    assert!(!state.applying_layout);
+    assert_eq!(state.inflight_request_id, None);
+    assert!(
+        !state.inflight_origins.contains_key(&request_id),
+        "obsolete feedback remains unconsumed"
+    );
+    let workspace = state.focused_workspace().unwrap();
+    assert!(
+        workspace.effective_column_width(&workspace.columns()[0]) < 1900,
+        "an invalidated acknowledgement must not teach the old frame's minimum"
+    );
+}
+
+#[test]
+fn test_apply_layout_preserves_full_partial_native_width_without_parking_follow_up() {
+    use crate::state::{
+        TestApplyPlacementsBehavior, TestApplyPlacementsOutcome, TestApplyPlacementsStep,
+    };
+
+    let mut monitors = two_monitors();
+    monitors[0].rect = Rect::new(0, 0, 5120, 1440);
+    monitors[0].work_area = Rect::new(0, 0, 5120, 1440);
+    monitors[1].rect = Rect::new(5120, 0, 800, 600);
+    monitors[1].work_area = Rect::new(5120, 0, 800, 600);
+    let mut state = AppState::new_with_config(test_config(), monitors);
+    state.paused = false;
+    let mut workspace = Workspace::with_gaps(0, 0);
+    workspace.insert_window(101, Some(1600)).unwrap();
+    workspace.insert_window(102, Some(1600)).unwrap();
+    workspace.insert_window(103, Some(1600)).unwrap();
+    workspace.insert_window(100, Some(1600)).unwrap();
+    workspace.set_scroll_offset(480.0);
+    state.workspaces.get_mut(&1).unwrap()[0] = workspace;
+    state.injected_apply_placements_behavior = Some(TestApplyPlacementsBehavior::Scripted(vec![
+        TestApplyPlacementsStep {
+            delay: std::time::Duration::ZERO,
+            outcome: TestApplyPlacementsOutcome::Succeed {
+                landings: vec![leopardwm_platform_win32::PlacementLanding {
+                    window_id: 100,
+                    requested_rect: Rect::new(4320, 0, 1600, 1440),
+                    requested_visibility: leopardwm_core_layout::Visibility::Visible,
+                    actual_visible_rect: Some(Rect::new(4320, 0, 1600, 1440)),
+                    actual_outer_rect: Some(Rect::new(4320, 0, 1600, 1440)),
+                    failed: false,
+                    unreadable: false,
+                }],
+            },
+        },
+    ]));
+
+    state.apply_layout().unwrap();
+
+    let presentation = &state.last_physical_presentations[&100];
+    assert_eq!(presentation.physical.rect, Rect::new(4320, 0, 1600, 1440));
+    assert_eq!(
+        presentation.kind,
+        crate::physical_placement::PhysicalKind::Unchanged
+    );
+    assert!(presentation.confirmed);
+    assert_eq!(
+        state.focused_workspace().unwrap().columns()[0].width(),
+        1600
+    );
+    assert_eq!(
+        *state.injected_apply_placements_batches.lock().unwrap(),
+        vec![vec![101, 102, 103, 100]],
+        "a successful full-width landing must not dispatch containment parking"
+    );
+}
+
+#[test]
+fn test_primary_feedback_survives_ordinary_contained_landing() {
+    use crate::state::{
+        TestApplyPlacementsBehavior, TestApplyPlacementsOutcome, TestApplyPlacementsStep,
+    };
+
+    let mut state = AppState::new_with_config(test_config(), two_monitors());
+    state.paused = false;
+    state.workspaces.get_mut(&2).unwrap()[0]
+        .insert_window(200, Some(400))
+        .unwrap();
+    state.injected_apply_placements_behavior = Some(TestApplyPlacementsBehavior::Scripted(vec![
+        TestApplyPlacementsStep {
+            delay: std::time::Duration::ZERO,
+            outcome: TestApplyPlacementsOutcome::SucceedWithFeedback {
+                width_violations: vec![leopardwm_platform_win32::WidthViolation {
+                    window_id: 200,
+                    min_width: 1200,
+                }],
+                height_violations: Vec::new(),
+                landings: vec![leopardwm_platform_win32::PlacementLanding {
+                    window_id: 200,
+                    requested_rect: Rect::new(1920, 0, 400, 1040),
+                    requested_visibility: leopardwm_core_layout::Visibility::Visible,
+                    actual_visible_rect: Some(Rect::new(1920, 0, 400, 1040)),
+                    actual_outer_rect: Some(Rect::new(1920, 0, 400, 1040)),
+                    failed: false,
+                    unreadable: false,
+                }],
+            },
+        },
+    ]));
+
+    assert!(state.apply_layout().is_ok());
+    let workspace = &state.workspaces[&2][0];
+    assert_eq!(
+        workspace.effective_column_width(&workspace.columns()[0]),
+        1200
+    );
+}
+
+#[test]
+fn test_failed_landing_retries_before_releasing_pending_ghost() {
+    use crate::state::{
+        TestApplyPlacementsBehavior, TestApplyPlacementsOutcome, TestApplyPlacementsStep,
+    };
+
+    const WID: u64 = 0xFFFF_FFFF_FFFF_FF32;
+    struct GhostCloakGuard(u64);
+    impl Drop for GhostCloakGuard {
+        fn drop(&mut self) {
+            leopardwm_platform_win32::unmark_ghost_cloaked(self.0);
+        }
+    }
+
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    state.paused = false;
+    state.workspaces.get_mut(&1).unwrap()[0]
+        .insert_window(WID, Some(800))
+        .unwrap();
+    let placement = state.workspaces[&1][0]
+        .compute_placements_animated(state.layout_viewport(1))
+        .into_iter()
+        .find(|placement| placement.window_id == WID)
+        .unwrap();
+    let dispatched = state.apply_physical_projection(vec![placement.clone()]);
+    let (request_id, invalidation_id) = state.physical_request_ids();
+    state.consume_physical_landings(
+        request_id,
+        invalidation_id,
+        &[leopardwm_platform_win32::PlacementLanding {
+            window_id: WID,
+            requested_rect: dispatched[0].rect,
+            requested_visibility: dispatched[0].visibility,
+            actual_visible_rect: Some(dispatched[0].rect),
+            actual_outer_rect: Some(dispatched[0].rect),
+            failed: false,
+            unreadable: false,
+        }],
+    );
+    state.last_placed_layout_rects.insert(WID, placement.rect);
+    assert!(state.physical_fast_path_ok());
+    state.post_animation_nudge_pending = true;
+    state.injected_apply_placements_behavior = Some(TestApplyPlacementsBehavior::Scripted(vec![
+        TestApplyPlacementsStep {
+            delay: std::time::Duration::ZERO,
+            outcome: TestApplyPlacementsOutcome::Fail,
+        },
+        TestApplyPlacementsStep {
+            delay: std::time::Duration::ZERO,
+            outcome: TestApplyPlacementsOutcome::Succeed {
+                landings: vec![leopardwm_platform_win32::PlacementLanding {
+                    window_id: WID,
+                    requested_rect: placement.rect,
+                    requested_visibility: placement.visibility,
+                    actual_visible_rect: Some(placement.rect),
+                    actual_outer_rect: Some(placement.rect),
+                    failed: false,
+                    unreadable: false,
+                }],
+            },
+        },
+    ]));
+
+    assert!(state.apply_layout().is_err());
+    assert_eq!(state.inflight_request_id, None);
+    assert!(state.inflight_origins.is_empty());
+    assert!(state.pending_physical_presentations.is_empty());
+    assert!(
+        !state.physical_fast_path_ok(),
+        "a failed landing must invalidate the old physical confirmation before an unchanged retry"
+    );
+    let _cloak_guard = GhostCloakGuard(WID);
+    leopardwm_platform_win32::mark_ghost_cloaked(WID);
+    state.ghost_sources_pending_safe_landing.insert(WID);
+
+    assert!(state.apply_layout().is_ok());
+    assert_eq!(
+        state
+            .injected_apply_placements_call_count
+            .load(Ordering::SeqCst),
+        2,
+        "an unchanged retry must obtain a current landing instead of trusting the failed attempt's old confirmation"
+    );
+    assert!(!state.ghost_sources_pending_safe_landing.contains(&WID));
+    assert!(!leopardwm_platform_win32::is_placement_cloaked(WID));
+}
+
+#[test]
+fn test_animation_projection_runs_once_and_preserves_full_partial_geometry() {
+    let mut monitors = two_monitors();
+    monitors[0].rect = Rect::new(0, 0, 5120, 1440);
+    monitors[0].work_area = Rect::new(0, 0, 5120, 1440);
+    monitors[1].rect = Rect::new(5120, 0, 800, 600);
+    monitors[1].work_area = Rect::new(5120, 0, 800, 600);
+    let mut state = AppState::new_with_config(test_config(), monitors);
+    state.workspaces.get_mut(&1).unwrap()[0]
+        .insert_window(100, Some(1600))
+        .unwrap();
+    let logical = leopardwm_core_layout::WindowPlacement {
+        window_id: 100,
+        rect: Rect::new(4320, 10, 1600, 1440),
+        visibility: leopardwm_core_layout::Visibility::Visible,
+        column_index: 0,
+    };
+    let physical = state.apply_physical_projection(vec![logical.clone()]);
+    let maximized = std::collections::HashSet::new();
+    let request = state.prepare_animation_frame(physical, &maximized);
+    assert_eq!(state.physical_request_seq, 1);
+    assert_eq!(request.placements[0].rect, logical.rect);
+    let origin = state.inflight_origins.get(&1).unwrap().get(&100).unwrap();
+    assert_eq!(origin.physical.rect, logical.rect);
+    assert_eq!(
+        origin.kind,
+        crate::physical_placement::PhysicalKind::Unchanged
+    );
+    state.applying_layout = true;
+    let frame_result = animation_worker::FrameResult {
+        apply_result: Ok(()),
+        frame_time: Duration::ZERO,
+        width_violations: Vec::new(),
+        height_violations: Vec::new(),
+        maximized_skipped_window_ids: Vec::new(),
+        physical_request_id: request.physical_request_id,
+        physical_invalidation_id: request.physical_invalidation_id,
+        landings: vec![leopardwm_platform_win32::PlacementLanding {
+            window_id: 100,
+            requested_rect: logical.rect,
+            requested_visibility: leopardwm_core_layout::Visibility::Visible,
+            actual_visible_rect: Some(logical.rect),
+            actual_outer_rect: Some(logical.rect),
+            failed: false,
+            unreadable: false,
+        }],
+    };
+    assert!(matches!(
+        state.handle_animation_placement_result(&frame_result),
+        crate::layout_apply::AnimationPlacementResult::Current
+    ));
+    assert!(state.last_physical_presentations[&100].confirmed);
+    assert_eq!(state.expected_physical_rect(100), Some(logical.rect));
 }
 
 #[test]
@@ -689,6 +1715,7 @@ fn test_animation_size_violations_use_usable_width_and_retarget_transition() {
                 min_height: 700,
             }],
             maximized_skipped_window_ids: Vec::new(),
+            landings: Vec::new(),
         },
         Duration::ZERO,
     );
@@ -707,6 +1734,7 @@ fn test_animation_size_violations_use_usable_width_and_retarget_transition() {
             }],
             height_violations: Vec::new(),
             maximized_skipped_window_ids: Vec::new(),
+            landings: Vec::new(),
         },
         Duration::ZERO,
     );
@@ -718,7 +1746,11 @@ fn test_animation_size_violations_use_usable_width_and_retarget_transition() {
 
     state.tick_animations(10_000);
     let workspace = &state.workspaces.get(&monitor).unwrap()[0];
-    assert_eq!(workspace.columns()[2].width(), usable_width - 1);
+    assert_eq!(workspace.columns()[2].width(), 300);
+    assert_eq!(
+        workspace.effective_column_width(&workspace.columns()[2]),
+        usable_width - 1
+    );
     assert!(
         workspace
             .compute_placements(viewport)
@@ -807,6 +1839,7 @@ fn test_current_maximize_hold_cleans_only_target_ghost_state() {
             (200, Rect::new(800, 0, 800, 600)),
         ]),
         exit_rects: HashMap::from([(100, target_exit_rect)]),
+        exit_provenance: HashMap::new(),
         elapsed_ms: 16,
         duration_ms: 150,
         easing: leopardwm_core_layout::Easing::default(),
@@ -871,6 +1904,7 @@ fn test_application_fullscreen_entry_removes_only_its_ghost_transition_state() {
             (200, Rect::new(800, 0, 800, 600)),
         ]),
         exit_rects: HashMap::from([(100, Rect::new(0, 1200, 800, 600))]),
+        exit_provenance: HashMap::new(),
         elapsed_ms: 16,
         duration_ms: 150,
         easing: leopardwm_core_layout::Easing::default(),
@@ -977,49 +2011,77 @@ fn test_app_state_startup_reduce_motion_matches_all_workspaces() {
 #[test]
 fn test_note_elevation_block_lifecycle() {
     use crate::event_handler::ElevationCheck;
+    use leopardwm_platform_win32::ManageBlock;
     let mut state = AppState::new_with_config(test_config(), test_monitors());
     let hwnd = 0xABCD_u64;
 
     // First block: recorded + flagged as new (caller toasts).
     assert_eq!(
-        state.note_elevation_block(hwnd, "Admin: term", true),
+        state.note_elevation_block(hwnd, "Admin: term", ManageBlock::HigherIntegrity),
         ElevationCheck::BlockedNew
     );
-    assert_eq!(
-        state.elevation_blocked.get(&hwnd).map(String::as_str),
-        Some("Admin: term")
-    );
+    let recorded = state.elevation_blocked.get(&hwnd).unwrap();
+    assert_eq!(recorded.title, "Admin: term");
+    assert_eq!(recorded.reason, ManageBlock::HigherIntegrity);
 
     // Same window blocked again: already known, no re-notify.
     assert_eq!(
-        state.note_elevation_block(hwnd, "Admin: term", true),
+        state.note_elevation_block(hwnd, "Admin: term", ManageBlock::HigherIntegrity),
         ElevationCheck::BlockedKnown
     );
 
     // Recycled HWND now owned by a different blocked window (title changed):
     // re-notify and refresh the stored title.
     assert_eq!(
-        state.note_elevation_block(hwnd, "Admin: other", true),
+        state.note_elevation_block(hwnd, "Admin: other", ManageBlock::HigherIntegrity),
         ElevationCheck::BlockedNew
     );
     assert_eq!(
-        state.elevation_blocked.get(&hwnd).map(String::as_str),
+        state.elevation_blocked.get(&hwnd).map(|r| r.title.as_str()),
         Some("Admin: other")
+    );
+
+    // Same title, changed reason: refresh and re-notify.
+    assert_eq!(
+        state.note_elevation_block(hwnd, "Admin: other", ManageBlock::Protected),
+        ElevationCheck::BlockedNew
+    );
+    assert_eq!(
+        state.elevation_blocked.get(&hwnd).map(|r| r.reason),
+        Some(ManageBlock::Protected)
     );
 
     // Now manageable (e.g. recycled HWND owned by a normal window): record cleared.
     assert_eq!(
-        state.note_elevation_block(hwnd, "Notepad", false),
+        state.note_elevation_block(hwnd, "Notepad", ManageBlock::No),
         ElevationCheck::Manageable
     );
     assert!(!state.elevation_blocked.contains_key(&hwnd));
 
     // Manageable when never recorded is a no-op clear.
     assert_eq!(
-        state.note_elevation_block(0x1234, "Other", false),
+        state.note_elevation_block(0x1234, "Other", ManageBlock::No),
         ElevationCheck::Manageable
     );
     assert!(state.elevation_blocked.is_empty());
+}
+
+#[test]
+fn test_elevation_block_hidden_retained_destroyed_cleared() {
+    use crate::event_handler::ElevationCheck;
+    use leopardwm_platform_win32::ManageBlock;
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    let hwnd = 0xBEEF_u64;
+    assert_eq!(
+        state.note_elevation_block(hwnd, "Elevated", ManageBlock::HigherIntegrity),
+        ElevationCheck::BlockedNew
+    );
+
+    state.handle_window_event(WindowEvent::Hidden(hwnd));
+    assert!(state.elevation_blocked.contains_key(&hwnd));
+
+    state.handle_window_event(WindowEvent::Destroyed(hwnd));
+    assert!(!state.elevation_blocked.contains_key(&hwnd));
 }
 
 #[test]
@@ -1056,6 +2118,7 @@ fn test_partition_for_animation_routes_ghosted_wids_to_ghost_stream() {
     let transition = LayoutTransition {
         start_rects: HashMap::new(),
         exit_rects: HashMap::new(),
+        exit_provenance: HashMap::new(),
         elapsed_ms: 0,
         duration_ms: 150,
         easing: leopardwm_core_layout::Easing::default(),
@@ -1127,6 +2190,38 @@ fn test_partition_for_animation_no_transition_keeps_everything_live() {
     let (live, ghosts) = AppState::partition_for_animation(placements, None, &HashMap::new());
     assert_eq!(live.len(), 1);
     assert_eq!(ghosts.len(), 0);
+}
+
+#[test]
+fn test_revoked_unconfirmed_ghost_source_stays_cloaked_until_landing() {
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    state.ghost_handles.insert(
+        42,
+        GhostEntry::new(0, "GhostClass".to_string(), Rect::new(0, 0, 100, 100)),
+    );
+
+    state.abort_active_ghost_transition();
+
+    assert!(state.ghost_handles.is_empty());
+    assert!(
+        state.ghost_sources_pending_safe_landing.contains(&42),
+        "revoking an unconfirmed ghost must not expose its stale source"
+    );
+}
+
+#[test]
+fn test_departing_pending_ghost_releases_ghost_cloak_after_thumbnail_drop() {
+    let wid = 0xFFFF_FFFF_FFFF_FF21;
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    leopardwm_platform_win32::mark_ghost_cloaked(wid);
+    state.ghost_sources_pending_safe_landing.insert(wid);
+
+    state.stop_ghosting_window_visuals(wid);
+
+    assert!(
+        !leopardwm_platform_win32::is_placement_cloaked(wid),
+        "pending safe-landing membership remains cloak ownership after its thumbnail has been dropped"
+    );
 }
 
 #[test]
@@ -1206,6 +2301,7 @@ fn test_partition_for_animation_missing_handle_drops_placement() {
     let transition = LayoutTransition {
         start_rects: HashMap::new(),
         exit_rects: HashMap::new(),
+        exit_provenance: HashMap::new(),
         elapsed_ms: 0,
         duration_ms: 150,
         easing: leopardwm_core_layout::Easing::default(),
@@ -1375,6 +2471,74 @@ fn test_application_fullscreen_crossfade_abort_reaches_worker() {
     drop(worker);
 }
 
+#[test]
+fn test_display_receipt_immediately_invalidates_crossfade_worker() {
+    use crate::state::CrossfadeState;
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(4);
+    let worker = animation_worker::AnimationWorkerHandle::spawn(
+        event_tx,
+        state.apply_worker_cancelled.clone(),
+    )
+    .expect("spawn animation worker");
+    let (abort_tx, abort_rx) = std::sync::mpsc::channel();
+    let (drop_tx, drop_rx) = std::sync::mpsc::channel();
+    state.animation_worker_control = Some(worker.control().with_abort_acknowledged(abort_tx));
+    state.active_crossfade = Some(CrossfadeState { epoch: 4 });
+    state.crossfade_sources.insert(
+        4,
+        (
+            std::collections::HashSet::from([100]),
+            std::time::Instant::now(),
+        ),
+    );
+    let invalidation_before = state.physical_invalidation_id.load(Ordering::SeqCst);
+    state.invalidate_physical_display_change();
+
+    assert_eq!(
+        state.physical_invalidation_id.load(Ordering::SeqCst),
+        invalidation_before + 1,
+        "receipt must invalidate physical work before debounce settles"
+    );
+    assert!(state.active_crossfade.is_none());
+    worker
+        .send_crossfade_with_physical_invalidation(
+            4,
+            vec![animation_worker::CrossfadeEntry {
+                window_id: 100,
+                handle_isize: 0,
+                dest_client_rect: Rect::new(0, 0, 1, 1),
+                dropped: Some(drop_tx),
+            }],
+            100_000,
+            Some((state.physical_invalidation_id.clone(), invalidation_before)),
+        )
+        .expect("queue stale crossfade");
+    assert!(
+        abort_rx.recv_timeout(Duration::from_millis(500)).is_ok(),
+        "receipt must send the crossfade abort to the worker"
+    );
+    assert_eq!(
+        drop_rx.recv_timeout(Duration::from_millis(500)),
+        Ok(100),
+        "the invalidated worker crossfade must release its stale target"
+    );
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+    assert!(matches!(
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_millis(500), event_rx.recv()).await
+        }),
+        Ok(Some(DaemonEvent::CrossfadeComplete { epoch: 4 }))
+    ));
+    drop(worker);
+}
+
 fn departing_ghost_fixture() -> AppState {
     use crate::state::{CrossfadeState, GhostEntry, LayoutTransition};
     use std::collections::{HashMap, HashSet};
@@ -1386,6 +2550,7 @@ fn departing_ghost_fixture() -> AppState {
             (200, Rect::new(800, 0, 800, 600)),
         ]),
         exit_rects: HashMap::from([(100, Rect::new(0, 1200, 800, 600))]),
+        exit_provenance: HashMap::new(),
         elapsed_ms: 16,
         duration_ms: 150,
         easing: leopardwm_core_layout::Easing::default(),
@@ -4514,6 +5679,282 @@ fn test_cmd_query_focused_empty() {
 }
 
 #[test]
+fn test_cmd_query_hotkeys_returns_catalog_order_and_defaults() {
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    let response = state.handle_command(IpcCommand::QueryHotkeys);
+
+    let IpcResponse::HotkeyList {
+        hotkeys,
+        scroll_modifier,
+        issues,
+    } = response
+    else {
+        panic!("Expected HotkeyList");
+    };
+
+    let catalog = leopardwm_ipc::hotkeys::hotkey_catalog();
+    assert_eq!(hotkeys.len(), catalog.len());
+    assert_eq!(hotkeys[0].action_id, catalog[0].id);
+    assert_eq!(hotkeys[0].label, catalog[0].label);
+    assert_eq!(hotkeys[0].group, catalog[0].group);
+    assert_eq!(hotkeys[0].bindings, vec!["Ctrl+Alt+H"]);
+    assert!(hotkeys[0].enabled);
+    assert_eq!(scroll_modifier, "Ctrl+Alt");
+    assert!(issues.is_empty());
+}
+
+#[test]
+fn test_cmd_query_hotkeys_preserves_diagnostics_and_unbound_actions() {
+    let mut config = test_config();
+    config.hotkeys.bindings.clear();
+    config
+        .hotkeys
+        .bindings
+        .insert("Ctrl+Alt+Z".to_string(), "focus_left".to_string());
+    config
+        .hotkeys
+        .bindings
+        .insert("Ctrl+Alt+A".to_string(), "focus-left".to_string());
+    config
+        .hotkeys
+        .bindings
+        .insert("Ctrl+Nope".to_string(), "focus_right".to_string());
+    config
+        .hotkeys
+        .bindings
+        .insert("Ctrl+Alt+Q".to_string(), "missing_action".to_string());
+
+    let mut state = AppState::new_with_config(config, test_monitors());
+    let response = state.handle_command(IpcCommand::QueryHotkeys);
+    let IpcResponse::HotkeyList {
+        hotkeys, issues, ..
+    } = response
+    else {
+        panic!("Expected HotkeyList");
+    };
+
+    let focus_left = hotkeys
+        .iter()
+        .find(|entry| entry.action_id == "focus_left")
+        .unwrap();
+    assert_eq!(focus_left.bindings, vec!["Ctrl+Alt+A", "Ctrl+Alt+Z"]);
+    assert!(focus_left.enabled);
+
+    let focus_right = hotkeys
+        .iter()
+        .find(|entry| entry.action_id == "focus_right")
+        .unwrap();
+    assert!(focus_right.bindings.is_empty());
+    assert!(!focus_right.enabled);
+
+    assert_eq!(issues.len(), 2);
+    assert_eq!(issues[0].binding, "Ctrl+Alt+Q");
+    assert_eq!(issues[0].message, "unknown action identifier");
+    assert_eq!(issues[1].binding, "Ctrl+Nope");
+    assert_eq!(issues[1].message, "invalid key chord");
+}
+
+#[test]
+fn test_cmd_query_hotkeys_appends_valid_non_catalog_actions() {
+    let mut config = test_config();
+    config.hotkeys.bindings.clear();
+    config
+        .hotkeys
+        .bindings
+        .insert("Ctrl+Alt+N".to_string(), "focus_next".to_string());
+
+    let mut state = AppState::new_with_config(config, test_monitors());
+    let IpcResponse::HotkeyList {
+        hotkeys, issues, ..
+    } = state.handle_command(IpcCommand::QueryHotkeys)
+    else {
+        panic!("Expected HotkeyList");
+    };
+
+    let extra = hotkeys.last().unwrap();
+    assert_eq!(extra.action_id, "focus_next");
+    assert_eq!(extra.label, "Focus next");
+    assert_eq!(extra.group, "Other");
+    assert_eq!(extra.bindings, vec!["Ctrl+Alt+N"]);
+    assert!(extra.enabled);
+    assert!(issues.is_empty());
+}
+
+#[test]
+fn test_cmd_query_hotkeys_reports_both_invalid_action_and_chord() {
+    let mut config = test_config();
+    config.hotkeys.bindings.clear();
+    config
+        .hotkeys
+        .bindings
+        .insert("Ctrl+Nope".to_string(), "missing_action".to_string());
+
+    let mut state = AppState::new_with_config(config, test_monitors());
+    let IpcResponse::HotkeyList { issues, .. } = state.handle_command(IpcCommand::QueryHotkeys)
+    else {
+        panic!("Expected HotkeyList");
+    };
+
+    assert_eq!(issues.len(), 2);
+    assert_eq!(issues[0].message, "invalid key chord");
+    assert_eq!(issues[1].message, "unknown action identifier");
+}
+
+#[test]
+fn test_cmd_query_hotkeys_excludes_f_key_trigger_used_as_modifier() {
+    let mut config = test_config();
+    config.hotkeys.bindings.clear();
+    config
+        .hotkeys
+        .bindings
+        .insert("F13+H".to_string(), "focus_left".to_string());
+    config
+        .hotkeys
+        .bindings
+        .insert("Ctrl+F13".to_string(), "focus_right".to_string());
+
+    let mut state = AppState::new_with_config(config, test_monitors());
+    let IpcResponse::HotkeyList {
+        hotkeys, issues, ..
+    } = state.handle_command(IpcCommand::QueryHotkeys)
+    else {
+        panic!("Expected HotkeyList");
+    };
+
+    let focus_left = hotkeys
+        .iter()
+        .find(|entry| entry.action_id == "focus_left")
+        .unwrap();
+    assert_eq!(focus_left.bindings, vec!["F13+H"]);
+    let focus_right = hotkeys
+        .iter()
+        .find(|entry| entry.action_id == "focus_right")
+        .unwrap();
+    assert!(!focus_right.enabled);
+    assert!(focus_right.bindings.is_empty());
+    assert_eq!(issues.len(), 1);
+    assert_eq!(
+        issues[0].message,
+        "trigger F-key is also configured as a modifier"
+    );
+}
+
+#[test]
+fn test_cmd_query_hotkeys_resolves_collisions_independent_of_insertion_order() {
+    let entries = [
+        ("Ctrl+Alt+H", "focus_right"),
+        ("Alt+Control+h", "Focus-Left"),
+    ];
+    let mut previous = None;
+    for reverse in [false, true] {
+        let mut config = test_config();
+        config.hotkeys.bindings.clear();
+        let mut ordered = entries.to_vec();
+        if reverse {
+            ordered.reverse();
+        }
+        for (binding, action) in ordered {
+            config
+                .hotkeys
+                .bindings
+                .insert(binding.into(), action.into());
+        }
+        let runtime = hotkey_resolution::resolve_hotkeys(&config.hotkeys);
+        assert_eq!(runtime.bindings.len(), 1);
+        assert_eq!(runtime.bindings[0].command, IpcCommand::FocusLeft);
+        assert_eq!(runtime.bindings[0].hook_binding.id, 0x348);
+        let mut state = AppState::new_with_config(config, test_monitors());
+        let response = state.handle_command(IpcCommand::QueryHotkeys);
+        let IpcResponse::HotkeyList {
+            hotkeys, issues, ..
+        } = &response
+        else {
+            panic!("Expected HotkeyList");
+        };
+        let left = hotkeys
+            .iter()
+            .find(|h| h.action_id == "focus_left")
+            .unwrap();
+        let right = hotkeys
+            .iter()
+            .find(|h| h.action_id == "focus_right")
+            .unwrap();
+        assert_eq!(left.bindings, vec!["Alt+Control+h"]);
+        assert!(left.enabled);
+        assert!(right.bindings.is_empty());
+        assert!(!right.enabled);
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].binding, "Ctrl+Alt+H");
+        assert_eq!(issues[0].action_id, "focus_right");
+        assert!(issues[0].message.contains("Alt+Control+h"));
+        assert!(issues[0].message.contains("Focus-Left"));
+        if let Some(previous) = previous {
+            assert_eq!(response, previous);
+        }
+        previous = Some(response);
+    }
+}
+
+#[test]
+fn test_cmd_query_hotkeys_reports_redundant_alias_for_same_action() {
+    let mut config = test_config();
+    config.hotkeys.bindings.clear();
+    config
+        .hotkeys
+        .bindings
+        .insert("Win+Left".into(), "focus_left".into());
+    config
+        .hotkeys
+        .bindings
+        .insert("Meta+Left".into(), "focus-left".into());
+    let mut state = AppState::new_with_config(config, test_monitors());
+    let IpcResponse::HotkeyList {
+        hotkeys, issues, ..
+    } = state.handle_command(IpcCommand::QueryHotkeys)
+    else {
+        panic!("Expected HotkeyList");
+    };
+    let left = hotkeys
+        .iter()
+        .find(|h| h.action_id == "focus_left")
+        .unwrap();
+    assert_eq!(left.bindings, vec!["Meta+Left"]);
+    assert_eq!(issues.len(), 1);
+    assert_eq!(issues[0].binding, "Win+Left");
+    assert!(issues[0].message.contains("Meta+Left"));
+}
+
+#[test]
+fn test_cmd_query_hotkeys_f_key_issue_preserves_loaded_action_identifier() {
+    let mut config = test_config();
+    config.hotkeys.bindings.clear();
+    config
+        .hotkeys
+        .bindings
+        .insert("F13+H".into(), "focus_left".into());
+    config
+        .hotkeys
+        .bindings
+        .insert("Ctrl+F13".into(), "Resize-Grow".into());
+    let mut state = AppState::new_with_config(config, test_monitors());
+    let IpcResponse::HotkeyList {
+        hotkeys, issues, ..
+    } = state.handle_command(IpcCommand::QueryHotkeys)
+    else {
+        panic!("Expected HotkeyList");
+    };
+    assert_eq!(issues.len(), 1);
+    assert_eq!(issues[0].binding, "Ctrl+F13");
+    assert_eq!(issues[0].action_id, "Resize-Grow");
+    let grow = hotkeys
+        .iter()
+        .find(|h| h.action_id == "cycle_width_up")
+        .unwrap();
+    assert!(!grow.enabled);
+    assert!(grow.bindings.is_empty());
+}
+
+#[test]
 fn test_cmd_focus_up_empty() {
     let mut state = AppState::new_with_config(test_config(), test_monitors());
     let resp = state.handle_command(IpcCommand::FocusUp);
@@ -4878,12 +6319,79 @@ fn test_reconcile_no_change() {
 }
 
 #[test]
+fn test_reconcile_no_change_preserves_manual_scroll() {
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    let workspace = &mut state.workspaces.get_mut(&1).unwrap()[0];
+    for id in 1..=4 {
+        workspace.insert_window(id, Some(600)).unwrap();
+    }
+    workspace.set_scroll_offset(250.0);
+
+    state.reconcile_monitors(test_monitors());
+
+    assert_eq!(state.workspaces[&1][0].scroll_offset(), 250.0);
+}
+
+#[test]
+fn test_reconcile_stable_monitor_rescales_for_work_area_change() {
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    state.workspaces.get_mut(&1).unwrap()[0]
+        .insert_window(100, Some(945))
+        .unwrap();
+    let mut resized = test_monitors();
+    resized[0].rect.width = 1280;
+    resized[0].work_area.width = 1280;
+
+    state.reconcile_monitors(resized);
+
+    assert_eq!(state.workspaces[&1][0].columns()[0].width(), 625);
+}
+
+#[test]
+fn test_reconcile_shrink_keeps_focused_column_visible() {
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    let workspace = &mut state.workspaces.get_mut(&1).unwrap()[0];
+    for id in 1..=3 {
+        workspace.insert_window(id, Some(945)).unwrap();
+    }
+    workspace.set_scroll_offset(0.0);
+    let mut resized = test_monitors();
+    resized[0].rect.width = 1280;
+    resized[0].work_area.width = 1280;
+
+    state.reconcile_monitors(resized);
+
+    let placements = state.workspaces[&1][0].compute_placements(Rect::new(0, 0, 1280, 1040));
+    let focused = placements
+        .iter()
+        .find(|placement| placement.window_id == 3)
+        .unwrap();
+    assert!(focused.rect.x >= 0);
+    assert!(focused.rect.x + focused.rect.width <= 1280);
+}
+
+#[test]
 fn test_reconcile_add_monitor() {
     let mut state = AppState::new_with_config(test_config(), test_monitors());
     assert_eq!(state.workspaces.len(), 1);
     state.reconcile_monitors(two_monitors());
     assert_eq!(state.workspaces.len(), 2);
     assert!(state.workspaces.contains_key(&2));
+}
+
+#[test]
+fn test_reconcile_new_monitor_keeps_destination_default_width() {
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    let mut monitors = two_monitors();
+    monitors[1].rect.width = 2560;
+    monitors[1].work_area.width = 2560;
+    state.reconcile_monitors(monitors);
+
+    state.workspaces.get_mut(&2).unwrap()[0]
+        .insert_window(200, None)
+        .unwrap();
+
+    assert_eq!(state.workspaces[&2][0].columns()[0].width(), 839);
 }
 
 #[test]
@@ -4949,6 +6457,48 @@ fn test_reconcile_restores_stashed_layout_on_monitor_return() {
 }
 
 #[test]
+fn test_reconcile_restores_stash_at_changed_width_and_active_workspace() {
+    let mut state = AppState::new_with_config(test_config(), two_monitors());
+    let second_workspace = state.workspaces[&2][0].clone();
+    state.workspaces.get_mut(&2).unwrap().push(second_workspace);
+    state.active_workspace.insert(2, 1);
+    state.workspaces.get_mut(&2).unwrap()[1]
+        .insert_window(100, Some(500))
+        .unwrap();
+
+    state.reconcile_monitors(test_monitors());
+
+    let mut returned = two_monitors();
+    returned[1].id = 99;
+    returned[1].rect.width = 1280;
+    returned[1].work_area.width = 1280;
+    state.reconcile_monitors(returned);
+
+    assert_eq!(state.active_workspace_idx(99), 1);
+    assert_eq!(state.workspaces[&99][1].columns()[0].width(), 329);
+}
+
+#[test]
+fn test_reconcile_restored_stash_uses_current_centering_policy() {
+    let mut config = test_config();
+    config.layout.center_past_edges = true;
+    let mut state = AppState::new_with_config(config.clone(), two_monitors());
+    let workspace = &mut state.workspaces.get_mut(&2).unwrap()[0];
+    workspace.insert_window(100, Some(500)).unwrap();
+    workspace.set_scroll_offset(-100.0);
+
+    state.reconcile_monitors(test_monitors());
+    config.layout.center_past_edges = false;
+    state.apply_config(config);
+
+    let mut returned = two_monitors();
+    returned[1].id = 99;
+    state.reconcile_monitors(returned);
+
+    assert_eq!(state.workspaces[&99][0].scroll_offset(), 0.0);
+}
+
+#[test]
 fn test_reconcile_adopts_layout_on_same_pass_handle_change() {
     // A single reconcile where a monitor's HMONITOR changes AND the count
     // changes (e.g. a dock event) must preserve the layout, not flatten it.
@@ -4987,6 +6537,49 @@ fn test_reconcile_adopts_layout_on_same_pass_handle_change() {
     );
     // Adopted live, so nothing was stashed or flattened onto another monitor.
     assert!(state.stashed_monitor_layouts.is_empty());
+}
+
+#[test]
+fn test_reconcile_adoption_maps_source_width_to_new_monitor_id() {
+    let mut state = AppState::new_with_config(test_config(), two_monitors());
+    state.workspaces.get_mut(&2).unwrap()[0]
+        .insert_window(100, Some(500))
+        .unwrap();
+
+    let mut next = two_monitors();
+    next[1].id = 99;
+    next[1].rect.width = 1280;
+    next[1].work_area.width = 1280;
+    next.push(MonitorInfo {
+        id: 3,
+        rect: Rect::new(3200, 0, 1920, 1080),
+        work_area: Rect::new(3200, 0, 1920, 1040),
+        is_primary: false,
+        device_name: "DISPLAY3".to_string(),
+        scale_factor: 1.0,
+    });
+
+    state.reconcile_monitors(next);
+
+    assert_eq!(state.workspaces[&99][0].columns()[0].width(), 329);
+}
+
+#[test]
+fn test_reconcile_handle_rekey_rescales_changed_width() {
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    state.workspaces.get_mut(&1).unwrap()[0]
+        .insert_window(100, Some(945))
+        .unwrap();
+    let mut rekeyed = test_monitors();
+    rekeyed[0].id = 99;
+    rekeyed[0].rect.width = 1280;
+    rekeyed[0].work_area.width = 1280;
+
+    state.reconcile_monitors(rekeyed);
+
+    assert!(!state.workspaces.contains_key(&1));
+    assert_eq!(state.workspaces[&99][0].columns()[0].width(), 625);
+    assert_eq!(state.focused_monitor, 99);
 }
 
 #[test]
@@ -5332,6 +6925,31 @@ fn test_all_managed_window_ids_multi_monitor() {
 // ================================================================
 // Minimize/Restore State Tests
 // ================================================================
+
+#[test]
+fn test_minimize_reconciles_geometry_after_native_minimum_removal() {
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    let workspace = state.focused_workspace_mut().unwrap();
+    workspace.set_reduce_motion(false);
+    workspace.set_centering_mode(leopardwm_core_layout::CenteringMode::JustInView);
+    workspace.insert_window(100, Some(467)).unwrap();
+    workspace.insert_window(200, Some(467)).unwrap();
+    workspace.insert_window_in_column(300, 1).unwrap();
+    workspace.commit_pending_min_size_clears();
+    workspace.set_window_min_width(200, 842);
+    workspace.set_scroll_offset(339.0);
+    assert_eq!(state.tiled_column_width(1, 0, 200), Some(467));
+    state.handle_window_event(WindowEvent::Minimized(200));
+    let workspace = state.focused_workspace_mut().unwrap();
+    assert!(workspace.is_minimized(200));
+    assert_eq!(workspace.columns()[1].width(), 467);
+    assert_eq!(
+        workspace.effective_column_width(&workspace.columns()[1]),
+        467
+    );
+    workspace.tick_animation(1000);
+    assert_eq!(workspace.scroll_offset(), 0.0);
+}
 
 #[test]
 fn test_minimize_marks_workspace_window() {
@@ -6501,6 +8119,7 @@ fn test_protected_only_animation_frame_dispatches_and_settles_transition() {
     state.layout_transition = Some(LayoutTransition {
         start_rects: HashMap::from([(100, Rect::new(0, 0, 800, 1040))]),
         exit_rects: HashMap::new(),
+        exit_provenance: HashMap::new(),
         elapsed_ms: 16,
         duration_ms: 150,
         easing: leopardwm_core_layout::Easing::default(),
@@ -6947,6 +8566,209 @@ fn test_workspace_numeric_switch_retains_raw_index_animation_direction() {
         IpcCommand::SwitchWorkspace { index: 1 },
         -1,
     );
+}
+
+#[test]
+fn test_workspace_activation_repairs_cleared_minimum_before_snapshot() {
+    for (deferred, sticky) in [(false, false), (true, false), (true, true)] {
+        let mut state = AppState::new_with_config(test_config(), test_monitors());
+        state.reduce_motion = false;
+        state.ensure_workspace_exists(1, 1);
+        let mut workspace = Workspace::with_gaps(10, 10);
+        workspace.set_centering_mode(leopardwm_core_layout::CenteringMode::JustInView);
+        workspace.set_center_past_edges(false);
+        for id in [200, 300, 400] {
+            workspace.insert_window(id, Some(800)).unwrap();
+        }
+        workspace.commit_pending_min_size_clears();
+        workspace.set_window_min_width(400, 1500);
+        workspace.set_scroll_offset(1220.0);
+        if deferred {
+            workspace.insert_window_in_column(500, 2).unwrap();
+        }
+        state.workspaces.get_mut(&1).unwrap()[1] = workspace;
+        if !deferred {
+            state.invalidate_display_change_constraints(true);
+            state.reconcile_monitors(test_monitors());
+        }
+        if sticky {
+            state
+                .focused_workspace_mut()
+                .unwrap()
+                .insert_window(100, Some(100))
+                .unwrap();
+            state.toggle_sticky();
+        }
+        assert_eq!(state.workspaces[&1][1].scroll_offset(), 1220.0);
+        assert_eq!(state.active_workspace_idx(1), 0);
+        assert!(matches!(
+            state.handle_command(IpcCommand::SwitchWorkspace { index: 2 }),
+            IpcResponse::Ok
+        ));
+        let transition = state.layout_transition.as_ref().unwrap();
+        let expected_scroll = if sticky { 630.0 } else { 520.0 };
+        assert_eq!(
+            transition.start_rects[&400].x,
+            1630 - expected_scroll as i32,
+            "deferred={deferred}, sticky={sticky}"
+        );
+        assert_eq!(transition.start_rects[&400].width, 800);
+        assert_eq!(state.workspaces[&1][1].scroll_offset(), expected_scroll);
+        if sticky {
+            assert!(state.workspaces[&1][1].contains_window(100));
+            assert!(!state.workspaces[&1][0].contains_window(100));
+        }
+    }
+}
+
+#[test]
+fn test_focus_follow_activation_repairs_minimum_before_snapshot() {
+    for (deferred, reduce_motion) in [(false, false), (true, false), (false, true), (true, true)] {
+        let mut state = AppState::new_with_config(test_config(), test_monitors());
+        state.reduce_motion = reduce_motion;
+        state.last_prune_at = Some(std::time::Instant::now());
+        state.ensure_workspace_exists(1, 1);
+        let mut workspace = Workspace::with_gaps(10, 10);
+        workspace.set_centering_mode(leopardwm_core_layout::CenteringMode::JustInView);
+        workspace.set_center_past_edges(false);
+        for id in [200, 300, 400] {
+            workspace.insert_window(id, Some(800)).unwrap();
+            state
+                .injected_window_info
+                .insert(id, make_test_window_info(id));
+        }
+        workspace.commit_pending_min_size_clears();
+        workspace.set_window_min_width(400, 1500);
+        workspace.set_scroll_offset(1220.0);
+        if deferred {
+            workspace.insert_window_in_column(500, 2).unwrap();
+            state
+                .injected_window_info
+                .insert(500, make_test_window_info(500));
+        } else {
+            workspace.clear_window_min_width(400);
+        }
+        state.workspaces.get_mut(&1).unwrap()[1] = workspace;
+        assert_eq!(state.active_workspace_idx(1), 0);
+        assert_eq!(state.workspaces[&1][1].scroll_offset(), 1220.0);
+
+        state.handle_window_event(WindowEvent::Focused(400, 0));
+
+        assert_eq!(state.active_workspace_idx(1), 1);
+        if reduce_motion {
+            assert!(state.layout_transition.is_none());
+        } else {
+            let transition = state.layout_transition.as_ref().unwrap();
+            assert_eq!(transition.start_rects[&400].x, 1110, "deferred={deferred}");
+            assert_eq!(transition.start_rects[&400].width, 800);
+        }
+        assert_eq!(state.workspaces[&1][1].scroll_offset(), 520.0);
+        assert_eq!(state.workspaces[&1][1].focused_window(), Some(400));
+        assert_eq!(state.previous_focused_hwnd, Some(400));
+    }
+}
+
+#[test]
+fn test_focus_follow_activation_snapshots_valid_scroll_without_revealing_focus() {
+    for (offset, target) in [
+        (137.0, None),
+        (-550.0, None),
+        (1070.0, None),
+        (137.0, Some(400.0)),
+    ] {
+        let mut state = AppState::new_with_config(test_config(), test_monitors());
+        state.reduce_motion = false;
+        state.last_prune_at = Some(std::time::Instant::now());
+        state.ensure_workspace_exists(1, 1);
+        let mut workspace = Workspace::with_gaps(10, 10);
+        workspace.set_centering_mode(leopardwm_core_layout::CenteringMode::Center);
+        workspace.set_center_past_edges(true);
+        for id in [200, 300, 400] {
+            workspace.insert_window(id, Some(800)).unwrap();
+            state
+                .injected_window_info
+                .insert(id, make_test_window_info(id));
+        }
+        workspace.commit_pending_min_size_clears();
+        workspace.set_scroll_offset(offset);
+        if let Some(target) = target {
+            workspace.start_scroll_animation(
+                target,
+                1920,
+                Some(1000),
+                Some(leopardwm_core_layout::Easing::Linear),
+            );
+            workspace.tick_animation(10);
+        }
+        let expected = workspace.compute_placements_animated(state.layout_viewport(1));
+        state.workspaces.get_mut(&1).unwrap()[1] = workspace;
+
+        state.handle_window_event(WindowEvent::Focused(400, 0));
+
+        let transition = state.layout_transition.as_ref().unwrap();
+        for placement in expected {
+            assert_eq!(
+                transition.start_rects[&placement.window_id].x,
+                placement.rect.x
+            );
+            assert_eq!(
+                transition.start_rects[&placement.window_id].width,
+                placement.rect.width
+            );
+        }
+        assert_eq!(state.previous_focused_hwnd, Some(400));
+    }
+}
+
+#[test]
+fn test_workspace_activation_preserves_valid_manual_and_animated_scroll() {
+    for reduce_motion in [false, true] {
+        for (offset, target) in [
+            (137.0, None),
+            (-550.0, None),
+            (1070.0, None),
+            (137.0, Some(400.0)),
+        ] {
+            let mut state = AppState::new_with_config(test_config(), test_monitors());
+            state.reduce_motion = reduce_motion;
+            state.ensure_workspace_exists(1, 1);
+            let mut workspace = Workspace::with_gaps(10, 10);
+            workspace.set_centering_mode(leopardwm_core_layout::CenteringMode::Center);
+            workspace.set_center_past_edges(true);
+            for id in [200, 300, 400] {
+                workspace.insert_window(id, Some(800)).unwrap();
+            }
+            workspace.commit_pending_min_size_clears();
+            workspace.set_scroll_offset(offset);
+            if let Some(target) = target {
+                workspace.start_scroll_animation(
+                    target,
+                    1920,
+                    Some(1000),
+                    Some(leopardwm_core_layout::Easing::Linear),
+                );
+                workspace.tick_animation(10);
+            }
+            let mut expected = workspace.clone();
+            state.workspaces.get_mut(&1).unwrap()[1] = workspace;
+            assert!(matches!(
+                state.handle_command(IpcCommand::SwitchWorkspace { index: 2 }),
+                IpcResponse::Ok
+            ));
+            let actual = &mut state.workspaces.get_mut(&1).unwrap()[1];
+            assert_eq!(
+                actual.effective_scroll_offset(),
+                expected.effective_scroll_offset()
+            );
+            assert_eq!(actual.is_animating(), expected.is_animating());
+            actual.tick_animation(100);
+            expected.tick_animation(100);
+            assert_eq!(
+                actual.effective_scroll_offset(),
+                expected.effective_scroll_offset()
+            );
+        }
+    }
 }
 
 fn switch_to_empty_workspace_with_pending_focus() -> AppState {
@@ -7858,12 +9680,21 @@ fn test_cmd_health_check() {
             total_windows,
             monitors,
             paused,
+            daemon_integrity,
+            elevation_blocked_windows,
+            elevation_blocked_records,
             ..
         } => {
             assert!(healthy);
             assert_eq!(total_windows, 0);
             assert_eq!(monitors, 1);
             assert!(!paused);
+            assert_eq!(
+                daemon_integrity,
+                leopardwm_platform_win32::current_process_integrity()
+            );
+            assert!(elevation_blocked_windows.is_empty());
+            assert_eq!(elevation_blocked_records, Some(Vec::new()));
         }
         other => panic!("Expected HealthInfo, got {:?}", other),
     }
@@ -7877,6 +9708,60 @@ fn test_cmd_health_check_paused() {
     match resp {
         IpcResponse::HealthInfo { paused, .. } => {
             assert!(paused, "paused flag should be true");
+        }
+        other => panic!("Expected HealthInfo, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_cmd_health_check_elevation_records_sorted_with_daemon_integrity() {
+    use leopardwm_ipc::{ElevationBlockReason, ElevationBlockedWindow};
+    use leopardwm_platform_win32::ManageBlock;
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    state.note_elevation_block(0x20, "Zed", ManageBlock::Protected);
+    state.note_elevation_block(0x30, "Admin", ManageBlock::HigherIntegrity);
+    state.note_elevation_block(0x10, "Admin", ManageBlock::HigherIntegrity);
+
+    let resp = state.handle_command(IpcCommand::HealthCheck);
+    match resp {
+        IpcResponse::HealthInfo {
+            daemon_integrity,
+            elevation_blocked_windows,
+            elevation_blocked_records,
+            ..
+        } => {
+            assert_eq!(
+                daemon_integrity,
+                leopardwm_platform_win32::current_process_integrity()
+            );
+            assert_eq!(
+                elevation_blocked_windows,
+                vec![
+                    (0x10, "Admin".to_string()),
+                    (0x30, "Admin".to_string()),
+                    (0x20, "Zed".to_string()),
+                ]
+            );
+            assert_eq!(
+                elevation_blocked_records,
+                Some(vec![
+                    ElevationBlockedWindow {
+                        hwnd: 0x10,
+                        title: "Admin".to_string(),
+                        reason: ElevationBlockReason::HigherIntegrity,
+                    },
+                    ElevationBlockedWindow {
+                        hwnd: 0x30,
+                        title: "Admin".to_string(),
+                        reason: ElevationBlockReason::HigherIntegrity,
+                    },
+                    ElevationBlockedWindow {
+                        hwnd: 0x20,
+                        title: "Zed".to_string(),
+                        reason: ElevationBlockReason::Protected,
+                    },
+                ])
+            );
         }
         other => panic!("Expected HealthInfo, got {:?}", other),
     }
@@ -8110,9 +9995,14 @@ fn test_snap_config_toggle_on() {
     config.behavior.disable_snap_layouts = false;
     let mut state = AppState::new_with_config(config, test_monitors());
 
-    // No windows tiled, so no snap_disabled_hwnds after enabling
+    // Config reload enumerates the desktop; keep this empty-layout fixture isolated.
     let mut new_config = test_config();
     new_config.behavior.disable_snap_layouts = true;
+    new_config.window_rules = vec![config::WindowRule {
+        match_class: Some(".*".to_string()),
+        action: config::WindowAction::Ignore,
+        ..Default::default()
+    }];
     state.apply_config(new_config);
     // No tiled windows → nothing to disable
     assert!(state.snap_disabled_hwnds.is_empty());
@@ -9656,6 +11546,803 @@ fn test_restore_structure_prunes_dead_windows() {
 }
 
 #[test]
+fn test_restore_structure_rejects_excluded_classes_but_keeps_hidden_windows() {
+    use windows::core::{w, PCWSTR};
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DestroyWindow, WINDOW_EX_STYLE, WINDOW_STYLE, WS_MINIMIZE,
+    };
+
+    struct TestWindow(HWND);
+    impl TestWindow {
+        fn new(class: PCWSTR, style: WINDOW_STYLE) -> Self {
+            Self(unsafe {
+                CreateWindowExW(
+                    WINDOW_EX_STYLE::default(),
+                    class,
+                    w!(""),
+                    style,
+                    0,
+                    0,
+                    200,
+                    100,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap()
+            })
+        }
+
+        fn id(&self) -> u64 {
+            self.0 .0 as u64
+        }
+    }
+    impl Drop for TestWindow {
+        fn drop(&mut self) {
+            let _ = unsafe { DestroyWindow(self.0) };
+        }
+    }
+
+    let dialog = TestWindow::new(w!("#32770"), WINDOW_STYLE::default());
+    let hidden = TestWindow::new(w!("STATIC"), WINDOW_STYLE::default());
+    let minimized = TestWindow::new(w!("STATIC"), WS_MINIMIZE);
+    assert!(!leopardwm_platform_win32::is_window_visible(hidden.id()));
+    assert_eq!(
+        leopardwm_platform_win32::window_minimized_state(minimized.id()),
+        Some(true)
+    );
+    let mut workspace = leopardwm_core_layout::Workspace::default();
+    for window in [&dialog, &hidden, &minimized] {
+        workspace.insert_window(window.id(), Some(480)).unwrap();
+    }
+    let snapshot = crate::state::StateSnapshot {
+        saved_at: "0".to_string(),
+        workspaces: vec![crate::state::WorkspaceSnapshot {
+            monitor_device_name: "DISPLAY2".to_string(),
+            workspace_index: 0,
+            workspace,
+        }],
+        focused_monitor_name: "DISPLAY1".to_string(),
+        active_workspace: std::collections::HashMap::new(),
+        tab_title_overrides: std::collections::HashMap::new(),
+    };
+    let mut state = structure_restore_state();
+    let restored = state.restore_workspace_structure(&snapshot);
+    let &(monitor, index) = restored.iter().next().unwrap();
+    let workspace = &state.workspaces[&monitor][index];
+    assert!(!workspace.contains_window(dialog.id()));
+    assert!(workspace.contains_window(hidden.id()));
+    assert!(workspace.contains_window(minimized.id()));
+    assert_eq!(workspace.column_count(), 2);
+}
+
+#[test]
+fn test_initial_layout_parks_restored_inactive_windows() {
+    use windows::core::w;
+    use windows::Win32::Foundation::{HWND, RECT};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DestroyWindow, GetWindowRect, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+        WS_MINIMIZE, WS_POPUP,
+    };
+
+    struct TestWindow(HWND);
+    impl TestWindow {
+        fn new(minimized: bool) -> Self {
+            Self(unsafe {
+                CreateWindowExW(
+                    WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+                    w!("STATIC"),
+                    w!(""),
+                    if minimized {
+                        WS_POPUP | WS_MINIMIZE
+                    } else {
+                        WS_POPUP
+                    },
+                    100,
+                    100,
+                    200,
+                    100,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap()
+            })
+        }
+
+        fn id(&self) -> u64 {
+            self.0 .0 as u64
+        }
+
+        fn rect(&self) -> Rect {
+            let mut rect = RECT::default();
+            unsafe { GetWindowRect(self.0, &mut rect).unwrap() };
+            Rect::new(
+                rect.left,
+                rect.top,
+                rect.right - rect.left,
+                rect.bottom - rect.top,
+            )
+        }
+    }
+    impl Drop for TestWindow {
+        fn drop(&mut self) {
+            let _ = unsafe { DestroyWindow(self.0) };
+        }
+    }
+
+    let active_primary = TestWindow::new(false);
+    let active_secondary = TestWindow::new(false);
+    let inactive_tiled = TestWindow::new(false);
+    let inactive_floating = TestWindow::new(false);
+    let inactive_secondary = TestWindow::new(false);
+    let fullscreen = TestWindow::new(false);
+    unsafe {
+        use windows::Win32::UI::WindowsAndMessaging::{SetWindowPos, SWP_NOACTIVATE, SWP_NOZORDER};
+        SetWindowPos(
+            fullscreen.0,
+            None,
+            0,
+            0,
+            1920,
+            1080,
+            SWP_NOACTIVATE | SWP_NOZORDER,
+        )
+        .unwrap();
+    }
+    let minimized = TestWindow::new(true);
+    let unmanaged = TestWindow::new(false);
+    let windows = [
+        &active_primary,
+        &active_secondary,
+        &inactive_tiled,
+        &inactive_floating,
+        &inactive_secondary,
+        &fullscreen,
+        &minimized,
+        &unmanaged,
+    ];
+    let before: HashMap<_, _> = windows
+        .iter()
+        .map(|window| (window.id(), window.rect()))
+        .collect();
+    let expected_parked = HashSet::from([
+        inactive_tiled.id(),
+        inactive_floating.id(),
+        inactive_secondary.id(),
+    ]);
+    let mut primary_active = Workspace::default();
+    primary_active
+        .insert_window(active_primary.id(), Some(640))
+        .unwrap();
+    let mut primary_inactive = Workspace::default();
+    primary_inactive
+        .insert_window(inactive_tiled.id(), Some(720))
+        .unwrap();
+    primary_inactive
+        .insert_window(minimized.id(), Some(480))
+        .unwrap();
+    primary_inactive
+        .add_floating(inactive_floating.id(), before[&inactive_floating.id()])
+        .unwrap();
+    primary_inactive
+        .insert_window(fullscreen.id(), Some(800))
+        .unwrap();
+    primary_inactive.mark_minimized(inactive_tiled.id());
+    let mut secondary_active = Workspace::default();
+    secondary_active
+        .insert_window(active_secondary.id(), Some(600))
+        .unwrap();
+    let mut secondary_inactive = Workspace::default();
+    secondary_inactive
+        .insert_window(inactive_secondary.id(), Some(500))
+        .unwrap();
+    let snapshot = crate::state::StateSnapshot {
+        saved_at: "0".to_string(),
+        workspaces: vec![
+            crate::state::WorkspaceSnapshot {
+                monitor_device_name: "DISPLAY1".into(),
+                workspace_index: 0,
+                workspace: primary_active,
+            },
+            crate::state::WorkspaceSnapshot {
+                monitor_device_name: "DISPLAY1".into(),
+                workspace_index: 1,
+                workspace: primary_inactive,
+            },
+            crate::state::WorkspaceSnapshot {
+                monitor_device_name: "DISPLAY2".into(),
+                workspace_index: 0,
+                workspace: secondary_inactive,
+            },
+            crate::state::WorkspaceSnapshot {
+                monitor_device_name: "DISPLAY2".into(),
+                workspace_index: 1,
+                workspace: secondary_active,
+            },
+        ],
+        focused_monitor_name: "DISPLAY1".into(),
+        active_workspace: HashMap::from([("DISPLAY1".into(), 0), ("DISPLAY2".into(), 1)]),
+        tab_title_overrides: HashMap::new(),
+    };
+    let mut state = structure_restore_state();
+    state.config.behavior.disable_snap_layouts = false;
+    state.restore_workspace_structure(&snapshot);
+    state.restore_state(&snapshot);
+    state.paused = false;
+    let membership = state.all_managed_window_ids();
+
+    for _ in 0..2 {
+        crate::prepare_initial_layout(&mut state);
+        assert_eq!(state.active_workspace_idx(1), 0);
+        assert_eq!(state.active_workspace_idx(2), 1);
+        assert_eq!(state.all_managed_window_ids(), membership);
+        assert!(!state.workspaces[&1][1].is_minimized(inactive_tiled.id()));
+        assert!(state.workspaces[&1][1].is_minimized(minimized.id()));
+        assert!(state.is_application_fullscreen(fullscreen.id()));
+        for window in windows {
+            let rect = window.rect();
+            let original = before[&window.id()];
+            if expected_parked.contains(&window.id()) {
+                assert!(
+                    leopardwm_platform_win32::is_move_offscreen_sentinel_rect(&rect),
+                    "restored inactive HWND {} must be physically parked, got {rect:?}",
+                    window.id()
+                );
+                assert_eq!((rect.width, rect.height), (original.width, original.height));
+            } else {
+                assert_eq!(
+                    rect, original,
+                    "startup must not move active, minimized, application-fullscreen or unmanaged windows"
+                );
+            }
+            assert!(!leopardwm_platform_win32::is_window_visible(window.id()));
+        }
+        assert_eq!(state.workspaces[&1][1].columns()[0].width(), 720);
+        assert_eq!(
+            state.workspaces[&1][1].floating_windows()[0].rect,
+            before[&inactive_floating.id()]
+        );
+    }
+}
+
+#[test]
+fn test_display_reconcile_parks_restored_inactive_windows() {
+    use windows::Win32::UI::WindowsAndMessaging::{SetWindowPos, SWP_NOACTIVATE, SWP_NOZORDER};
+
+    let active_primary = ParkProbeWindow::new(false);
+    let active_returning = ParkProbeWindow::new(false);
+    let inactive_tiled = ParkProbeWindow::new(false);
+    let inactive_floating = ParkProbeWindow::new(false);
+    let fullscreen = ParkProbeWindow::new(false);
+    unsafe {
+        SetWindowPos(
+            fullscreen.0,
+            None,
+            0,
+            0,
+            1920,
+            1080,
+            SWP_NOACTIVATE | SWP_NOZORDER,
+        )
+        .unwrap();
+    }
+    let minimized = ParkProbeWindow::new(true);
+    let unmanaged = ParkProbeWindow::new(false);
+    let windows = [
+        &active_primary,
+        &active_returning,
+        &inactive_tiled,
+        &inactive_floating,
+        &fullscreen,
+        &minimized,
+        &unmanaged,
+    ];
+    let before: HashMap<_, _> = windows
+        .iter()
+        .map(|window| (window.id(), window.rect()))
+        .collect();
+    let expected_parked = HashSet::from([inactive_tiled.id(), inactive_floating.id()]);
+
+    let mut state = AppState::new_with_config(test_config(), two_monitors());
+    state.workspaces.get_mut(&1).unwrap()[0]
+        .insert_window(active_primary.id(), Some(640))
+        .unwrap();
+
+    let mut returning_inactive = Workspace::default();
+    returning_inactive
+        .insert_window(inactive_tiled.id(), Some(720))
+        .unwrap();
+    returning_inactive.mark_minimized(inactive_tiled.id());
+    returning_inactive
+        .insert_window(minimized.id(), Some(480))
+        .unwrap();
+    returning_inactive.mark_minimized(minimized.id());
+    returning_inactive
+        .add_floating(inactive_floating.id(), before[&inactive_floating.id()])
+        .unwrap();
+    returning_inactive
+        .insert_window(fullscreen.id(), Some(800))
+        .unwrap();
+
+    let mut returning_active = Workspace::default();
+    returning_active
+        .insert_window(active_returning.id(), Some(600))
+        .unwrap();
+
+    state
+        .workspaces
+        .insert(2, vec![returning_inactive, returning_active]);
+    state.active_workspace.insert(2, 1);
+
+    state.reconcile_monitors(test_monitors());
+    assert!(!state.workspaces.contains_key(&2));
+    assert!(state.workspaces[&1][0].contains_window(inactive_tiled.id()));
+    assert!(state.workspaces[&1][0].contains_window(active_returning.id()));
+    assert!(state.stashed_monitor_layouts.contains_key("DISPLAY2"));
+
+    let mut returned = two_monitors();
+    returned[1].id = 99;
+    state.reconcile_monitors(returned);
+
+    assert!(state.workspaces.contains_key(&99));
+    assert_eq!(state.active_workspace_idx(99), 1);
+    assert!(state.workspaces[&99][0].contains_window(inactive_tiled.id()));
+    assert!(state.workspaces[&99][0].is_floating(inactive_floating.id()));
+    assert!(state.workspaces[&99][1].contains_window(active_returning.id()));
+    assert!(!state.workspaces[&1][0].contains_window(inactive_tiled.id()));
+    assert!(!state.stashed_monitor_layouts.contains_key("DISPLAY2"));
+    for window in [&inactive_tiled, &inactive_floating] {
+        assert_eq!(
+            window.rect(),
+            before[&window.id()],
+            "monitor restore must not park native windows by itself"
+        );
+    }
+    assert!(state.paused);
+    assert!(state.workspaces[&99][0].is_minimized(inactive_tiled.id()));
+
+    let membership = state.all_managed_window_ids();
+    state.prepare_inactive_workspace_windows();
+    assert_eq!(state.active_workspace_idx(1), 0);
+    assert_eq!(state.active_workspace_idx(99), 1);
+    assert_eq!(state.all_managed_window_ids(), membership);
+    assert!(!state.workspaces[&99][0].is_minimized(inactive_tiled.id()));
+    assert!(state.workspaces[&99][0].is_minimized(minimized.id()));
+    for window in windows {
+        assert_eq!(
+            window.rect(),
+            before[&window.id()],
+            "paused display preparation must not move native windows"
+        );
+    }
+
+    state.paused = false;
+    for _ in 0..2 {
+        state.prepare_inactive_workspace_windows();
+        assert_eq!(state.active_workspace_idx(1), 0);
+        assert_eq!(state.active_workspace_idx(99), 1);
+        assert_eq!(state.all_managed_window_ids(), membership);
+        assert!(!state.workspaces[&99][0].is_minimized(inactive_tiled.id()));
+        assert!(state.workspaces[&99][0].is_minimized(minimized.id()));
+        for window in windows {
+            let rect = window.rect();
+            let original = before[&window.id()];
+            if expected_parked.contains(&window.id()) {
+                assert!(
+                    leopardwm_platform_win32::is_move_offscreen_sentinel_rect(&rect),
+                    "restored inactive HWND {} must be physically parked, got {rect:?}",
+                    window.id()
+                );
+                assert_eq!((rect.width, rect.height), (original.width, original.height));
+            } else {
+                assert_eq!(
+                    rect, original,
+                    "display reconcile must not move active, minimized, application-fullscreen or unmanaged windows"
+                );
+            }
+            assert!(!leopardwm_platform_win32::is_window_visible(window.id()));
+        }
+        assert!(state.is_application_fullscreen(fullscreen.id()));
+        assert_eq!(state.workspaces[&99][0].columns()[0].width(), 720);
+        assert_eq!(
+            state.workspaces[&99][0].floating_windows()[0].rect,
+            before[&inactive_floating.id()]
+        );
+    }
+}
+
+struct ParkProbeWindow(windows::Win32::Foundation::HWND);
+impl ParkProbeWindow {
+    fn new(minimized: bool) -> Self {
+        use windows::core::w;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_MINIMIZE, WS_POPUP,
+        };
+        Self(unsafe {
+            CreateWindowExW(
+                WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+                w!("STATIC"),
+                w!(""),
+                if minimized {
+                    WS_POPUP | WS_MINIMIZE
+                } else {
+                    WS_POPUP
+                },
+                100,
+                100,
+                200,
+                100,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+        })
+    }
+
+    fn id(&self) -> u64 {
+        self.0 .0 as u64
+    }
+
+    fn rect(&self) -> Rect {
+        use windows::Win32::Foundation::RECT;
+        use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
+        let mut rect = RECT::default();
+        unsafe { GetWindowRect(self.0, &mut rect).unwrap() };
+        Rect::new(
+            rect.left,
+            rect.top,
+            rect.right - rect.left,
+            rect.bottom - rect.top,
+        )
+    }
+}
+impl Drop for ParkProbeWindow {
+    fn drop(&mut self) {
+        use windows::Win32::UI::WindowsAndMessaging::DestroyWindow;
+        let _ = unsafe { DestroyWindow(self.0) };
+    }
+}
+
+fn park_probe_state() -> AppState {
+    let mut state = AppState::new_with_config(test_config(), two_monitors());
+    state.paused = false;
+    state.injected_apply_placements_behavior = Some(TestApplyPlacementsBehavior::SleepAndSucceed(
+        Duration::from_millis(1),
+    ));
+    state.ensure_workspace_exists(1, 1);
+    state
+}
+
+#[test]
+fn test_resume_parks_inactive_windows_and_syncs_taskbar() {
+    use windows::Win32::UI::WindowsAndMessaging::{SetWindowPos, SWP_NOACTIVATE, SWP_NOZORDER};
+
+    let active = ParkProbeWindow::new(false);
+    let inactive_tiled = ParkProbeWindow::new(false);
+    let inactive_floating = ParkProbeWindow::new(false);
+    let fullscreen = ParkProbeWindow::new(false);
+    unsafe {
+        SetWindowPos(
+            fullscreen.0,
+            None,
+            0,
+            0,
+            1920,
+            1080,
+            SWP_NOACTIVATE | SWP_NOZORDER,
+        )
+        .unwrap();
+    }
+    let minimized = ParkProbeWindow::new(true);
+    let unmanaged = ParkProbeWindow::new(false);
+    let windows = [
+        &active,
+        &inactive_tiled,
+        &inactive_floating,
+        &fullscreen,
+        &minimized,
+        &unmanaged,
+    ];
+    let before: HashMap<_, _> = windows
+        .iter()
+        .map(|window| (window.id(), window.rect()))
+        .collect();
+    let expected_parked = HashSet::from([inactive_tiled.id(), inactive_floating.id()]);
+
+    let mut state = park_probe_state();
+    state.paused = true;
+    state.workspaces.get_mut(&1).unwrap()[0]
+        .insert_window(active.id(), Some(640))
+        .unwrap();
+    let inactive = &mut state.workspaces.get_mut(&1).unwrap()[1];
+    inactive
+        .insert_window(inactive_tiled.id(), Some(720))
+        .unwrap();
+    inactive
+        .add_floating(inactive_floating.id(), before[&inactive_floating.id()])
+        .unwrap();
+    inactive.insert_window(fullscreen.id(), Some(800)).unwrap();
+    inactive.insert_window(minimized.id(), Some(480)).unwrap();
+    inactive.mark_minimized(minimized.id());
+    let membership = state.all_managed_window_ids();
+
+    state.toggle_pause("test resume catchup").unwrap();
+    assert!(!state.paused);
+    assert_eq!(state.active_workspace_idx(1), 0);
+    assert_eq!(state.all_managed_window_ids(), membership);
+    assert!(state.workspaces[&1][1].is_minimized(minimized.id()));
+    assert!(state.is_application_fullscreen(fullscreen.id()));
+    for window in windows {
+        let rect = window.rect();
+        let original = before[&window.id()];
+        if expected_parked.contains(&window.id()) {
+            assert!(
+                leopardwm_platform_win32::is_move_offscreen_sentinel_rect(&rect),
+                "resumed inactive HWND {} must be physically parked, got {rect:?}",
+                window.id()
+            );
+            assert_eq!((rect.width, rect.height), (original.width, original.height));
+        } else if window.id() == active.id() {
+            assert_eq!(
+                rect, original,
+                "active window is unmoved by parking while the active apply backend is faked"
+            );
+        } else {
+            assert_eq!(
+                rect, original,
+                "resume parking must not move minimized, application-fullscreen or unmanaged windows"
+            );
+        }
+        assert!(!leopardwm_platform_win32::is_window_visible(window.id()));
+    }
+    let commands = state.take_recorded_taskbar_commands();
+    assert!(commands.contains(&(active.id(), true)));
+    assert!(commands.contains(&(inactive_tiled.id(), false)));
+    assert!(commands.contains(&(inactive_floating.id(), false)));
+    assert!(commands.contains(&(minimized.id(), false)));
+    assert!(!commands.iter().any(|(id, _)| *id == fullscreen.id()));
+    assert!(!commands.iter().any(|(id, _)| *id == unmanaged.id()));
+}
+
+#[test]
+fn test_failed_resume_does_not_park_or_sync_taskbar() {
+    let active = ParkProbeWindow::new(false);
+    let inactive_tiled = ParkProbeWindow::new(false);
+    let before_active = active.rect();
+    let before_inactive = inactive_tiled.rect();
+
+    let mut state = park_probe_state();
+    state.paused = true;
+    state.injected_apply_placements_behavior = Some(TestApplyPlacementsBehavior::SleepAndFail(
+        Duration::from_millis(1),
+    ));
+    state.workspaces.get_mut(&1).unwrap()[0]
+        .insert_window(active.id(), Some(640))
+        .unwrap();
+    state.workspaces.get_mut(&1).unwrap()[1]
+        .insert_window(inactive_tiled.id(), Some(720))
+        .unwrap();
+
+    state
+        .toggle_pause("test failed resume catchup")
+        .expect_err("injected resume apply failure should propagate");
+    assert!(state.paused, "failed resume should restore paused state");
+    assert_eq!(active.rect(), before_active);
+    assert_eq!(inactive_tiled.rect(), before_inactive);
+    assert!(
+        !leopardwm_platform_win32::is_move_offscreen_sentinel_rect(&inactive_tiled.rect()),
+        "failed resume must not park inactive windows"
+    );
+    assert!(state.take_recorded_taskbar_commands().is_empty());
+}
+
+#[test]
+fn test_display_change_event_parks_inactive_windows_and_syncs_taskbar() {
+    let active = ParkProbeWindow::new(false);
+    let inactive_tiled = ParkProbeWindow::new(false);
+    let unmanaged = ParkProbeWindow::new(false);
+    let before_active = active.rect();
+    let before_inactive = inactive_tiled.rect();
+    let before_unmanaged = unmanaged.rect();
+
+    let mut state = park_probe_state();
+    state.injected_display_monitors = Some(two_monitors());
+    state.workspaces.get_mut(&1).unwrap()[0]
+        .insert_window(active.id(), Some(640))
+        .unwrap();
+    state.workspaces.get_mut(&1).unwrap()[1]
+        .insert_window(inactive_tiled.id(), Some(720))
+        .unwrap();
+
+    state.handle_window_event(WindowEvent::DisplayChange);
+    assert!(!state.paused);
+    assert_eq!(state.active_workspace_idx(1), 0);
+    assert_eq!(active.rect(), before_active);
+    assert_eq!(unmanaged.rect(), before_unmanaged);
+    assert!(
+        leopardwm_platform_win32::is_move_offscreen_sentinel_rect(&inactive_tiled.rect()),
+        "display-change caller must park restored inactive windows, got {:?}",
+        inactive_tiled.rect()
+    );
+    assert_eq!(
+        (inactive_tiled.rect().width, inactive_tiled.rect().height),
+        (before_inactive.width, before_inactive.height)
+    );
+    let commands = state.take_recorded_taskbar_commands();
+    assert!(commands.contains(&(active.id(), true)));
+    assert!(commands.contains(&(inactive_tiled.id(), false)));
+    assert!(!commands.iter().any(|(id, _)| *id == unmanaged.id()));
+}
+
+#[test]
+fn test_paused_display_change_event_resyncs_without_moving_and_syncs_taskbar() {
+    let active = ParkProbeWindow::new(false);
+    let inactive_tiled = ParkProbeWindow::new(false);
+    let minimized = ParkProbeWindow::new(true);
+    let before_active = active.rect();
+    let before_inactive = inactive_tiled.rect();
+    let before_minimized = minimized.rect();
+
+    let mut state = park_probe_state();
+    state.paused = true;
+    state.injected_display_monitors = Some(two_monitors());
+    state.workspaces.get_mut(&1).unwrap()[0]
+        .insert_window(active.id(), Some(640))
+        .unwrap();
+    let inactive = &mut state.workspaces.get_mut(&1).unwrap()[1];
+    inactive
+        .insert_window(inactive_tiled.id(), Some(720))
+        .unwrap();
+    inactive.mark_minimized(inactive_tiled.id());
+    inactive.insert_window(minimized.id(), Some(480)).unwrap();
+    inactive.mark_minimized(minimized.id());
+
+    state.handle_window_event(WindowEvent::DisplayChange);
+    assert!(state.paused);
+    assert!(!state.workspaces[&1][1].is_minimized(inactive_tiled.id()));
+    assert!(state.workspaces[&1][1].is_minimized(minimized.id()));
+    assert_eq!(active.rect(), before_active);
+    assert_eq!(inactive_tiled.rect(), before_inactive);
+    assert_eq!(minimized.rect(), before_minimized);
+    let commands = state.take_recorded_taskbar_commands();
+    assert!(commands.contains(&(active.id(), true)));
+    assert!(commands.contains(&(inactive_tiled.id(), false)));
+    assert!(commands.contains(&(minimized.id(), false)));
+}
+
+#[test]
+fn test_restore_structure_reapplies_snap_suppression() {
+    use windows::core::w;
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DestroyWindow, GetWindowLongW, GWL_STYLE, WS_CAPTION, WS_EX_NOACTIVATE,
+        WS_EX_TOOLWINDOW, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU, WS_THICKFRAME,
+    };
+
+    struct TestWindow(HWND);
+    impl TestWindow {
+        fn new(maximize_box: bool) -> Self {
+            let mut style = WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_MINIMIZEBOX;
+            if maximize_box {
+                style |= WS_MAXIMIZEBOX;
+            }
+            Self(unsafe {
+                CreateWindowExW(
+                    WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+                    w!("STATIC"),
+                    w!(""),
+                    style,
+                    0,
+                    0,
+                    200,
+                    100,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap()
+            })
+        }
+
+        fn id(&self) -> u64 {
+            self.0 .0 as u64
+        }
+
+        fn style(&self) -> u32 {
+            unsafe { GetWindowLongW(self.0, GWL_STYLE) as u32 }
+        }
+    }
+    impl Drop for TestWindow {
+        fn drop(&mut self) {
+            let _ = leopardwm_platform_win32::restore_maximizebox(self.id());
+            let _ = unsafe { DestroyWindow(self.0) };
+        }
+    }
+
+    for enabled in [false, true] {
+        let tiled = TestWindow::new(true);
+        let inactive = TestWindow::new(true);
+        let floating = TestWindow::new(true);
+        let no_maximize_box = TestWindow::new(false);
+        let unmanaged = TestWindow::new(true);
+        let windows = [&tiled, &inactive, &floating, &no_maximize_box, &unmanaged];
+        let original_styles = windows.map(|window| window.style());
+        assert_ne!(original_styles[0] & WS_MAXIMIZEBOX.0, 0);
+        assert_eq!(original_styles[3] & WS_MAXIMIZEBOX.0, 0);
+
+        let mut workspace = Workspace::default();
+        workspace.insert_window(tiled.id(), Some(640)).unwrap();
+        workspace
+            .insert_window(no_maximize_box.id(), Some(480))
+            .unwrap();
+        workspace
+            .add_floating(floating.id(), Rect::new(100, 100, 200, 100))
+            .unwrap();
+        let mut inactive_workspace = Workspace::default();
+        inactive_workspace
+            .insert_window(inactive.id(), Some(720))
+            .unwrap();
+        let snapshot = crate::state::StateSnapshot {
+            saved_at: "0".to_string(),
+            workspaces: vec![
+                crate::state::WorkspaceSnapshot {
+                    monitor_device_name: "DISPLAY1".to_string(),
+                    workspace_index: 0,
+                    workspace,
+                },
+                crate::state::WorkspaceSnapshot {
+                    monitor_device_name: "DISPLAY2".to_string(),
+                    workspace_index: 1,
+                    workspace: inactive_workspace,
+                },
+            ],
+            focused_monitor_name: "DISPLAY1".to_string(),
+            active_workspace: HashMap::new(),
+            tab_title_overrides: HashMap::new(),
+        };
+        let mut state = structure_restore_state();
+        state.config.behavior.disable_snap_layouts = enabled;
+        let expected_tracked = if enabled {
+            HashSet::from([tiled.id(), inactive.id()])
+        } else {
+            HashSet::new()
+        };
+        let mut expected_styles = original_styles;
+        if enabled {
+            expected_styles[0] &= !WS_MAXIMIZEBOX.0;
+            expected_styles[1] &= !WS_MAXIMIZEBOX.0;
+        }
+
+        for _ in 0..2 {
+            let restored = state.restore_workspace_structure(&snapshot);
+            assert_eq!(restored, HashSet::from([(1, 0), (2, 1)]));
+            assert_eq!(
+                windows.map(|window| window.style()),
+                expected_styles,
+                "startup must reapply the configured restriction only to restored tiled windows"
+            );
+            assert_eq!(state.snap_disabled_hwnds, expected_tracked);
+            assert_eq!(state.workspaces[&1][0].columns()[0].width(), 640);
+            assert_eq!(state.active_workspace_idx(2), 0);
+            for window in windows {
+                assert!(!leopardwm_platform_win32::is_window_visible(window.id()));
+            }
+        }
+
+        state.restore_snap_for_all_windows();
+        assert!(state.snap_disabled_hwnds.is_empty());
+        assert_eq!(windows.map(|window| window.style()), original_styles);
+    }
+}
+
+#[test]
 fn test_restore_structure_clamps_workspace_index() {
     let mut state = structure_restore_state();
     let mut ws = leopardwm_core_layout::Workspace::default();
@@ -9753,6 +12440,135 @@ fn test_persisted_signature_changes_on_active_workspace() {
     assert_ne!(
         before, after,
         "active workspace index change must change the signature"
+    );
+}
+
+#[test]
+fn test_width_only_persistence_tracks_requested_not_native_width() {
+    let window_id = u64::MAX - 1;
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    let viewport_width = state.focused_viewport().width;
+    state
+        .focused_workspace_mut()
+        .unwrap()
+        .insert_window(window_id, Some(300))
+        .unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    state.install_save_channel(tx);
+    state.request_save_if_changed();
+    assert_eq!(rx.try_recv(), Ok(()));
+
+    let workspace = state.focused_workspace_mut().unwrap();
+    workspace.set_window_min_width(window_id, 1200);
+    assert_eq!(
+        workspace.effective_column_width(&workspace.columns()[0]),
+        1200
+    );
+    state.request_save_if_changed();
+    assert_eq!(
+        rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    );
+
+    let workspace = state.focused_workspace_mut().unwrap();
+    workspace.set_focused_column_width_fraction(0.25, viewport_width);
+    let requested_width = workspace.columns()[0].width();
+    assert_ne!(requested_width, 300);
+    assert_eq!(
+        workspace.effective_column_width(&workspace.columns()[0]),
+        1200
+    );
+    state.request_save_if_changed();
+    assert_eq!(
+        rx.try_recv(),
+        Ok(()),
+        "requested-width change must queue a save"
+    );
+    let saved: serde_json::Value =
+        serde_json::from_str(&state.build_state_json().unwrap()).unwrap();
+    assert_eq!(
+        saved["workspaces"][0]["workspace"]["columns"][0]["width"],
+        requested_width
+    );
+    state.request_save_if_changed();
+    assert_eq!(
+        rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    );
+}
+
+#[test]
+fn test_width_only_persistence_command_saves_unchanged_placements() {
+    let window_id = u64::MAX - 1;
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    state.paused = false;
+    state.reduce_motion = true;
+    let workspace = state.focused_workspace_mut().unwrap();
+    workspace.insert_window(window_id, Some(300)).unwrap();
+    workspace.commit_pending_min_size_clears();
+    workspace.set_window_min_width(window_id, 1200);
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    state.install_save_channel(tx);
+    state.apply_layout().unwrap();
+    assert_eq!(rx.try_recv(), Ok(()));
+    let placements = state.last_placed_layout_rects.clone();
+    assert_eq!(placements[&window_id].width, 1200);
+
+    assert!(matches!(
+        state.handle_command(IpcCommand::SetColumnWidth { fraction: 0.25 }),
+        IpcResponse::Ok
+    ));
+    let workspace = state.focused_workspace().unwrap();
+    assert_ne!(workspace.columns()[0].width(), 300);
+    assert_eq!(
+        workspace.effective_column_width(&workspace.columns()[0]),
+        1200
+    );
+    assert_eq!(workspace.scroll_offset(), 0.0);
+    assert_eq!(state.last_placed_layout_rects, placements);
+    assert!(!state.applying_layout);
+    assert!(state.layout_transition.is_none());
+    assert_eq!(
+        rx.try_recv(),
+        Ok(()),
+        "unchanged placements must not skip saving width intent"
+    );
+    state.apply_layout().unwrap();
+    assert_eq!(
+        rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    );
+}
+
+#[test]
+fn test_width_only_persistence_resize_queues_save() {
+    let window_id = u64::MAX - 1;
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    state.paused = false;
+    state.reduce_motion = true;
+    state
+        .focused_workspace_mut()
+        .unwrap()
+        .insert_window(window_id, Some(800))
+        .unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    state.install_save_channel(tx);
+    state.apply_layout().unwrap();
+    assert_eq!(rx.try_recv(), Ok(()));
+
+    assert!(matches!(
+        state.handle_command(IpcCommand::Resize { delta: -100 }),
+        IpcResponse::Ok
+    ));
+    let workspace = state.focused_workspace().unwrap();
+    assert_eq!(workspace.columns()[0].width(), 700);
+    assert_eq!(workspace.scroll_offset(), 0.0);
+    assert_eq!(state.last_placed_layout_rects[&window_id].width, 700);
+    assert_eq!(rx.try_recv(), Ok(()), "width-only resize must queue a save");
+    state.apply_layout().unwrap();
+    assert_eq!(
+        rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
     );
 }
 
@@ -9879,11 +12695,12 @@ fn test_taskbar_work_area_invalidation_clears_heights_and_preserves_widths() {
             "heights clear in workspace {workspace_idx}"
         );
         workspace.set_all_column_widths(400);
-        assert!(
-            workspace.apply_min_width_constraints(),
+        assert_eq!(
+            workspace.effective_column_width(&workspace.columns()[0]),
+            600,
             "width remains constrained in workspace {workspace_idx}"
         );
-        assert_eq!(workspace.columns()[0].width(), 600);
+        assert_eq!(workspace.columns()[0].width(), 400);
     }
 }
 
@@ -9924,8 +12741,9 @@ fn test_full_display_invalidation_clears_widths_and_heights() {
             "heights clear in workspace {workspace_idx}"
         );
         workspace.set_all_column_widths(400);
-        assert!(
-            !workspace.apply_min_width_constraints(),
+        assert_eq!(
+            workspace.effective_column_width(&workspace.columns()[0]),
+            400,
             "width clears in workspace {workspace_idx}"
         );
         assert_eq!(workspace.columns()[0].width(), 400);

@@ -2,14 +2,15 @@
 
 use crate::config;
 use crate::state::{
-    AppState, ApplicationFullscreenState, DragHintAction, DragState, EDIT_CONFIG_PULL_TTL,
-    FALLBACK_VIEWPORT_HEIGHT, FALLBACK_VIEWPORT_WIDTH, RECENTLY_HIDDEN_TTL,
+    AppState, ApplicationFullscreenState, DragHintAction, DragState, ElevationBlockedRecord,
+    EDIT_CONFIG_PULL_TTL, FALLBACK_VIEWPORT_HEIGHT, FALLBACK_VIEWPORT_WIDTH, RECENTLY_HIDDEN_TTL,
     TRANSIENT_WINDOW_THRESHOLD,
 };
 use leopardwm_core_layout::Rect;
+#[cfg(not(test))]
+use leopardwm_platform_win32::enumerate_monitors;
 use leopardwm_platform_win32::{
-    enumerate_monitors, find_monitor_for_rect, get_process_executable, is_shift_key_pressed,
-    MonitorInfo, WindowEvent,
+    find_monitor_for_rect, get_process_executable, is_shift_key_pressed, MonitorInfo, WindowEvent,
 };
 use tracing::{debug, info, warn};
 
@@ -409,28 +410,30 @@ impl AppState {
     }
 
     /// Update the session elevation-block record for `hwnd` given the live
-    /// `blocked` verdict, returning what the caller should do. Pure map logic
+    /// admission verdict, returning what the caller should do. Pure map logic
     /// (no Win32, no toast) so the dedup / clear / recycle behavior is
     /// unit-testable; the Win32 verdict and the one-shot toast live in
-    /// `skip_if_elevation_blocked`. Always refreshes the stored title so
-    /// `lwm doctor` reflects the current window even across HWND recycle.
+    /// `skip_if_elevation_blocked`. First sighting or a changed title/reason
+    /// refreshes the snapshot; an identical known record is deduped.
     pub(crate) fn note_elevation_block(
         &mut self,
         hwnd: u64,
         title: &str,
-        blocked: bool,
+        block: leopardwm_platform_win32::ManageBlock,
     ) -> ElevationCheck {
-        if !blocked {
+        if !block.is_blocked() {
             // Manageable now: clear any stale record (e.g. a recycled HWND now
             // owned by a normal window) so it tiles again.
             self.elevation_blocked.remove(&hwnd);
             return ElevationCheck::Manageable;
         }
-        match self.elevation_blocked.insert(hwnd, title.to_string()) {
-            // First sighting, or a recycled HWND now owned by a *different*
-            // window (title changed) → notify again.
+        let record = ElevationBlockedRecord {
+            title: title.to_string(),
+            reason: block,
+        };
+        match self.elevation_blocked.insert(hwnd, record) {
             None => ElevationCheck::BlockedNew,
-            Some(prev) if prev != title => ElevationCheck::BlockedNew,
+            Some(prev) if prev.title != title || prev.reason != block => ElevationCheck::BlockedNew,
             Some(_) => ElevationCheck::BlockedKnown,
         }
     }
@@ -451,7 +454,7 @@ impl AppState {
     ) -> bool {
         use leopardwm_platform_win32::ManageBlock;
         let block = leopardwm_platform_win32::manage_block(pid);
-        match self.note_elevation_block(hwnd, title, block.is_blocked()) {
+        match self.note_elevation_block(hwnd, title, block) {
             ElevationCheck::Manageable => false,
             ElevationCheck::BlockedNew => {
                 warn!(
@@ -957,16 +960,17 @@ impl AppState {
             leopardwm_platform_win32::clear_suspected_oversize(hwnd);
             // Scrub a window that dies while its monitor is stashed (disconnected),
             // so it isn't resurrected as a ghost column when the monitor returns.
-            for (ws_vec, _) in self.stashed_monitor_layouts.values_mut() {
-                for ws in ws_vec.iter_mut() {
+            for layout in self.stashed_monitor_layouts.values_mut() {
+                for ws in &mut layout.workspaces {
                     let _ = ws.remove_window(hwnd);
                     ws.remove_floating(hwnd);
                 }
             }
             // Drop a stash emptied by window deaths so the map stays bounded when
             // a disconnected monitor never returns.
-            self.stashed_monitor_layouts.retain(|_, (ws_vec, _)| {
-                ws_vec
+            self.stashed_monitor_layouts.retain(|_, layout| {
+                layout
+                    .workspaces
                     .iter()
                     .any(|ws| ws.window_count() > 0 || !ws.floating_windows().is_empty())
             });
@@ -1011,6 +1015,7 @@ impl AppState {
         // Drop the recorded layout rect so the map doesn't retain
         // entries for windows that no longer exist.
         self.last_placed_layout_rects.remove(&hwnd);
+        self.clear_physical_window_state(hwnd);
         self.application_fullscreen.remove(&hwnd);
         self.pending_create_retry.remove(&hwnd);
 
@@ -1189,13 +1194,13 @@ impl AppState {
             if let Some(next) = self.injected_next_foreground_hwnd.take() {
                 self.injected_foreground_hwnd = Some(next);
             }
-            return foreground.map(|foreground| {
+            foreground.map(|foreground| {
                 (
                     foreground.filter(|&id| id != 0),
                     self.injected_foreground_is_valid
                         .unwrap_or(foreground.is_some_and(|id| id != 0)),
                 )
-            });
+            })
         }
         #[cfg(not(test))]
         {
@@ -1425,6 +1430,15 @@ impl AppState {
         old_placements.retain(|(wid, _)| !self.is_application_fullscreen(*wid));
 
         self.active_workspace.insert(monitor_id, ws_idx);
+        let viewport_width = self.viewport_width_for(monitor_id);
+        if let Some(workspace) = self
+            .workspaces
+            .get_mut(&monitor_id)
+            .and_then(|v| v.get_mut(ws_idx))
+        {
+            workspace.commit_pending_min_size_clears();
+            workspace.reconcile_scroll_bounds(viewport_width);
+        }
 
         // Compute new workspace's final placements for enter animation.
         let mut new_placements: Vec<(u64, leopardwm_core_layout::Rect)> = self
@@ -2267,7 +2281,10 @@ impl AppState {
         leopardwm_platform_win32::set_dwm_transitions_disabled(hwnd, false);
     }
 
-    fn application_fullscreen_geometry(&self, hwnd: u64) -> (Option<Rect>, Option<Rect>) {
+    pub(crate) fn application_fullscreen_geometry(
+        &self,
+        hwnd: u64,
+    ) -> (Option<Rect>, Option<Rect>) {
         let chrome_rect = leopardwm_platform_win32::get_window_chrome_rect(hwnd);
         let dwm_rect = chrome_rect
             .is_none()
@@ -2276,7 +2293,7 @@ impl AppState {
         (chrome_rect, dwm_rect)
     }
 
-    fn observe_application_fullscreen(
+    pub(crate) fn observe_application_fullscreen(
         &self,
         hwnd: u64,
         chrome_rect: Option<Rect>,
@@ -2298,9 +2315,10 @@ impl AppState {
             dwm_rect,
             is_zoomed,
         )?;
+        let expected_physical = self.expected_physical_rect(hwnd);
         if let Some(expected) = application_fullscreen_expected_layout_rect(
-            self.compute_window_layout_rect(hwnd),
-            self.last_placed_layout_rects.get(&hwnd).copied(),
+            expected_physical.or_else(|| self.compute_window_layout_rect(hwnd)),
+            expected_physical.or_else(|| self.last_placed_layout_rects.get(&hwnd).copied()),
         ) {
             let scale_factor = self
                 .monitors
@@ -2634,7 +2652,10 @@ impl AppState {
                 // all create small legitimate deltas we don't want to
                 // chase. Real user drags are typically tens to hundreds
                 // of pixels off, so 20px comfortably separates them.
-                let expected = self.last_placed_layout_rects.get(&hwnd).copied();
+                const POSITION_EPSILON_PX: i32 = 20;
+                let expected = self
+                    .expected_physical_rect(hwnd)
+                    .or_else(|| self.last_placed_layout_rects.get(&hwnd).copied());
                 let dwm_actual = leopardwm_platform_win32::get_window_visible_rect(hwnd);
                 // Cross-check with GetWindowRect — for Chromium /
                 // Firefox / Cascadia under the swap-chain-stale bug,
@@ -2740,9 +2761,23 @@ impl AppState {
         // immediately on WM_DISPLAYCHANGE receipt (before debounce) in the
         // event loop. This handler runs after the debounce settles.
         info!("Display configuration changed - reconciling monitors");
-
-        // Re-enumerate monitors
-        match enumerate_monitors() {
+        let enumerated: Result<Vec<MonitorInfo>, leopardwm_platform_win32::Win32Error> = {
+            #[cfg(test)]
+            {
+                match self.injected_display_monitors.clone() {
+                    Some(monitors) => Ok(monitors),
+                    None => {
+                        warn!("Ignoring display change in tests without injected monitors");
+                        return;
+                    }
+                }
+            }
+            #[cfg(not(test))]
+            {
+                enumerate_monitors()
+            }
+        };
+        match enumerated {
             Ok(new_monitors) if !new_monitors.is_empty() => {
                 info!(
                     "Detected {} monitor(s) after display change",
@@ -2765,16 +2800,15 @@ impl AppState {
                 self.reconcile_monitors(new_monitors);
                 self.reconcile_application_fullscreen_sessions();
 
-                // Correct any window whose minimized flag went stale across the
-                // topology change (e.g. a monitor waking un-minimizes its
-                // windows but the restored stash still has them flagged), so the
-                // re-apply below tiles what is actually on screen.
-                self.resync_minimized_from_os();
+                // Correct stale minimized flags, then park restored inactive
+                // workspace windows that apply_layout will not place.
+                self.prepare_inactive_workspace_windows();
 
                 // Re-apply layout with updated monitor configuration
                 if let Err(e) = self.apply_layout() {
                     warn!("Failed to apply layout after display change: {}", e);
                 }
+                self.sync_taskbar_buttons();
             }
             Ok(_) => {
                 warn!("No monitors found after display change");

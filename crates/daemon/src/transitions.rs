@@ -126,6 +126,7 @@ impl AppState {
         self.layout_transition = Some(LayoutTransition {
             start_rects,
             exit_rects: HashMap::new(),
+            exit_provenance: HashMap::new(),
             elapsed_ms: 16,
             duration_ms,
             easing: self.config.animation.easing,
@@ -153,9 +154,25 @@ impl AppState {
         }
         self.abort_active_ghost_transition();
         self.abort_layout_transition();
+        let exit_provenance = exit_rects
+            .keys()
+            .filter_map(|window_id| {
+                self.find_window_workspace(*window_id)
+                    .map(|(monitor_id, _)| {
+                        (
+                            *window_id,
+                            crate::state::ExitProjectionProvenance {
+                                owner: monitor_id,
+                                eligible: self.exit_projection_eligible(*window_id),
+                            },
+                        )
+                    })
+            })
+            .collect();
         self.layout_transition = Some(LayoutTransition {
             start_rects,
             exit_rects,
+            exit_provenance,
             elapsed_ms: 16,
             duration_ms,
             easing: self.config.animation.easing,
@@ -187,6 +204,7 @@ impl AppState {
     }
 
     pub(crate) fn stop_ghosting_window_visuals(&mut self, hwnd: u64) {
+        let pending_safe_landing = self.ghost_sources_pending_safe_landing.remove(&hwnd);
         let crossfade_epochs: Vec<u64> = self
             .crossfade_sources
             .iter()
@@ -197,12 +215,28 @@ impl AppState {
                 ctrl.send_drop_crossfade_target(epoch, hwnd);
             }
         }
-        if self.ghost_handles.remove(&hwnd).is_some() {
+        let had_ghost_handle = self.ghost_handles.remove(&hwnd).is_some();
+        if pending_safe_landing || had_ghost_handle {
             leopardwm_platform_win32::unmark_ghost_cloaked(hwnd);
             leopardwm_platform_win32::apply_cloak_state(hwnd);
         }
         if let Some(ref mut transition) = self.layout_transition {
             transition.ghosted_wids.remove(&hwnd);
+        }
+    }
+
+    pub(crate) fn release_ghost_sources_after_physical_landing(&mut self) {
+        let pending: Vec<u64> = self
+            .ghost_sources_pending_safe_landing
+            .iter()
+            .copied()
+            .collect();
+        for hwnd in pending {
+            if self.physical_landing_is_safe_to_expose(hwnd) {
+                leopardwm_platform_win32::unmark_ghost_cloaked(hwnd);
+                leopardwm_platform_win32::apply_cloak_state(hwnd);
+                self.ghost_sources_pending_safe_landing.remove(&hwnd);
+            }
         }
     }
 
@@ -241,8 +275,9 @@ impl AppState {
             .collect()
     }
 
-    /// Drop any in-flight ghost-animation handles and uncloak their
-    /// sources, then signal the worker to abort any running crossfade.
+    /// Drop any in-flight ghost-animation handles, retaining unsafe sources
+    /// cloaked until a confirmed landing, then signal the worker to abort any
+    /// running crossfade.
     ///
     /// Routed through by every code path that mutates or clears
     /// `layout_transition`. No-op when no ghost state is alive.
@@ -252,11 +287,17 @@ impl AppState {
         let wids: Vec<u64> = self.ghost_handles.keys().copied().collect();
         self.ghost_handles.clear();
 
-        // Uncloak the (formerly) ghosted sources through apply_cloak_state so a
-        // window also in GLOBAL_CLOAKED (off-screen parked) stays cloaked.
+        // A revoked thumbnail must not expose a source until its current
+        // synchronous physical landing confirms it remains inside its owner.
+        // Safe sources can resume immediately; affected or invalidated sources
+        // stay cloaked and are released by the next confirmed landing.
         for wid in &wids {
-            leopardwm_platform_win32::unmark_ghost_cloaked(*wid);
-            leopardwm_platform_win32::apply_cloak_state(*wid);
+            if self.physical_landing_is_safe_to_expose(*wid) {
+                leopardwm_platform_win32::unmark_ghost_cloaked(*wid);
+                leopardwm_platform_win32::apply_cloak_state(*wid);
+            } else {
+                self.ghost_sources_pending_safe_landing.insert(*wid);
+            }
         }
 
         // Clear ghosted_wids on any still-live transition so
@@ -269,6 +310,11 @@ impl AppState {
         // DaemonEvent::CrossfadeComplete { epoch }; that epoch's entry in
         // crossfade_sources is removed then.
         self.abort_active_crossfade();
+    }
+
+    pub(crate) fn invalidate_physical_display_change(&mut self) {
+        self.abort_active_crossfade();
+        self.bump_physical_invalidation();
     }
 
     /// Send `AbortCrossfade { epoch }` to the worker if a fade is in
@@ -356,13 +402,18 @@ impl AppState {
             .unwrap_or(self.focused_monitor);
 
         for (&wid, &start_rect) in start_rects {
-            if self.is_application_fullscreen(wid) {
+            if self.is_application_fullscreen(wid)
+                || self.ghost_sources_pending_safe_landing.contains(&wid)
+            {
                 continue;
             }
             let Some(&(target_rect, monitor_id)) = targets.get(&wid) else {
                 continue;
             };
             if start_rect == target_rect {
+                continue;
+            }
+            if self.swept_rect_meets_protected_boundary(wid, start_rect, target_rect) {
                 continue;
             }
             // Cross-monitor moves use the legacy nudge path — the
