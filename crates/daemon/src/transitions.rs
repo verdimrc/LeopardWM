@@ -193,6 +193,7 @@ impl AppState {
             .is_some_and(|transition| transition.suppress_landing_focus_resync);
         self.layout_transition = None;
         self.pending_suppress_landing_focus_resync = suppress;
+        self.layout_last_completed_at = Some(std::time::Instant::now());
     }
 
     pub(crate) fn release_departing_hwnd_ghost(&mut self, hwnd: u64) {

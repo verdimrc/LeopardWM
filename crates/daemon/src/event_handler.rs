@@ -1665,7 +1665,13 @@ impl AppState {
             // already re-asserted the correct foreground window, so
             // GetForegroundWindow disagrees. Outside of layout work (e.g.
             // overview activation) we let the event through normally.
-            if self.applying_layout || self.layout_transition.is_some() {
+            let layout_recently_completed = self
+                .layout_last_completed_at
+                .is_some_and(|t| t.elapsed() < std::time::Duration::from_millis(200));
+            if self.applying_layout
+                || self.layout_transition.is_some()
+                || layout_recently_completed
+            {
                 if let Some(fg) = leopardwm_platform_win32::get_foreground_window() {
                     if fg != hwnd {
                         debug!(

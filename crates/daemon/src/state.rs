@@ -407,6 +407,10 @@ pub(crate) struct AppState {
     /// clearing so the extra post-complete frame can still consume it.
     /// Cleared on consume, abort, or a newer transition start.
     pub(crate) pending_suppress_landing_focus_resync: bool,
+    /// Instant when the last layout transition completed. Used to extend the
+    /// stale-focus guard beyond the transition window, catching delayed
+    /// WinEventHook deliveries that race past the post-animation focus re-sync.
+    pub(crate) layout_last_completed_at: Option<std::time::Instant>,
     /// Previously focused window for border color tracking.
     pub(crate) previous_focused_hwnd: Option<u64>,
     /// Suppresses delayed focus notifications for the exact window left by a
@@ -895,6 +899,7 @@ impl AppState {
             sticky_windows: HashSet::new(),
             pending_sticky_refocus: None,
             pending_suppress_landing_focus_resync: false,
+            layout_last_completed_at: None,
             previous_focused_hwnd: None,
             pending_workspace_switch_focus: None,
             last_broadcast_focused: None,
