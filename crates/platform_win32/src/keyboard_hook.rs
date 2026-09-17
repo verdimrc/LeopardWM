@@ -541,11 +541,6 @@ unsafe fn keyboard_ll_hook_inner(ncode: i32, wparam: WPARAM, lparam: LPARAM) -> 
         .unwrap_or_else(recover_poisoned_mutex);
     let right_alt = GetAsyncKeyState(VK_RMENU) < 0;
     let left_ctrl = GetAsyncKeyState(VK_LCONTROL) < 0;
-    // AltGr = synthesized Left Ctrl + Right Alt. When symmetric_modifiers is off,
-    // also suppress any lone Right Alt to stay safe on international layouts.
-    if right_alt && (left_ctrl || !symmetric) {
-        return CallNextHookEx(None, ncode, wparam, lparam);
-    }
     if recording && fn_mod_bit(vk).is_some() {
         let bit = fn_mod_bit(vk).unwrap();
         let mut recording_held = HOOK_RECORDING_FN_HELD
@@ -588,7 +583,7 @@ unsafe fn keyboard_ll_hook_inner(ncode: i32, wparam: WPARAM, lparam: LPARAM) -> 
         fn_held,
         recording_fn_held,
         is_new_press,
-        GetAsyncKeyState(VK_RMENU) < 0,
+        right_alt && (left_ctrl || !symmetric),
         pending_recorded_vk,
     );
     drop(binds);
