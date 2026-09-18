@@ -40,6 +40,40 @@ struct OverviewRowGeometry {
     strip: Rect,
 }
 
+/// Lay out `n` column slots left-to-right inside a `w` x `h` client area:
+/// 4% outer margin, 2% column gap, equal-width columns capped at `w / 3`
+/// and centered horizontally. Used for vertical-monitor overviews.
+fn layout_overview_columns(w: i32, h: i32, n: usize) -> Vec<OverviewRowGeometry> {
+    let n_i = n as i32;
+    if n_i <= 0 || w <= 0 || h <= 0 {
+        return Vec::new();
+    }
+    let margin_x = ((f64::from(w) * OUTER_MARGIN_FRAC).round() as i32).max(SELECT_PAD + 2);
+    let margin_y = ((f64::from(h) * OUTER_MARGIN_FRAC).round() as i32).max(SELECT_PAD + 2);
+    let gap = ((f64::from(w) * ROW_GAP_FRAC).round() as i32).max(2 * SELECT_PAD + 2);
+    let avail_w = w - 2 * margin_x - gap * (n_i - 1);
+    let col_w = (avail_w / n_i).min(w / 3).max(1);
+    let total_w = col_w * n_i + gap * (n_i - 1);
+    let left = margin_x + ((w - 2 * margin_x) - total_w).max(0) / 2;
+    let panel_h = (h - 2 * margin_y).max(1);
+    let label_h = LABEL_STRIP_H.min(panel_h);
+    (0..n_i)
+        .map(|i| {
+            let x = left + i * (col_w + gap);
+            OverviewRowGeometry {
+                panel: Rect::new(x, margin_y, col_w, panel_h),
+                label_strip: Rect::new(x, margin_y, col_w, label_h),
+                strip: Rect::new(
+                    x + BODY_INSET,
+                    margin_y + label_h + BODY_INSET,
+                    (col_w - 2 * BODY_INSET).max(1),
+                    (panel_h - label_h - 2 * BODY_INSET).max(1),
+                ),
+            }
+        })
+        .collect()
+}
+
 /// Lay out `n` row slots top-to-bottom inside a `w` x `h` client area:
 /// 4% outer margin, 2% row gap, equal-height rows capped at `h / 3` and
 /// centered vertically when fewer rows than would fill the area.
@@ -164,6 +198,8 @@ impl AppState {
         monitor: isize,
     ) -> Option<(Rect, OverviewModel)> {
         let work_area = self.monitors.get(&monitor)?.work_area;
+        let layout_vp = self.layout_viewport(monitor);
+        let orient = crate::monitors::Orientation::of(work_area);
         let ws_vec = self.workspaces.get(&monitor)?;
         let active_idx = self.active_workspace_idx(monitor);
 
@@ -193,7 +229,11 @@ impl AppState {
         }
         let ws_vec = self.workspaces.get(&monitor)?;
 
-        let geoms = layout_overview_rows(work_area.width, work_area.height, ws_vec.len());
+        let geoms = if orient.is_vertical() {
+            layout_overview_columns(work_area.width, work_area.height, ws_vec.len())
+        } else {
+            layout_overview_rows(work_area.width, work_area.height, ws_vec.len())
+        };
         let focused_wid = ws_vec.get(active_idx).and_then(|ws| ws.focused_window());
         let accent_width = self.config.appearance.active_border_width.max(1);
         let device_name = self
@@ -219,8 +259,8 @@ impl AppState {
                 geom.strip.width,
                 (geom.strip.height - 1).max(1),
             );
-            let (mut cards, mut viewport, content_w) =
-                self.overview_cards_for(ws, work_area, strip, selected_wid, is_active);
+            let (mut cards, mut viewport, content_primary) =
+                self.overview_cards_for(ws, work_area, layout_vp, orient, strip, selected_wid, is_active);
             // The active row always carries a selection: fall back to its
             // first card when the focused window isn't represented.
             if is_active && !cards.iter().any(|c| c.selected) {
@@ -237,19 +277,24 @@ impl AppState {
             // shares the panel width. Height per row is unchanged.
             // Empty workspaces (no cards) use a compact width so the
             // label badge doesn't span the full monitor width.
-            let panel_w = match content_w {
-                Some(cw) => (cw + 2 * BODY_INSET).min(geom.panel.width),
-                None if cards.is_empty() => (8 * LABEL_STRIP_H).min(geom.panel.width),
-                None => geom.panel.width,
+            // vmon uses full column width (panels are tall columns, no width wrapping).
+            let panel_w = if orient.is_vertical() {
+                geom.panel.width
+            } else {
+                match content_primary {
+                    Some(cw) => (cw + 2 * BODY_INSET).min(geom.panel.width),
+                    None if cards.is_empty() => (8 * LABEL_STRIP_H).min(geom.panel.width),
+                    None => geom.panel.width,
+                }
             };
             // RTL monitors right-anchor the panel within the full slot so
             // content accumulates from the right edge, matching the strip.
-            let panel_x = if rtl {
+            let panel_x = if !orient.is_vertical() && rtl {
                 geom.panel.x + geom.panel.width - panel_w
             } else {
                 geom.panel.x
             };
-            if rtl {
+            if !orient.is_vertical() && rtl {
                 let dx = panel_x - geom.panel.x;
                 for card in &mut cards {
                     card.rect.x += dx;
@@ -359,21 +404,29 @@ impl AppState {
         &self,
         ws: &Workspace,
         work_area: Rect,
+        layout_vp: Rect,
+        orient: crate::monitors::Orientation,
         strip: Rect,
         selected_wid: Option<u64>,
         is_active: bool,
     ) -> (Vec<OverviewCard>, Rect, Option<i32>) {
-        let full_w = ws.total_width().saturating_add(work_area.width).max(1);
-        let virtual_viewport = Rect::new(0, 0, full_w, work_area.height);
+        // full_w and virtual_viewport are in layout space (primary axis = X).
+        let full_w = ws.total_width().saturating_add(layout_vp.width).max(1);
+        let virtual_viewport = Rect::new(0, 0, full_w, layout_vp.height);
         let scroll = ws.scroll_offset().round() as i32;
-        // The strip region the real viewport currently shows.
-        let viewport_region = Rect::new(scroll, 0, work_area.width, work_area.height);
+        // Viewport region in layout space; rotated to physical for vmon.
+        let viewport_region_layout = Rect::new(scroll, 0, layout_vp.width, layout_vp.height);
+        let viewport_region = if orient.is_vertical() {
+            crate::monitors::rotate_layout_rect(viewport_region_layout, work_area)
+        } else {
+            viewport_region_layout
+        };
 
         let fullscreen = ws
             .fullscreen_window_id()
             .filter(|&wid| ws.contains_window(wid) && !ws.is_minimized(wid));
         let sources: Vec<(u64, Rect, Option<usize>)> = if let Some(fs_wid) = fullscreen {
-            // The fullscreen window covers the whole viewport.
+            // The fullscreen window covers the whole viewport (physical space).
             vec![(fs_wid, viewport_region, None)]
         } else {
             let mut sources: Vec<(u64, Rect, Option<usize>)> = ws
@@ -385,27 +438,41 @@ impl AppState {
                         && p.column_index != usize::MAX // floats handled below
                 })
                 .map(|p| {
+                    // Rotate layout-space rects to physical for vertical monitors.
+                    let r = if orient.is_vertical() {
+                        crate::monitors::rotate_layout_rect(p.rect, work_area)
+                    } else {
+                        p.rect
+                    };
                     let tab_count = ws
                         .column(p.column_index)
                         .filter(|c| c.is_tabbed() && c.len() > 1)
                         .map(leopardwm_core_layout::Column::len);
-                    (p.window_id, p.rect, tab_count)
+                    (p.window_id, r, tab_count)
                 })
                 .collect();
             for f in ws.floating_windows() {
                 if ws.is_minimized(f.id) {
                     continue; // matches the tiled path's visibility filter
                 }
-                sources.push((
-                    f.id,
+                // Floating windows are in physical space. For hmon the scroll
+                // offset is on X; for vmon it maps to Y (layout X = physical Y).
+                let strip_rect = if orient.is_vertical() {
+                    Rect::new(
+                        f.rect.x - work_area.x,
+                        f.rect.y - work_area.y + scroll,
+                        f.rect.width,
+                        f.rect.height,
+                    )
+                } else {
                     Rect::new(
                         f.rect.x - work_area.x + scroll,
                         f.rect.y - work_area.y,
                         f.rect.width,
                         f.rect.height,
-                    ),
-                    None,
-                ));
+                    )
+                };
+                sources.push((f.id, strip_rect, None));
             }
             sources
         };
@@ -426,21 +493,20 @@ impl AppState {
         } else {
             0
         };
-        let vp_right = viewport_region.x + viewport_region.width;
-        // In/out classification in RAW strip space, against the viewport
-        // region's CONTENT edges: the outer gaps are dead zones (the
-        // engine cloaks a column whose strip-x reaches the padded edge),
-        // so a card whose left edge sits at/after `vp_right - outer_right`
-        // is out of view even though it nominally overlaps the viewport
-        // rect. EDGE_EPSILON absorbs the scroll-offset rounding.
+        // In/out classification in physical strip space against the viewport
+        // region's CONTENT edges. Uses the primary axis (X for hmon, Y for
+        // vmon) so the logic is uniform after rotation.
         const EDGE_EPSILON: i32 = 1;
-        let (outer_left, outer_right, _, _) = ws.outer_gaps();
-        let vis_left = viewport_region.x + outer_left.max(0);
-        let vis_right = vp_right - outer_right.max(0);
+        let (outer_lo, outer_hi, _, _) = ws.outer_gaps();
+        let vp_primary = orient.primary(viewport_region);
+        let vis_lo = vp_primary + outer_lo.max(0);
+        let vis_hi = vp_primary + orient.primary_size(viewport_region) - outer_hi.max(0);
         let out_dir = |r: &Rect| -> i32 {
-            if r.x + r.width <= vis_left + EDGE_EPSILON {
+            let lo = orient.primary(*r);
+            let hi = lo + orient.primary_size(*r);
+            if hi <= vis_lo + EDGE_EPSILON {
                 -1
-            } else if r.x >= vis_right - EDGE_EPSILON {
+            } else if lo >= vis_hi - EDGE_EPSILON {
                 1
             } else {
                 0
@@ -467,15 +533,19 @@ impl AppState {
         } else {
             bounding_box(sources.iter().map(|(_, r, _)| *r))
         };
-        let fit_strip = Rect::new(
-            strip.x,
-            strip.y,
-            (strip.width - reserve).max(1),
-            strip.height,
-        );
+        // Reserve space from the primary axis of the strip for boundary gaps.
+        let fit_strip = if orient.is_vertical() {
+            Rect::new(strip.x, strip.y, strip.width, (strip.height - reserve).max(1))
+        } else {
+            Rect::new(strip.x, strip.y, (strip.width - reserve).max(1), strip.height)
+        };
         let mut xform = StripTransform::fit(&content, &fit_strip);
         if has_left {
-            xform.offset_x += boundary_gap;
+            if orient.is_vertical() {
+                xform.offset_y += boundary_gap;
+            } else {
+                xform.offset_x += boundary_gap;
+            }
         }
 
         // Live previews unless config says placeholder/snapshot. A window
@@ -488,14 +558,19 @@ impl AppState {
             .into_iter()
             .map(|(wid, r, tab_count)| {
                 let mut rect = xform.apply(&r);
-                rect.x += out_dir(&r) * boundary_gap;
+                let shift = out_dir(&r) * boundary_gap;
+                if orient.is_vertical() {
+                    rect.y += shift;
+                } else {
+                    rect.x += shift;
+                }
                 // The window's real placement in overlay client coords:
-                // strip space minus the scroll (the strip places the
-                // viewport region at x = scroll; the overlay origin is
-                // the work-area origin). Filled for EVERY row — the
-                // close animation may zoom toward any workspace's
-                // would-be placements, not just the active one.
-                let from_rect = Rect::new(r.x - scroll, r.y, r.width, r.height);
+                // strip space minus the scroll offset on the primary axis.
+                let from_rect = if orient.is_vertical() {
+                    Rect::new(r.x, r.y - scroll, r.width, r.height)
+                } else {
+                    Rect::new(r.x - scroll, r.y, r.width, r.height)
+                };
                 OverviewCard {
                     window_id: wid,
                     title: self
@@ -535,7 +610,13 @@ impl AppState {
                 v.height + 2 * VIEWPORT_RING_PAD,
             )
         };
-        (cards, marker, Some(xform.scaled_width(&content) + reserve))
+        // For vmon column panels, no width wrapping is needed (full column height used).
+        let content_primary = if orient.is_vertical() {
+            None
+        } else {
+            Some(xform.scaled_width(&content) + reserve)
+        };
+        (cards, marker, content_primary)
     }
 
     /// Toggle the overview overlay on the focused monitor. Closing via
