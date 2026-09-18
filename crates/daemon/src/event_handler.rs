@@ -2940,6 +2940,7 @@ impl AppState {
         let width_presets = self.config.layout.width_presets.clone();
         let height_presets = self.config.layout.height_presets.clone();
 
+        let viewport_height = self.viewport_height_for(monitor_id);
         if let Some(ws) = self
             .workspaces
             .get_mut(&monitor_id)
@@ -2957,11 +2958,6 @@ impl AppState {
                 // Snap height to nearest preset (multi-window columns only)
                 let col_len = ws.columns().get(col_idx).map(|c| c.len()).unwrap_or(0);
                 if col_len > 1 {
-                    let viewport_height = self
-                        .monitors
-                        .get(&monitor_id)
-                        .map(|m| m.work_area.height)
-                        .unwrap_or(crate::state::FALLBACK_WORK_AREA_HEIGHT);
                     ws.snap_window_height_to_preset(
                         col_idx,
                         win_idx,

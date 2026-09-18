@@ -1387,14 +1387,14 @@ impl AppState {
     pub(crate) fn viewport_width_for(&self, monitor_id: MonitorId) -> i32 {
         self.monitors
             .get(&monitor_id)
-            .map(|m| {
-                if m.work_area.height > m.work_area.width {
-                    m.work_area.height
-                } else {
-                    m.work_area.width
-                }
-            })
+            .map(|m| crate::monitors::Orientation::of(m.work_area).primary_size(m.work_area))
             .unwrap_or(FALLBACK_VIEWPORT_WIDTH)
+    }
+
+    /// Get the viewport height (secondary axis) for a specific monitor.
+    /// For vertical monitors, returns work_area.width (the layout engine's secondary axis).
+    pub(crate) fn viewport_height_for(&self, monitor_id: MonitorId) -> i32 {
+        self.layout_viewport(monitor_id).height
     }
 }
 

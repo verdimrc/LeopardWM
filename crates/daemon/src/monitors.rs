@@ -548,10 +548,25 @@ impl AppState {
             source_workspace
                 .remove_window(window_id)
                 .map_err(|e| format!("Failed to remove window: {}", e))?;
+            let source_viewport_w = self.viewport_width_for(source_monitor);
             let target_viewport_w = self.viewport_width_for(target_monitor);
-            let clamped_column_width = source_column_width.map(|w| w.min(target_viewport_w));
+            let source_orient = self.monitors.get(&source_monitor)
+                .map(|m| Orientation::of(m.work_area))
+                .unwrap_or(Orientation::Horizontal);
+            let target_orient = self.monitors.get(&target_monitor)
+                .map(|m| Orientation::of(m.work_area))
+                .unwrap_or(Orientation::Horizontal);
+            let new_column_width = source_column_width.map(|w| {
+                if source_orient != target_orient && source_viewport_w > 0 {
+                    let frac = w as f64 / source_viewport_w as f64;
+                    ((frac * target_viewport_w as f64).round() as i32)
+                        .clamp(100, target_viewport_w)
+                } else {
+                    w.min(target_viewport_w)
+                }
+            });
             target_workspace
-                .insert_window(window_id, clamped_column_width)
+                .insert_window(window_id, new_column_width)
                 .map_err(|e| format!("Failed to add window to target: {}", e))?;
         }
 
@@ -603,14 +618,42 @@ impl AppState {
     pub(crate) fn layout_viewport(&self, monitor_id: MonitorId) -> Rect {
         self.monitors
             .get(&monitor_id)
-            .map(|m| {
-                if m.work_area.height > m.work_area.width {
-                    Rect::new(m.work_area.x, m.work_area.y, m.work_area.height, m.work_area.width)
-                } else {
-                    m.work_area
-                }
+            .map(|m| match Orientation::of(m.work_area) {
+                Orientation::Vertical =>
+                    Rect::new(m.work_area.x, m.work_area.y, m.work_area.height, m.work_area.width),
+                Orientation::Horizontal => m.work_area,
             })
             .unwrap_or_else(|| Rect::new(0, 0, FALLBACK_VIEWPORT_WIDTH, FALLBACK_VIEWPORT_HEIGHT))
+    }
+}
+
+/// Axis orientation of a monitor. Vertical monitors (portrait) swap the
+/// layout engine's primary (X) axis onto the physical Y axis.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Orientation {
+    Horizontal,
+    Vertical,
+}
+
+#[allow(dead_code)]
+impl Orientation {
+    pub(crate) fn of(work_area: Rect) -> Self {
+        if work_area.height > work_area.width { Self::Vertical } else { Self::Horizontal }
+    }
+    pub(crate) fn primary(self, r: Rect) -> i32 {
+        match self { Self::Horizontal => r.x, Self::Vertical => r.y }
+    }
+    pub(crate) fn primary_size(self, r: Rect) -> i32 {
+        match self { Self::Horizontal => r.width, Self::Vertical => r.height }
+    }
+    pub(crate) fn secondary(self, r: Rect) -> i32 {
+        match self { Self::Horizontal => r.y, Self::Vertical => r.x }
+    }
+    pub(crate) fn secondary_size(self, r: Rect) -> i32 {
+        match self { Self::Horizontal => r.height, Self::Vertical => r.width }
+    }
+    pub(crate) fn primary_coord(self, x: i32, y: i32) -> i32 {
+        match self { Self::Horizontal => x, Self::Vertical => y }
     }
 }
 

@@ -380,7 +380,7 @@ impl AppState {
                     let viewport = self.layout_viewport(*monitor_id);
                     let mut placements = workspace.compute_placements_animated(viewport);
                     if let Some(m) = self.monitors.get(monitor_id) {
-                        if m.work_area.height > m.work_area.width {
+                        if crate::monitors::Orientation::of(m.work_area) == crate::monitors::Orientation::Vertical {
                             let work_area = m.work_area;
                             for p in &mut placements {
                                 p.rect = crate::monitors::rotate_layout_rect(p.rect, work_area);
@@ -762,7 +762,7 @@ impl AppState {
                     let viewport = self.layout_viewport(*monitor_id);
                     let mut placements = workspace.compute_placements_animated(viewport);
                     if let Some(m) = self.monitors.get(monitor_id) {
-                        if m.work_area.height > m.work_area.width {
+                        if crate::monitors::Orientation::of(m.work_area) == crate::monitors::Orientation::Vertical {
                             let work_area = m.work_area;
                             for p in &mut placements {
                                 p.rect = crate::monitors::rotate_layout_rect(p.rect, work_area);
@@ -1171,11 +1171,11 @@ impl AppState {
             else {
                 continue;
             };
-            let viewport_height = self
-                .monitors
-                .get(&monitor_id)
-                .map(|monitor| monitor.work_area.height)
-                .unwrap_or(i32::MAX);
+            let viewport_height = if self.monitors.contains_key(&monitor_id) {
+                self.viewport_height_for(monitor_id)
+            } else {
+                i32::MAX
+            };
             if violation.min_height >= viewport_height {
                 debug!(
                     "Ignoring viewport-sized height violation for window {} ({}px >= {}px viewport)",
