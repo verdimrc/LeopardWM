@@ -551,14 +551,8 @@ impl AppState {
                 .map_err(|e| format!("Failed to remove window: {}", e))?;
             let source_viewport_w = self.viewport_width_for(source_monitor);
             let target_viewport_w = self.viewport_width_for(target_monitor);
-            let source_orient = self.monitors.get(&source_monitor)
-                .map(|m| Orientation::of(m.work_area))
-                .unwrap_or(Orientation::Horizontal);
-            let target_orient = self.monitors.get(&target_monitor)
-                .map(|m| Orientation::of(m.work_area))
-                .unwrap_or(Orientation::Horizontal);
             let new_column_width = source_column_width.map(|w| {
-                if source_orient != target_orient && source_viewport_w > 0 {
+                if source_viewport_w > 0 {
                     let frac = w as f64 / source_viewport_w as f64;
                     ((frac * target_viewport_w as f64).round() as i32)
                         .clamp(100, target_viewport_w)
