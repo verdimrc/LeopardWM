@@ -41,7 +41,7 @@ impl AppState {
         let old_viewport_widths: HashMap<MonitorId, i32> = self
             .monitors
             .iter()
-            .map(|(&id, monitor)| (id, monitor.work_area.width))
+            .map(|(&id, monitor)| (id, monitor_viewport_width(monitor)))
             .collect();
         let mut source_viewport_widths: HashMap<MonitorId, i32> = new_monitors
             .iter()
@@ -106,7 +106,7 @@ impl AppState {
                     let viewport_width = self
                         .monitors
                         .get(&monitor_id)
-                        .map(|m| m.work_area.width)
+                        .map(monitor_viewport_width)
                         .unwrap_or(FALLBACK_VIEWPORT_WIDTH);
                     let params = ScaledLayoutParams::from_config(
                         &self.config.layout,
@@ -214,12 +214,13 @@ impl AppState {
                         continue;
                     }
                 }
-                source_viewport_widths.insert(monitor.id, monitor.work_area.width);
+                let mvw = monitor_viewport_width(monitor);
+                source_viewport_widths.insert(monitor.id, mvw);
                 let params = ScaledLayoutParams::from_config(
                     &self.config.layout,
                     &self.config.appearance,
                     monitor.scale_factor,
-                    monitor.work_area.width,
+                    mvw,
                 );
                 let mut workspace = Workspace::with_directional_gaps(
                     params.gap,
@@ -354,7 +355,7 @@ impl AppState {
             let viewport_width = self
                 .monitors
                 .get(&monitor_id)
-                .map(|m| m.work_area.width)
+                .map(monitor_viewport_width)
                 .unwrap_or(FALLBACK_VIEWPORT_WIDTH);
             let params = ScaledLayoutParams::from_config(
                 &self.config.layout,
@@ -655,6 +656,12 @@ impl Orientation {
     pub(crate) fn primary_coord(self, x: i32, y: i32) -> i32 {
         match self { Self::Horizontal => x, Self::Vertical => y }
     }
+}
+
+/// Returns the primary-axis length (layout viewport width) for a monitor.
+/// For vertical monitors this is `work_area.height`; for horizontal, `work_area.width`.
+pub(crate) fn monitor_viewport_width(m: &leopardwm_platform_win32::MonitorInfo) -> i32 {
+    Orientation::of(m.work_area).primary_size(m.work_area)
 }
 
 /// Rotate a layout-space rect to physical screen coordinates for a vertical

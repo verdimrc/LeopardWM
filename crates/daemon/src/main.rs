@@ -988,7 +988,7 @@ fn init_workspace_state(state: &mut AppState) {
     let monitor_widths: HashMap<MonitorId, i32> = state
         .monitors
         .iter()
-        .map(|(id, m)| (*id, m.work_area.width))
+        .map(|(id, m)| (*id, crate::monitors::monitor_viewport_width(m)))
         .collect();
 
     // Ensure the focused column is visible in the viewport for every workspace.
@@ -1017,7 +1017,7 @@ fn init_workspace_state(state: &mut AppState) {
         .monitors
         .iter()
         .map(|(&id, m)| {
-            let vw = m.work_area.width;
+            let vw = crate::monitors::monitor_viewport_width(m);
             (id, state.config.layout.default_column_width_px(vw))
         })
         .collect();

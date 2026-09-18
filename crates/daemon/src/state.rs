@@ -847,7 +847,7 @@ impl AppState {
                 &config.layout,
                 &config.appearance,
                 monitor.scale_factor,
-                monitor.work_area.width,
+                crate::monitors::monitor_viewport_width(&monitor),
             );
             let mut workspace = Workspace::with_directional_gaps(
                 params.gap,

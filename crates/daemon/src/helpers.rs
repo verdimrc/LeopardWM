@@ -184,7 +184,7 @@ impl AppState {
             let viewport_width = self
                 .monitors
                 .get(&monitor_id)
-                .map(|m| m.work_area.width)
+                .map(crate::monitors::monitor_viewport_width)
                 .unwrap_or(FALLBACK_VIEWPORT_WIDTH);
             let params = ScaledLayoutParams::from_config(
                 &self.config.layout,
