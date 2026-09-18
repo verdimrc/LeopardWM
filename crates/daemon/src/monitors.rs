@@ -603,7 +603,25 @@ impl AppState {
     pub(crate) fn layout_viewport(&self, monitor_id: MonitorId) -> Rect {
         self.monitors
             .get(&monitor_id)
-            .map(|m| m.work_area)
+            .map(|m| {
+                if m.work_area.height > m.work_area.width {
+                    Rect::new(m.work_area.x, m.work_area.y, m.work_area.height, m.work_area.width)
+                } else {
+                    m.work_area
+                }
+            })
             .unwrap_or_else(|| Rect::new(0, 0, FALLBACK_VIEWPORT_WIDTH, FALLBACK_VIEWPORT_HEIGHT))
     }
+}
+
+/// Rotate a layout-space rect to physical screen coordinates for a vertical
+/// monitor. The layout engine receives a viewport with swapped width/height,
+/// so its "x" axis maps to the monitor's Y axis and vice versa.
+pub(crate) fn rotate_layout_rect(layout_rect: Rect, work_area: Rect) -> Rect {
+    Rect::new(
+        work_area.x + (layout_rect.y - work_area.y),
+        work_area.y + (layout_rect.x - work_area.x),
+        layout_rect.height,
+        layout_rect.width,
+    )
 }

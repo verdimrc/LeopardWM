@@ -1379,17 +1379,21 @@ impl AppState {
 
     /// Get the focused monitor's viewport.
     pub(crate) fn focused_viewport(&self) -> Rect {
-        self.monitors
-            .get(&self.focused_monitor)
-            .map(|m| m.work_area)
-            .unwrap_or_else(|| Rect::new(0, 0, FALLBACK_VIEWPORT_WIDTH, FALLBACK_VIEWPORT_HEIGHT))
+        self.layout_viewport(self.focused_monitor)
     }
 
-    /// Get the viewport width for a specific monitor.
+    /// Get the viewport width for a specific monitor. For vertical monitors,
+    /// returns the work area height (the layout engine's primary axis).
     pub(crate) fn viewport_width_for(&self, monitor_id: MonitorId) -> i32 {
         self.monitors
             .get(&monitor_id)
-            .map(|m| m.work_area.width)
+            .map(|m| {
+                if m.work_area.height > m.work_area.width {
+                    m.work_area.height
+                } else {
+                    m.work_area.width
+                }
+            })
             .unwrap_or(FALLBACK_VIEWPORT_WIDTH)
     }
 }

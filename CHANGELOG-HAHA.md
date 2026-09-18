@@ -1,6 +1,6 @@
 # Changelog — haha branch
 
-## [Unreleased] — diff between branch `haha` (`c65df72`) and `main` (`ed0aa13`)
+## [Unreleased] — diff between `ed0aa13` .. HEAD
 
 ### Features
 
@@ -18,6 +18,8 @@
 
 - Window rules support `tile_on_os_monitor` to respect the OS-chosen monitor.
   Useful for PowerPoint presentation mode: respects where PowerPoint places both the slide show and the presenter view windows, while still tiling the presenter view.
+
+- Vertical monitor support: monitors in portrait orientation (height > width) are automatically detected. The layout engine's horizontal axis maps to the monitor's vertical axis — columns become rows, and left/right navigation moves up/down. Drag-and-drop, column resizing, and cross-monitor operations all respect the rotated axis. No configuration required; rotate the monitor in Windows Display Settings.
 
 - Right Ctrl and Right Alt are interchangeable with their left counterparts in hotkeys.
   Opt in with `behavior.symmetric_modifiers = true` in the config. Useful for one-handed operation.

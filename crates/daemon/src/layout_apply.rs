@@ -379,6 +379,14 @@ impl AppState {
                 if self.monitors.contains_key(monitor_id) {
                     let viewport = self.layout_viewport(*monitor_id);
                     let mut placements = workspace.compute_placements_animated(viewport);
+                    if let Some(m) = self.monitors.get(monitor_id) {
+                        if m.work_area.height > m.work_area.width {
+                            let work_area = m.work_area;
+                            for p in &mut placements {
+                                p.rect = crate::monitors::rotate_layout_rect(p.rect, work_area);
+                            }
+                        }
+                    }
                     crate::physical_placement::park_offscreen_avoiding_neighbors(
                         &mut placements,
                         *monitor_id,
@@ -753,6 +761,14 @@ impl AppState {
                     // Use animated placements to support smooth scrolling
                     let viewport = self.layout_viewport(*monitor_id);
                     let mut placements = workspace.compute_placements_animated(viewport);
+                    if let Some(m) = self.monitors.get(monitor_id) {
+                        if m.work_area.height > m.work_area.width {
+                            let work_area = m.work_area;
+                            for p in &mut placements {
+                                p.rect = crate::monitors::rotate_layout_rect(p.rect, work_area);
+                            }
+                        }
+                    }
                     crate::physical_placement::park_offscreen_avoiding_neighbors(
                         &mut placements,
                         *monitor_id,

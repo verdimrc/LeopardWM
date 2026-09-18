@@ -160,7 +160,6 @@ pub struct LayoutConfig {
     /// Example: `rtl_monitor_indices = [2]` enables this on \\.\DISPLAY2.
     #[serde(default)]
     pub rtl_monitor_indices: Vec<u32>,
-
     // Legacy fields kept for backward-compatible deserialization; not used.
     #[serde(default, skip_serializing)]
     #[allow(dead_code)]
