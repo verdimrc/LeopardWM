@@ -18,6 +18,17 @@ fn effective_column_widths(
         .map(|column| workspace.effective_column_width(column))
 }
 
+fn rotate_placements_if_vertical(
+    placements: &mut Vec<leopardwm_core_layout::WindowPlacement>,
+    work_area: leopardwm_core_layout::Rect,
+) {
+    if crate::monitors::Orientation::of(work_area).is_vertical() {
+        for p in placements {
+            p.rect = crate::monitors::rotate_layout_rect(p.rect, work_area);
+        }
+    }
+}
+
 pub(crate) fn should_dispatch_visible_tiled_placement(
     maximized: bool,
     settling: bool,
@@ -380,12 +391,7 @@ impl AppState {
                     let viewport = self.layout_viewport(*monitor_id);
                     let mut placements = workspace.compute_placements_animated(viewport);
                     if let Some(m) = self.monitors.get(monitor_id) {
-                        if crate::monitors::Orientation::of(m.work_area) == crate::monitors::Orientation::Vertical {
-                            let work_area = m.work_area;
-                            for p in &mut placements {
-                                p.rect = crate::monitors::rotate_layout_rect(p.rect, work_area);
-                            }
-                        }
+                        rotate_placements_if_vertical(&mut placements, m.work_area);
                     }
                     crate::physical_placement::park_offscreen_avoiding_neighbors(
                         &mut placements,
@@ -762,12 +768,7 @@ impl AppState {
                     let viewport = self.layout_viewport(*monitor_id);
                     let mut placements = workspace.compute_placements_animated(viewport);
                     if let Some(m) = self.monitors.get(monitor_id) {
-                        if crate::monitors::Orientation::of(m.work_area) == crate::monitors::Orientation::Vertical {
-                            let work_area = m.work_area;
-                            for p in &mut placements {
-                                p.rect = crate::monitors::rotate_layout_rect(p.rect, work_area);
-                            }
-                        }
+                        rotate_placements_if_vertical(&mut placements, m.work_area);
                     }
                     crate::physical_placement::park_offscreen_avoiding_neighbors(
                         &mut placements,

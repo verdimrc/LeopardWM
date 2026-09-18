@@ -235,11 +235,7 @@ impl AppState {
                 return;
             }
             let viewport = self.layout_viewport(target_monitor_id);
-            let (work_area, orient) = self
-                .monitors
-                .get(&target_monitor_id)
-                .map(|m| (m.work_area, crate::monitors::Orientation::of(m.work_area)))
-                .unwrap_or((viewport, crate::monitors::Orientation::Horizontal));
+            let (work_area, orient) = self.monitor_work_area_and_orient(target_monitor_id);
             let cursor_primary = orient.primary_coord(cursor_x, cursor_y);
             let ws_idx = self.active_workspace_idx(target_monitor_id);
             let Some(workspace) = self
@@ -250,7 +246,7 @@ impl AppState {
                 self.reset_drag_preview_without_target(hwnd);
                 return;
             };
-            let column_bounds = column_bounds_from_placements(workspace, viewport, work_area, orient);
+            let column_bounds = column_bounds_from_placements(workspace, viewport, work_area);
 
             // If the cursor is over a visible tab strip, route the drop
             // to that strip's owning column. The strip overhangs the
@@ -448,11 +444,7 @@ impl AppState {
             return;
         }
         let viewport = self.layout_viewport(target_monitor_id);
-        let (work_area, orient) = self
-            .monitors
-            .get(&target_monitor_id)
-            .map(|m| (m.work_area, crate::monitors::Orientation::of(m.work_area)))
-            .unwrap_or((viewport, crate::monitors::Orientation::Horizontal));
+        let (work_area, orient) = self.monitor_work_area_and_orient(target_monitor_id);
         let ws_idx = self.active_workspace_idx(target_monitor_id);
         let Some(workspace) = self
             .workspaces
@@ -461,7 +453,7 @@ impl AppState {
         else {
             return;
         };
-        let column_bounds = column_bounds_from_placements(workspace, viewport, work_area, orient);
+        let column_bounds = column_bounds_from_placements(workspace, viewport, work_area);
         let cursor_primary = orient.primary_coord(cursor_x, cursor_y);
         let insert_index = compute_insertion_index(&column_bounds, cursor_primary);
         let drop_target = DropTarget {
@@ -477,7 +469,7 @@ impl AppState {
         }
         let gap = workspace.gap();
         let hint_pos = compute_insertion_hint_x(&column_bounds, insert_index, gap);
-        let hint_rect = if orient == crate::monitors::Orientation::Vertical {
+        let hint_rect = if orient.is_vertical() {
             Rect::new(work_area.x, hint_pos - 2, work_area.width, 4)
         } else {
             Rect::new(hint_pos - 2, viewport.y, 4, viewport.height)
@@ -499,11 +491,7 @@ impl AppState {
             return;
         }
         let viewport = self.layout_viewport(source_monitor);
-        let (work_area, orient) = self
-            .monitors
-            .get(&source_monitor)
-            .map(|m| (m.work_area, crate::monitors::Orientation::of(m.work_area)))
-            .unwrap_or((viewport, crate::monitors::Orientation::Horizontal));
+        let (work_area, orient) = self.monitor_work_area_and_orient(source_monitor);
         let cursor_primary = orient.primary_coord(cursor_x, cursor_y);
         let (target_idx, current_rect) = {
             let Some(workspace) = self
@@ -513,7 +501,7 @@ impl AppState {
             else {
                 return;
             };
-            let column_bounds = column_bounds_from_placements(workspace, viewport, work_area, orient);
+            let column_bounds = column_bounds_from_placements(workspace, viewport, work_area);
             (
                 compute_target_column_index(&column_bounds, cursor_primary),
                 compute_column_rect(workspace, viewport, current_col),
@@ -679,11 +667,7 @@ impl AppState {
     ) -> Option<bool> {
         // Insert placeholder at target to shift target windows.
         // Recompute target_col since removing from source may have shifted indices.
-        let (work_area, orient) = self
-            .monitors
-            .get(&target_monitor_id)
-            .map(|m| (m.work_area, crate::monitors::Orientation::of(m.work_area)))
-            .unwrap_or((viewport, crate::monitors::Orientation::Horizontal));
+        let (work_area, orient) = self.monitor_work_area_and_orient(target_monitor_id);
         let cursor_primary = orient.primary_coord(cursor_x, cursor_y);
         let adj_target_col = if self
             .drag_state
@@ -696,7 +680,7 @@ impl AppState {
                 .workspaces
                 .get(&target_monitor_id)
                 .and_then(|v| v.get(tgt_idx))?;
-            let bounds = column_bounds_from_placements(ws, viewport, work_area, orient);
+            let bounds = column_bounds_from_placements(ws, viewport, work_area);
             compute_target_column_index(&bounds, cursor_primary)?
         } else {
             target_col
@@ -813,10 +797,7 @@ impl AppState {
             return;
         }
         let target_viewport = self.layout_viewport(target_monitor);
-        let target_work_area = self.monitors.get(&target_monitor).map(|m| m.work_area).unwrap_or(target_viewport);
-        let target_orient = self.monitors.get(&target_monitor)
-            .map(|m| crate::monitors::Orientation::of(m.work_area))
-            .unwrap_or(crate::monitors::Orientation::Horizontal);
+        let (target_work_area, target_orient) = self.monitor_work_area_and_orient(target_monitor);
 
         // A SafeBand (no-placeholder) drop never touched the live layout, so
         // this cached target may be stale if a peer Hidden/Destroyed event
@@ -864,7 +845,7 @@ impl AppState {
                 self.snap_back_tiled(source_monitor, drag.source_workspace_idx);
                 return;
             };
-            let column_bounds = column_bounds_from_placements(workspace, target_viewport, target_work_area, target_orient);
+            let column_bounds = column_bounds_from_placements(workspace, target_viewport, target_work_area);
             let (cursor_x, cursor_y) =
                 leopardwm_platform_win32::get_cursor_pos().unwrap_or_else(|| {
                     (
@@ -1225,17 +1206,14 @@ impl AppState {
             return;
         }
         let target_viewport = self.layout_viewport(target_monitor);
-        let target_work_area = self.monitors.get(&target_monitor).map(|m| m.work_area).unwrap_or(target_viewport);
-        let target_orient = self.monitors.get(&target_monitor)
-            .map(|m| crate::monitors::Orientation::of(m.work_area))
-            .unwrap_or(crate::monitors::Orientation::Horizontal);
+        let (target_work_area, target_orient) = self.monitor_work_area_and_orient(target_monitor);
 
         let tgt_idx = self.active_workspace_idx(target_monitor);
         let target_bounds = self
             .workspaces
             .get(&target_monitor)
             .and_then(|v| v.get(tgt_idx))
-            .map(|ws| column_bounds_from_placements(ws, target_viewport, target_work_area, target_orient))
+            .map(|ws| column_bounds_from_placements(ws, target_viewport, target_work_area))
             .unwrap_or_default();
         let win_center = target_orient.primary_coord(
             win_rect.x + win_rect.width / 2,
@@ -1364,10 +1342,10 @@ fn column_bounds_from_placements(
     workspace: &leopardwm_core_layout::Workspace,
     viewport: Rect,
     work_area: Rect,
-    orient: crate::monitors::Orientation,
 ) -> Vec<ColumnBound> {
+    let orient = crate::monitors::Orientation::of(work_area);
     let mut placements = workspace.compute_placements_animated(viewport);
-    if orient == crate::monitors::Orientation::Vertical {
+    if orient.is_vertical() {
         for p in &mut placements {
             p.rect = crate::monitors::rotate_layout_rect(p.rect, work_area);
         }

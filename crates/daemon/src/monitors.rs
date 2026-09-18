@@ -620,6 +620,18 @@ impl AppState {
             })
             .unwrap_or_else(|| Rect::new(0, 0, FALLBACK_VIEWPORT_WIDTH, FALLBACK_VIEWPORT_HEIGHT))
     }
+
+    /// Returns the physical work area and orientation of a monitor.
+    /// Falls back to the layout viewport rect and `Horizontal` if the monitor is unknown.
+    pub(crate) fn monitor_work_area_and_orient(
+        &self,
+        monitor_id: MonitorId,
+    ) -> (Rect, Orientation) {
+        self.monitors
+            .get(&monitor_id)
+            .map(|m| (m.work_area, Orientation::of(m.work_area)))
+            .unwrap_or_else(|| (self.layout_viewport(monitor_id), Orientation::Horizontal))
+    }
 }
 
 /// Axis orientation of a monitor. Vertical monitors (portrait) swap the
@@ -630,22 +642,18 @@ pub(crate) enum Orientation {
     Vertical,
 }
 
-#[allow(dead_code)]
 impl Orientation {
     pub(crate) fn of(work_area: Rect) -> Self {
         if work_area.height > work_area.width { Self::Vertical } else { Self::Horizontal }
+    }
+    pub(crate) fn is_vertical(self) -> bool {
+        self == Self::Vertical
     }
     pub(crate) fn primary(self, r: Rect) -> i32 {
         match self { Self::Horizontal => r.x, Self::Vertical => r.y }
     }
     pub(crate) fn primary_size(self, r: Rect) -> i32 {
         match self { Self::Horizontal => r.width, Self::Vertical => r.height }
-    }
-    pub(crate) fn secondary(self, r: Rect) -> i32 {
-        match self { Self::Horizontal => r.y, Self::Vertical => r.x }
-    }
-    pub(crate) fn secondary_size(self, r: Rect) -> i32 {
-        match self { Self::Horizontal => r.height, Self::Vertical => r.width }
     }
     pub(crate) fn primary_coord(self, x: i32, y: i32) -> i32 {
         match self { Self::Horizontal => x, Self::Vertical => y }
