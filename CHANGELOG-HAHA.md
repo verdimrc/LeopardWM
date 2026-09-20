@@ -6,8 +6,9 @@
 
 - New windows open on the monitor under the cursor.
 - `behavior.notify_elevation_blocked` silences the toast when a privilege-elevated window is excluded from tiling.
-- RTL layout mode: columns accumulate from the right edge of the viewport instead of the left. Enable with
-  `[layout] rtl_monitor_indices = [N]` where N is the Windows display number (e.g. `\\.\DISPLAY2` → `2`).
+- RTL layout mode: columns accumulate from the right edge of the viewport instead of the left, and new
+  columns open to the left of the focused column. Enable with `[layout] rtl_monitor_indices = [N]` where N
+  is the Windows display number (e.g. `\\.\DISPLAY2` → `2`).
 - Overview improvements:
   - Shows on all monitors simultaneously with Ctrl+Alt+Win+Space.
   - Secondary monitor overlays are now clickable and highlight on hover.
