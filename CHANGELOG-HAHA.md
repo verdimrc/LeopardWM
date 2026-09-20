@@ -6,9 +6,16 @@
 
 - New windows open on the monitor under the cursor.
 - `behavior.notify_elevation_blocked` silences the toast when a privilege-elevated window is excluded from tiling.
+- Right Ctrl and Right Alt are interchangeable with their left counterparts in hotkeys.
+  Opt in with `behavior.symmetric_modifiers = true` in the config. Useful for one-handed operation.
 - RTL layout mode: columns accumulate from the right edge of the viewport instead of the left, and new
   columns open to the left of the focused column. Enable with `[layout] rtl_monitor_indices = [N]` where N
   is the Windows display number (e.g. `\\.\DISPLAY2` → `2`).
+
+  The motivating setup: a wide external monitor sitting to the left of a center main display. LTR places
+  new windows at the far left of that monitor — far from the center display, forcing a wide eye sweep.
+  RTL clusters windows toward the right edge of the external monitor, right next to the center display,
+  so your eyes barely move between the two screens.
 - Overview improvements:
   - Shows on all monitors simultaneously with Ctrl+Alt+Win+Space (`hotkeys.toggle_overview_all`).
   - Secondary monitor overlays are now clickable and highlight on hover.
@@ -25,17 +32,20 @@
     respect the rotated axis.
   - Overview workspace panels are arranged side by side as tall columns instead of horizontal stripes.
     Window cards are shown in their physical (portrait) orientation, stacked top to bottom.
-- Desktop peek: two shortcuts reveal the desktop behind the focused window on LTR horizontal monitors.
-  `Ctrl+Alt+'` (`hotkeys.toggle_desktop_peek_anchored`) keeps the focused window in its current position —
-  the ghost fills the space to its left (at least `layout.desktop_peek_min_width`, default 25%). The only
-  exception: if the window is already at the left edge, it shifts right by the minimum width to make room
-  for the ghost. `Ctrl+Alt+Shift+'` (`hotkeys.toggle_desktop_peek`) always moves the focused window to
-  the minimum-width mark, regardless of where it started.
-  The ghost area is click-through; the desktop beneath remains interactive. Peek is monitor-local —
-  operations on other monitors leave it intact. Any window operation on the peeked monitor (focus change,
-  move, close, minimize, maximize, fullscreen) exits peek and restores the previous scroll position.
-- Right Ctrl and Right Alt are interchangeable with their left counterparts in hotkeys.
-  Opt in with `behavior.symmetric_modifiers = true` in the config. Useful for one-handed operation.
+- Desktop peek: reveals the left portion of the Windows desktop without closing any windows. The
+  motivating use case is drag-and-drop to the desktop — Windows places desktop icons on the left, but a
+  tiling layout covers that area.
+  - `Ctrl+Alt+'` (`hotkeys.toggle_desktop_peek_anchored`) slides a ghost column in from the left and
+    keeps the focused window in its current position. The ghost fills the space to its left (at least
+    `layout.desktop_peek_min_width`, default 25%). Exception: if the window is already at the left edge,
+    it shifts right by the minimum width to make room.
+  - `Ctrl+Alt+Shift+'` (`hotkeys.toggle_desktop_peek`) always moves the focused window to the
+    minimum-width mark, regardless of where it started.
+  - The ghost area is click-through; the desktop beneath remains interactive.
+  - Peek is monitor-local — operations on other monitors leave it intact. Any window operation on the
+    peeked monitor (focus change, move, close, minimize, maximize, fullscreen) exits peek and restores
+    the previous scroll position.
+  - Only available on LTR horizontal monitors.
 
 ### New config fields
 
