@@ -512,6 +512,15 @@ pub enum IpcCommand {
     MoveToWorkspacePrev,
     /// Move the focused window to the next workspace (cycles 9 → 1 on wrap).
     MoveToWorkspaceNext,
+    /// Reveal the desktop's left margin by inserting a ghost column of the
+    /// configured minimum width before the focused window, shifting it right.
+    /// Toggle again to restore. Shortcut: Ctrl+Alt+'.
+    ToggleDesktopPeek,
+    /// Like `ToggleDesktopPeek`, but sizes the ghost column so the focused
+    /// window stays at its current screen position (ghost = B's current
+    /// screen-left offset, floored at the configured minimum). Shortcut:
+    /// Ctrl+Alt+Shift+'.
+    ToggleDesktopPeekAnchored,
     /// Toggle the workspace overview overlay (a map of the focused
     /// monitor's non-empty workspaces).
     ToggleOverview,

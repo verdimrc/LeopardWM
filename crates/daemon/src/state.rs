@@ -119,6 +119,21 @@ pub(crate) const MAX_SET_WIDTH_FRACTION: f64 = 1.0;
 /// Sentinel window ID used as a placeholder during drag to reserve space in the
 /// target column without moving the real window.
 pub(crate) const DRAG_PLACEHOLDER_HWND: u64 = u64::MAX;
+/// Sentinel window ID for the desktop-peek ghost column. Never sent to Win32.
+pub(crate) const DESKTOP_PEEK_HWND: u64 = u64::MAX - 1;
+
+/// Saved state for the desktop-peek toggle so it can be undone exactly.
+pub(crate) struct DesktopPeekState {
+    pub monitor: isize,
+    pub ws_idx: usize,
+    pub saved_scroll: f64,
+    /// HWND that was OS-foreground when peek was entered; auto-exit fires on
+    /// this window's close, minimize, maximize, or fullscreen.
+    pub focused_hwnd: u64,
+    /// Number of real (non-ghost) columns at peek entry; auto-exit fires if a
+    /// new window arrives on the peeked workspace while peek is active.
+    pub initial_column_count: usize,
+}
 
 /// Maximum time to wait for the layout-apply worker before giving up and
 /// pausing the daemon. Raised from 1500ms to 5000ms so that transient CPU
@@ -479,6 +494,8 @@ pub(crate) struct AppState {
     /// the state lock. HICONs are app-owned shared handles — never
     /// destroyed here. Evicted on real window destroy.
     pub(crate) overview_icon_cache: HashMap<u64, Option<isize>>,
+    /// Active desktop-peek state, or `None` when not peeking.
+    pub(crate) desktop_peek: Option<DesktopPeekState>,
     /// Whether tiling is paused.
     pub(crate) paused: bool,
     /// Guard flag to suppress MovedOrResized events during apply_layout().
@@ -974,6 +991,7 @@ impl AppState {
             pending_create_retry: HashMap::new(),
             move_to_monitor_target: None,
             hidden_column_widths: HashMap::new(),
+            desktop_peek: None,
             move_origins: HashMap::new(),
             stashed_monitor_layouts: HashMap::new(),
             window_managed_at: HashMap::new(),

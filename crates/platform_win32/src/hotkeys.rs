@@ -606,8 +606,13 @@ pub mod vk {
     pub const EQUALS: u32 = 0xBB; // '='
     pub const BRACKET_LEFT: u32 = 0xDB; // '['
     pub const BRACKET_RIGHT: u32 = 0xDD; // ']'
+    pub const BACKSLASH: u32 = 0xDC; // '\'
     pub const COMMA: u32 = 0xBC; // ','
     pub const PERIOD: u32 = 0xBE; // '.'
+    pub const SEMICOLON: u32 = 0xBA; // ';'
+    pub const QUOTE: u32 = 0xDE; // '\''
+    pub const SLASH: u32 = 0xBF; // '/'
+    pub const GRAVE: u32 = 0xC0; // '`'
 }
 
 /// Parse a virtual key code from a key name string.
@@ -677,6 +682,11 @@ pub fn parse_vk(key: &str) -> Option<u32> {
         "PERIOD" | "." => Some(vk::PERIOD),
         "BRACKET_LEFT" | "[" => Some(vk::BRACKET_LEFT),
         "BRACKET_RIGHT" | "]" => Some(vk::BRACKET_RIGHT),
+        "BACKSLASH" | "\\" => Some(vk::BACKSLASH),
+        "SEMICOLON" | ";" => Some(vk::SEMICOLON),
+        "QUOTE" | "APOSTROPHE" | "'" => Some(vk::QUOTE),
+        "SLASH" | "/" => Some(vk::SLASH),
+        "GRAVE" | "BACKTICK" | "`" => Some(vk::GRAVE),
         _ => None,
     }
 }
@@ -749,6 +759,11 @@ pub fn format_hotkey(modifiers: Modifiers, vk: u32) -> Option<String> {
         vk::PERIOD => ".".to_string(),
         vk::BRACKET_LEFT => "[".to_string(),
         vk::BRACKET_RIGHT => "]".to_string(),
+        vk::BACKSLASH => "\\".to_string(),
+        vk::SEMICOLON => ";".to_string(),
+        vk::QUOTE => "'".to_string(),
+        vk::SLASH => "/".to_string(),
+        vk::GRAVE => "`".to_string(),
         _ => return None,
     };
 

@@ -370,6 +370,13 @@ impl AppState {
             for ws_vec in self.workspaces.values() {
                 for workspace in ws_vec.iter() {
                     for &wid in &workspace.all_window_ids() {
+                        // Skip sentinel pseudo-HWNDs — they are not real Win32
+                        // windows and would always fail is_window_alive_and_visible.
+                        if wid == crate::state::DESKTOP_PEEK_HWND
+                            || wid == crate::state::DRAG_PLACEHOLDER_HWND
+                        {
+                            continue;
+                        }
                         let alive_visible = is_window_alive_and_visible(wid);
                         let gone = !alive_visible && !workspace.is_minimized(wid);
                         let unmanageable = alive_visible && is_excluded_tool_window_hwnd(wid);

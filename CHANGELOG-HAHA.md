@@ -25,6 +25,15 @@
     respect the rotated axis.
   - Overview workspace panels are arranged side by side as tall columns instead of horizontal stripes.
     Window cards are shown in their physical (portrait) orientation, stacked top to bottom.
+- Desktop peek: two shortcuts reveal the desktop behind the focused window on LTR horizontal monitors.
+  `Ctrl+Alt+'` keeps the focused window in its current position — the ghost fills the space to its left
+  (at least `layout.desktop_peek_min_width`, default 25%). The only exception: if the window is already
+  at the left edge, it shifts right by the minimum width to make room for the ghost.
+  `Ctrl+Alt+Shift+'` always moves the focused window to the minimum-width mark, regardless of where it
+  started.
+  The ghost area is click-through; the desktop beneath remains interactive. Peek is monitor-local —
+  operations on other monitors leave it intact. Any window operation on the peeked monitor (focus change,
+  move, close, minimize, maximize, fullscreen) exits peek and restores the previous scroll position.
 - Right Ctrl and Right Alt are interchangeable with their left counterparts in hotkeys.
   Opt in with `behavior.symmetric_modifiers = true` in the config. Useful for one-handed operation.
 

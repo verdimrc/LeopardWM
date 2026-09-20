@@ -1054,6 +1054,8 @@ impl AppState {
         self.recently_hidden_hwnds
             .retain(|_, t| t.elapsed() < RECENTLY_HIDDEN_TTL);
 
+        self.maybe_exit_desktop_peek_for_window(hwnd);
+
         // Clear stale focus reference before sampling replacement evidence.
         let was_tracked_focus = self.previous_focused_hwnd == Some(hwnd);
         if was_tracked_focus {
@@ -1682,6 +1684,19 @@ impl AppState {
                     }
                 }
             }
+            // Exit desktop peek when a genuine focus change lands on the peeked
+            // monitor for a DIFFERENT window. Placed AFTER the stale-layout guard
+            // so spurious EVENT_SYSTEM_FOREGROUND echoes from SetWindowPos callbacks
+            // are already dropped and never reach here. Focusing a window on any
+            // other monitor leaves peek intact — peek is monitor-local.
+            let should_exit_peek = self
+                .desktop_peek
+                .as_ref()
+                .is_some_and(|ps| ps.monitor == monitor_id && ps.focused_hwnd != hwnd);
+            if should_exit_peek {
+                self.exit_desktop_peek();
+            }
+
             self.follow_workspace_without_stealing_focus(monitor_id, ws_idx);
 
             let viewport_width = self.viewport_width_for(monitor_id);
@@ -1880,6 +1895,7 @@ impl AppState {
 
     /// Handle a window-minimized event.
     fn on_window_minimized(&mut self, hwnd: u64) {
+        self.maybe_exit_desktop_peek_for_window(hwnd);
         if let Some((monitor_id, ws_idx)) = self.find_window_workspace(hwnd) {
             let viewport_width = self.viewport_width_for(monitor_id);
             let layout_viewport = self.layout_viewport(monitor_id);
@@ -2483,6 +2499,7 @@ impl AppState {
                 self.is_application_fullscreen(hwnd),
                 is_maximized,
             ) {
+                self.maybe_exit_desktop_peek_for_window(hwnd);
                 self.observe_tiled_window_maximized(hwnd);
             }
             return;
@@ -2498,6 +2515,7 @@ impl AppState {
         let lifecycle = application_fullscreen_lifecycle(prior, session);
         match lifecycle {
             ApplicationFullscreenLifecycle::Enter | ApplicationFullscreenLifecycle::Reassign => {
+                self.maybe_exit_desktop_peek_for_window(hwnd);
                 let session = session.expect("fullscreen lifecycle requires a session");
                 self.application_fullscreen.insert(hwnd, session);
                 self.stop_ghosting_window(hwnd);

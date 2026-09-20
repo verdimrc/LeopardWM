@@ -160,6 +160,10 @@ pub struct LayoutConfig {
     /// Example: `rtl_monitor_indices = [2]` enables this on \\.\DISPLAY2.
     #[serde(default)]
     pub rtl_monitor_indices: Vec<u32>,
+    /// Minimum width of the ghost column inserted by the desktop-peek toggle,
+    /// as a fraction of the monitor viewport width. Default: 0.25 (25%).
+    #[serde(default = "default_desktop_peek_min_width")]
+    pub desktop_peek_min_width: f64,
     // Legacy fields kept for backward-compatible deserialization; not used.
     #[serde(default, skip_serializing)]
     #[allow(dead_code)]
@@ -173,6 +177,10 @@ pub struct LayoutConfig {
     #[serde(default, skip_serializing)]
     #[allow(dead_code)]
     max_column_width: Option<i32>,
+}
+
+fn default_desktop_peek_min_width() -> f64 {
+    0.25
 }
 
 fn default_width_presets() -> Vec<f64> {
@@ -201,6 +209,7 @@ impl Default for LayoutConfig {
             default_width_preset: default_width_preset(),
             height_presets: default_height_presets(),
             rtl_monitor_indices: Vec::new(),
+            desktop_peek_min_width: default_desktop_peek_min_width(),
             outer_gap: None,
             default_column_width: None,
             min_column_width: None,

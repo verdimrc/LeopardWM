@@ -73,6 +73,37 @@ fn is_focus_navigation(cmd: &IpcCommand) -> bool {
     )
 }
 
+/// Returns true for commands that should NOT auto-exit desktop peek.
+///
+/// Peek is monitor-local, so:
+/// - The peek-toggle commands themselves are exempt.
+/// - Pure read-only queries are exempt.
+/// - FocusMonitor* commands move focus to another monitor and must not
+///   exit peek (the peeked monitor is unaffected).
+fn is_peek_passthrough_command(cmd: &IpcCommand) -> bool {
+    use IpcCommand::*;
+    matches!(
+        cmd,
+        ToggleDesktopPeek
+            | ToggleDesktopPeekAnchored
+            | QueryWorkspace
+            | QueryFocused
+            | QueryHotkeys
+            | QueryStatus
+            | QueryAllWindows
+            | HealthCheck
+            | GetAutoStart
+            | Subscribe { .. }
+            // FocusMonitor* moves focus to another monitor and must not exit
+            // peek — the peeked monitor is unaffected. on_window_focused also
+            // guards this, but the IPC gate fires before that event arrives.
+            | FocusMonitorLeft
+            | FocusMonitorRight
+            | FocusMonitorUp
+            | FocusMonitorDown
+    )
+}
+
 /// Classify how `cmd` should behave when the focused workspace is fullscreen.
 fn fullscreen_policy(cmd: &IpcCommand) -> FullscreenPolicy {
     use IpcCommand::*;
@@ -302,6 +333,18 @@ impl AppState {
     pub(crate) fn handle_command(&mut self, cmd: IpcCommand) -> IpcResponse {
         if let Some(resp) = self.apply_fullscreen_policy(&cmd) {
             return resp;
+        }
+        // Exit desktop peek before any window-operation command, but only when
+        // the command targets the peeked monitor. Operations on other monitors
+        // are local to those monitors and must not disturb peek. Queries,
+        // health checks, and the peek-toggle commands themselves are exempt.
+        if self
+            .desktop_peek
+            .as_ref()
+            .is_some_and(|s| s.monitor == self.focused_monitor)
+            && !is_peek_passthrough_command(&cmd)
+        {
+            self.exit_desktop_peek();
         }
         // "Mouse follows focus" (#43): warp the cursor onto the focused window
         // after a focus-navigation command, but only if focus actually moved to
@@ -539,6 +582,14 @@ impl AppState {
                     "Subscribe must be handled in stream mode by the IPC server, not the main \
                      command loop — this is an internal routing bug.",
                 )
+            }
+            IpcCommand::ToggleDesktopPeek => {
+                self.toggle_desktop_peek(false);
+                IpcResponse::Ok
+            }
+            IpcCommand::ToggleDesktopPeekAnchored => {
+                self.toggle_desktop_peek(true);
+                IpcResponse::Ok
             }
             IpcCommand::ToggleOverview => {
                 self.toggle_overview();
@@ -1687,6 +1738,140 @@ impl AppState {
         self.sync_foreground_window();
         info!("Set active tab: column={}, tab={}", column, tab);
         IpcResponse::Ok
+    }
+
+    pub(crate) fn toggle_desktop_peek(&mut self, anchor: bool) {
+        if self.desktop_peek.is_some() {
+            self.exit_desktop_peek();
+        } else {
+            self.enter_desktop_peek(anchor);
+        }
+    }
+
+    fn enter_desktop_peek(&mut self, anchor: bool) {
+        let monitor = self.focused_monitor;
+
+        // Desktop peek is only implemented for LTR horizontal monitors.
+        if let Some(m) = self.monitors.get(&monitor) {
+            if crate::monitors::Orientation::of(m.work_area).is_vertical() {
+                tracing::info!(
+                    "desktop_peek: not supported on vertical monitor {} — skipping",
+                    m.device_name
+                );
+                return;
+            }
+            if self.config.layout.is_rtl_monitor(&m.device_name) {
+                tracing::info!(
+                    "desktop_peek: not supported on RTL monitor {} — skipping",
+                    m.device_name
+                );
+                return;
+            }
+        }
+
+        // Require the OS foreground window to be a managed window on this
+        // monitor. Checking the live OS state (not previous_focused_hwnd) avoids
+        // a race where an app calls SetForegroundWindow on itself after being
+        // repositioned by exit_desktop_peek, making previous_focused_hwnd
+        // non-None even though the user never intentionally re-focused it.
+        let fg_hwnd = leopardwm_platform_win32::get_foreground_window().unwrap_or(0);
+        let fg_on_monitor = self
+            .find_window_workspace(fg_hwnd)
+            .is_some_and(|(mid, _)| mid == monitor);
+        if !fg_on_monitor {
+            tracing::info!("desktop_peek: no managed window focused on monitor {} — skipping", monitor);
+            return;
+        }
+
+        let ws_idx = self.active_workspace_idx(monitor);
+        let vp = self.layout_viewport(monitor);
+        let min_w = ((vp.width as f64 * self.config.layout.desktop_peek_min_width).round() as i32)
+            .max(100);
+
+        let Some(ws) = self
+            .workspaces
+            .get_mut(&monitor)
+            .and_then(|v| v.get_mut(ws_idx))
+        else {
+            return;
+        };
+        if ws.is_empty() {
+            return;
+        }
+        // Bail if a ghost column is already present (e.g. from a stale state).
+        if ws.contains_window(crate::state::DESKTOP_PEEK_HWND) {
+            return;
+        }
+
+        let saved_scroll = ws.scroll_offset();
+        let initial_column_count = ws.column_count();
+        let ghost_layout_x = ws.focused_column_layout_x();
+
+        // anchor=true: ghost is as wide as B's current screen-left offset so B
+        // stays in place. anchor=false: ghost uses the configured minimum width.
+        let ghost_w = if anchor {
+            let b_screen_x = (ghost_layout_x as f64 - saved_scroll).round() as i32;
+            b_screen_x.max(min_w)
+        } else {
+            min_w
+        };
+
+        let focused_col = ws.focused_column_index();
+
+        if ws
+            .insert_window_at_column_no_focus(
+                crate::state::DESKTOP_PEEK_HWND,
+                Some(ghost_w),
+                focused_col,
+            )
+            .is_err()
+        {
+            return;
+        }
+
+        ws.set_scroll_offset_immediate(ghost_layout_x as f64);
+
+        self.desktop_peek = Some(crate::state::DesktopPeekState {
+            monitor,
+            ws_idx,
+            saved_scroll,
+            focused_hwnd: fg_hwnd,
+            initial_column_count,
+        });
+
+        if let Err(e) = self.apply_layout() {
+            tracing::warn!("desktop peek apply_layout: {e}");
+        }
+    }
+
+    pub(crate) fn exit_desktop_peek(&mut self) {
+        let Some(state) = self.desktop_peek.take() else {
+            return;
+        };
+        let Some(ws) = self
+            .workspaces
+            .get_mut(&state.monitor)
+            .and_then(|v| v.get_mut(state.ws_idx))
+        else {
+            return;
+        };
+        let _ = ws.remove_window(crate::state::DESKTOP_PEEK_HWND);
+        ws.set_scroll_offset_immediate(state.saved_scroll);
+        if let Err(e) = self.apply_layout() {
+            tracing::warn!("desktop peek restore apply_layout: {e}");
+        }
+    }
+
+    /// Auto-exit desktop peek when the window that triggered peek is closed,
+    /// minimized, maximized, or enters fullscreen.
+    pub(crate) fn maybe_exit_desktop_peek_for_window(&mut self, hwnd: u64) {
+        if self
+            .desktop_peek
+            .as_ref()
+            .is_some_and(|s| s.focused_hwnd == hwnd)
+        {
+            self.exit_desktop_peek();
+        }
     }
 }
 

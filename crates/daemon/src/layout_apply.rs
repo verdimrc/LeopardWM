@@ -425,6 +425,8 @@ impl AppState {
                 });
             }
         }
+        // Desktop-peek ghost column is always a sentinel — never sent to Win32.
+        all_placements.retain(|p| p.window_id != crate::state::DESKTOP_PEEK_HWND);
 
         let dispatched_placements = self.filter_application_fullscreen_placements(all_placements);
         let maximized = self.observe_maximized_placements(&dispatched_placements);
@@ -540,6 +542,40 @@ impl AppState {
         // paused apply path cannot leave constraints cleared indefinitely.
         self.commit_pending_min_size_clears();
 
+        // While desktop peek is active, handle structural changes in the peeked
+        // workspace. A new window arriving (column count grew) auto-exits peek
+        // inline so the monitor returns to normal tiling immediately. Otherwise,
+        // re-anchor the scroll so the ghost stays at screen_x=0 (e.g. when an
+        // unrelated column on the same workspace is removed).
+        if let Some(ref ps) = self.desktop_peek {
+            let (mon, ws_idx, initial_col_count, saved_scroll) =
+                (ps.monitor, ps.ws_idx, ps.initial_column_count, ps.saved_scroll);
+            if let Some(ws) = self
+                .workspaces
+                .get_mut(&mon)
+                .and_then(|v| v.get_mut(ws_idx))
+            {
+                // column_count() includes the ghost; real columns = count - 1.
+                let real_col_count = ws.column_count().saturating_sub(1);
+                if real_col_count > initial_col_count {
+                    // A new window landed on the peeked workspace — exit peek
+                    // inline to avoid recursion (exit_desktop_peek calls
+                    // apply_layout; doing it here would re-enter).
+                    let _ = ws.remove_window(crate::state::DESKTOP_PEEK_HWND);
+                    ws.set_scroll_offset_immediate(saved_scroll);
+                    self.desktop_peek = None;
+                    tracing::info!(
+                        "desktop_peek: new window on peeked monitor {} — auto-exit",
+                        mon
+                    );
+                } else if let Some(ghost_x) =
+                    ws.column_layout_x_for_window(crate::state::DESKTOP_PEEK_HWND)
+                {
+                    ws.set_scroll_offset_immediate(ghost_x as f64);
+                }
+            }
+        }
+
         let mut all_placements = self.collect_apply_placements();
         let logically_empty = all_placements.is_empty();
 
@@ -557,6 +593,8 @@ impl AppState {
                 });
             }
         }
+        // Desktop-peek ghost column is always a sentinel — never sent to Win32.
+        all_placements.retain(|p| p.window_id != crate::state::DESKTOP_PEEK_HWND);
 
         // Fast path: unchanged placements and visible-set need no worker
         // unless a post-animation landing is pending. Spawning

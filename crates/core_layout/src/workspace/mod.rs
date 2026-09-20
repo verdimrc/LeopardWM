@@ -357,6 +357,30 @@ impl Workspace {
         self.scroll_offset
     }
 
+    /// Layout X coordinate of the focused column (sum of preceding column widths + gaps).
+    /// Returns 0 for an empty workspace.
+    pub fn focused_column_layout_x(&self) -> i32 {
+        let gap = self.gap.max(0);
+        let mut x = 0i32;
+        for (i, col) in self.columns.iter().enumerate() {
+            if i == self.focused_column {
+                return x;
+            }
+            if self.is_column_active(col) {
+                x = x
+                    .saturating_add(self.effective_column_width(col))
+                    .saturating_add(gap);
+            }
+        }
+        x
+    }
+
+    /// Set the scroll offset immediately, cancelling any in-progress animation.
+    pub fn set_scroll_offset_immediate(&mut self, offset: f64) {
+        self.scroll_offset = offset;
+        self.active_animation = None;
+    }
+
     /// Get a slice of all columns.
     pub fn columns(&self) -> &[Column] {
         &self.columns
@@ -371,6 +395,24 @@ impl Workspace {
     pub fn column_width_for_window(&self, window_id: WindowId) -> Option<i32> {
         let (col_idx, _) = self.find_window_location(window_id)?;
         self.columns.get(col_idx).map(|c| c.width)
+    }
+
+    /// Return the layout-space x coordinate of the column containing `window_id`.
+    /// Uses the same active-column accounting as `compute_placements` (inactive
+    /// columns — all windows minimized — do not advance the strip position).
+    pub fn column_layout_x_for_window(&self, window_id: WindowId) -> Option<i32> {
+        let (col_idx, _) = self.find_window_location(window_id)?;
+        let gap = self.gap.max(0);
+        let mut x = 0i32;
+        for (i, col) in self.columns.iter().enumerate() {
+            if i == col_idx {
+                return Some(x);
+            }
+            if self.is_column_active(col) {
+                x = x.saturating_add(self.effective_column_width(col)).saturating_add(gap);
+            }
+        }
+        None
     }
 
     /// Find a window's location in the workspace.
