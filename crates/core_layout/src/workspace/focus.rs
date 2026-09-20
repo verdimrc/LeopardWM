@@ -26,8 +26,13 @@ impl Workspace {
         if self.columns.is_empty() {
             self.columns.push(new_column);
             self.focused_column = 0;
+        } else if self.rtl {
+            // RTL: insert to the left of the focused column
+            let insert_pos = self.focused_column;
+            self.columns.insert(insert_pos, new_column);
+            self.focused_column = insert_pos;
         } else {
-            // Insert to the right of the focused column
+            // LTR: insert to the right of the focused column
             let insert_pos = self.focused_column + 1;
             self.columns.insert(insert_pos, new_column);
             self.focused_column = insert_pos;
@@ -140,13 +145,16 @@ impl Workspace {
 
         self.insert_window(window_id, width)?;
 
-        // insert_window inserts at saved_col + 1 (or 0 if was empty).
+        // insert_window inserts adjacent to saved_col (or 0 if was empty).
         // If the workspace was empty, there's nothing to restore.
-        if saved_col < self.columns.len() && self.columns.len() > 1 {
-            // The new column was inserted at saved_col + 1, which shifted
-            // nothing before it, so saved_col is still valid.
-            self.focused_column = saved_col;
-            self.focused_window_in_column = saved_win;
+        if self.columns.len() > 1 {
+            // LTR: new column at saved_col+1, old column still at saved_col.
+            // RTL: new column at saved_col, old column shifted to saved_col+1.
+            let restore = if self.rtl { saved_col + 1 } else { saved_col };
+            if restore < self.columns.len() {
+                self.focused_column = restore;
+                self.focused_window_in_column = saved_win;
+            }
         }
 
         Ok(())

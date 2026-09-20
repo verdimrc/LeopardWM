@@ -289,12 +289,12 @@ impl AppState {
             };
             // RTL monitors right-anchor the panel within the full slot so
             // content accumulates from the right edge, matching the strip.
-            let panel_x = if !orient.is_vertical() && rtl {
+            let panel_x = if rtl {
                 geom.panel.x + geom.panel.width - panel_w
             } else {
                 geom.panel.x
             };
-            if !orient.is_vertical() && rtl {
+            if rtl {
                 let dx = panel_x - geom.panel.x;
                 for card in &mut cards {
                     card.rect.x += dx;
