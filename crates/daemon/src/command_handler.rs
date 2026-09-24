@@ -756,7 +756,7 @@ impl AppState {
             NewWindowPlacement::InColumn => NewWindowPlacement::NewColumn,
         };
         self.config.behavior.new_window_placement = next;
-        let _ = self.config.save();
+        // Transient: only the settings GUI configurator persists config.toml.
         info!("New-window placement set to {:?}", next);
         IpcResponse::Ok
     }

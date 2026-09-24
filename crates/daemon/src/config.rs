@@ -1598,7 +1598,14 @@ impl Config {
     /// Save configuration to the primary config path.
     ///
     /// Serializes the config to TOML and writes to `config_paths()[0]`.
-    /// Creates parent directories if they don't exist.
+    /// Creates parent directories if they don't exist. Only the settings
+    /// GUI configurator calls this — runtime toggles (tray menu, hotkeys,
+    /// IPC commands) mutate `Config` in memory only, so config.toml never
+    /// changes underneath the user outside of an explicit configurator save.
+    /// If a config file already exists at that path, it's copied to
+    /// `config.toml.bak` (single rotating backup) before being overwritten.
+    /// If that backup fails, the save is aborted and the existing config.toml
+    /// is left untouched.
     pub fn save(&self) -> Result<()> {
         // Unit tests exercise command handlers that persist config; never
         // let them overwrite the developer's real config file.
@@ -1614,6 +1621,17 @@ impl Config {
             fs::create_dir_all(parent).with_context(|| {
                 format!("Failed to create config directory: {}", parent.display())
             })?;
+        }
+
+        if path.exists() {
+            let backup_path = path.with_extension("toml.bak");
+            fs::copy(path, &backup_path).with_context(|| {
+                format!(
+                    "Failed to back up existing config to {}; aborting save",
+                    backup_path.display()
+                )
+            })?;
+            tracing::info!("Backed up previous config to: {}", backup_path.display());
         }
 
         let content = toml::to_string_pretty(self).context("Failed to serialize config to TOML")?;

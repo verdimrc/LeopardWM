@@ -2283,7 +2283,8 @@ async fn handle_tray_event(ctx: &mut EventLoopCtx<'_>, tray_event: tray::TrayEve
             } else {
                 state.hide_border();
             }
-            let _ = state.config.save();
+            // Tray toggles are transient: only the settings GUI configurator
+            // persists config.toml.
         }
         tray::TrayEvent::ToggleFocusNewWindows => {
             let mut state = ctx.state.lock().await;
@@ -2292,7 +2293,6 @@ async fn handle_tray_event(ctx: &mut EventLoopCtx<'_>, tray_event: tray::TrayEve
                 "Tray: Focus new windows toggled to {}",
                 state.config.behavior.focus_new_windows
             );
-            let _ = state.config.save();
         }
         tray::TrayEvent::ToggleFocusFollowsMouse => {
             let enabled = {
@@ -2303,7 +2303,6 @@ async fn handle_tray_event(ctx: &mut EventLoopCtx<'_>, tray_event: tray::TrayEve
                     "Tray: Focus follows mouse toggled to {}",
                     state.config.behavior.focus_follows_mouse
                 );
-                let _ = state.config.save();
                 state.config.behavior.focus_follows_mouse
             };
             // Install or drop the hook now so the toggle takes effect without a
@@ -2323,7 +2322,6 @@ async fn handle_tray_event(ctx: &mut EventLoopCtx<'_>, tray_event: tray::TrayEve
                 "Tray: Hide off-screen taskbar buttons toggled to {}",
                 state.config.behavior.hide_offscreen_taskbar_buttons
             );
-            let _ = state.config.save();
             // Apply live: hide off-view buttons, or restore all when turned off.
             state.sync_taskbar_buttons();
         }
@@ -2358,7 +2356,6 @@ async fn handle_tray_event(ctx: &mut EventLoopCtx<'_>, tray_event: tray::TrayEve
                 if let Err(e) = state.apply_layout() {
                     warn!("Layout apply after centering change failed: {}", e);
                 }
-                let _ = state.config.save();
             }
             sync_tray_toggles(ctx.tray_manager, &state.config);
         }
@@ -2376,7 +2373,6 @@ async fn handle_tray_event(ctx: &mut EventLoopCtx<'_>, tray_event: tray::TrayEve
                 if let Err(e) = state.apply_layout() {
                     warn!("Layout apply after centering change failed: {}", e);
                 }
-                let _ = state.config.save();
             }
             sync_tray_toggles(ctx.tray_manager, &state.config);
         }
@@ -2390,7 +2386,6 @@ async fn handle_tray_event(ctx: &mut EventLoopCtx<'_>, tray_event: tray::TrayEve
                 if let Err(e) = state.apply_layout() {
                     warn!("Layout apply after centering change failed: {}", e);
                 }
-                let _ = state.config.save();
             }
             sync_tray_toggles(ctx.tray_manager, &state.config);
         }
@@ -2399,7 +2394,6 @@ async fn handle_tray_event(ctx: &mut EventLoopCtx<'_>, tray_event: tray::TrayEve
             if state.config.behavior.new_window_placement != config::NewWindowPlacement::NewColumn {
                 state.config.behavior.new_window_placement = config::NewWindowPlacement::NewColumn;
                 info!("Tray: New-window placement set to NewColumn");
-                let _ = state.config.save();
             }
             sync_tray_toggles(ctx.tray_manager, &state.config);
         }
@@ -2408,7 +2402,6 @@ async fn handle_tray_event(ctx: &mut EventLoopCtx<'_>, tray_event: tray::TrayEve
             if state.config.behavior.new_window_placement != config::NewWindowPlacement::InColumn {
                 state.config.behavior.new_window_placement = config::NewWindowPlacement::InColumn;
                 info!("Tray: New-window placement set to InColumn");
-                let _ = state.config.save();
             }
             sync_tray_toggles(ctx.tray_manager, &state.config);
         }
