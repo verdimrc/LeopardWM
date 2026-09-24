@@ -2872,7 +2872,7 @@ impl AppState {
                     hwnd,
                     queued_at.elapsed().as_millis()
                 );
-                self.on_window_created(hwnd);
+                self.on_window_created(hwnd, 0);
             }
             return;
         }
