@@ -92,3 +92,14 @@
 - Wrong window targeted by commands after layout animation completes (briefly tested; no consistent repro
   trigger).
 - Window resizing after opening a new window now targets the focused window.
+- Moving a window to another monitor now scales its column width proportionally to the target monitor's
+  viewport width, instead of resetting to a default width.
+- Cross-monitor window moves:
+  - Fixed: after moving a window to a new monitor, monitor-focus shortcuts must also focus the new monitor.
+  - Fixed apps never joining the tiled layout when they don't report their initial window position.
+  - Fixed incorrect sizing when moving to a monitor with different DPI scaling.
+  - Fixed a window appearing wider than the target monitor (off-screen on both edges) when moving to a
+    narrower monitor.
+
+  Note: main's `ed2f51f` and `00e9b66` fix DPI rescaling on display-settings changes and floating/monitor-removal
+  edge cases; these are different bugs than the ones above.
