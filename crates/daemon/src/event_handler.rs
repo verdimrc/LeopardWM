@@ -907,8 +907,16 @@ impl AppState {
                         workspace.add_floating(hwnd, rect).is_ok()
                     }
                     config::WindowAction::Tile => {
-                        let in_column = self.config.behavior.new_window_placement
-                            == config::NewWindowPlacement::InColumn
+                        // One-shot placement override (ToggleNewWindowPlacementOnce)
+                        // takes precedence over the persistent setting for this
+                        // window only, then is cleared regardless of whether it
+                        // ends up applied below (e.g. a rule_slot bypasses it) —
+                        // a tiled window's appearance is what consumes it.
+                        let effective_placement = self
+                            .next_window_placement_override
+                            .take()
+                            .unwrap_or(self.config.behavior.new_window_placement);
+                        let in_column = effective_placement == config::NewWindowPlacement::InColumn
                             && workspace.column_count() > 0;
                         let ok = if let Some(slot) = rule_slot {
                             // A slot rule opens the window as its own column at

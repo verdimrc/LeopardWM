@@ -9214,6 +9214,20 @@ fn test_cmd_reload() {
 }
 
 #[test]
+fn test_cmd_reload_clears_active_once_override() {
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    state.handle_command(IpcCommand::ToggleNewWindowPlacementOnce);
+    assert!(state.next_window_placement_override.is_some());
+
+    let resp = state.handle_command(IpcCommand::Reload);
+    assert_eq!(resp, IpcResponse::Ok);
+    assert_eq!(
+        state.next_window_placement_override, None,
+        "reload should not let a stale one-shot override survive a config change"
+    );
+}
+
+#[test]
 fn test_cmd_query_all_windows() {
     let mut state = AppState::new_with_config(test_config(), test_monitors());
     let resp = state.handle_command(IpcCommand::QueryAllWindows);
@@ -14317,6 +14331,94 @@ fn test_toggle_new_window_placement_command() {
         state.config.behavior.new_window_placement,
         crate::config::NewWindowPlacement::NewColumn
     );
+}
+
+#[test]
+fn test_toggle_new_window_placement_cancels_active_once_override() {
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    // Activate a one-shot override.
+    state.handle_command(IpcCommand::ToggleNewWindowPlacementOnce);
+    assert_eq!(
+        state.next_window_placement_override,
+        Some(crate::config::NewWindowPlacement::InColumn)
+    );
+
+    // The permanent switch must cancel it, not just flip the persistent
+    // setting underneath an override that would otherwise keep winning.
+    state.handle_command(IpcCommand::ToggleNewWindowPlacement);
+    assert_eq!(state.next_window_placement_override, None);
+    assert_eq!(
+        state.config.behavior.new_window_placement,
+        crate::config::NewWindowPlacement::InColumn
+    );
+}
+
+#[test]
+fn test_toggle_new_window_placement_once_activates_and_cancels() {
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    assert_eq!(state.next_window_placement_override, None);
+
+    // Persistent setting is NewColumn (default); activating should pick the opposite.
+    let resp = state.handle_command(IpcCommand::ToggleNewWindowPlacementOnce);
+    assert_eq!(resp, IpcResponse::Ok);
+    assert_eq!(
+        state.next_window_placement_override,
+        Some(crate::config::NewWindowPlacement::InColumn)
+    );
+    // Persistent setting itself is untouched.
+    assert_eq!(
+        state.config.behavior.new_window_placement,
+        crate::config::NewWindowPlacement::NewColumn
+    );
+
+    // Pressing again while active cancels it instead of activating a new one.
+    state.handle_command(IpcCommand::ToggleNewWindowPlacementOnce);
+    assert_eq!(state.next_window_placement_override, None);
+}
+
+#[test]
+fn test_new_window_placement_once_consumed_on_next_tiled_window() {
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    assert_eq!(
+        state.config.behavior.new_window_placement,
+        crate::config::NewWindowPlacement::NewColumn
+    );
+
+    // First window: its own column, regardless of placement mode.
+    state
+        .injected_window_info
+        .insert(100, make_test_window_info(100));
+    state.handle_window_event(WindowEvent::Created(100, 0));
+    assert_eq!(state.focused_workspace().unwrap().column_count(), 1);
+
+    // Activate a one-shot override to InColumn.
+    state.handle_command(IpcCommand::ToggleNewWindowPlacementOnce);
+    assert_eq!(
+        state.next_window_placement_override,
+        Some(crate::config::NewWindowPlacement::InColumn)
+    );
+
+    // Second window: consumes the override and stacks into the existing column.
+    state
+        .injected_window_info
+        .insert(200, make_test_window_info(200));
+    state.handle_window_event(WindowEvent::Created(200, 0));
+    let ws = state.focused_workspace().unwrap();
+    assert_eq!(ws.column_count(), 1, "override placed the window in-column");
+    assert_eq!(ws.columns()[0].len(), 2);
+    assert_eq!(
+        state.next_window_placement_override, None,
+        "override is consumed after one tiled window"
+    );
+
+    // Third window: override already consumed, falls back to the persistent
+    // NewColumn setting.
+    state
+        .injected_window_info
+        .insert(300, make_test_window_info(300));
+    state.handle_window_event(WindowEvent::Created(300, 0));
+    let ws = state.focused_workspace().unwrap();
+    assert_eq!(ws.column_count(), 2, "persistent setting resumes after consumption");
 }
 
 #[test]

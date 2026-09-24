@@ -17,7 +17,7 @@ use std::sync::{
     mpsc, Arc, Mutex,
 };
 use thiserror::Error;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use tray_icon::{
     menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu},
     TrayIconBuilder,
@@ -149,6 +149,8 @@ pub const CENTERING_JUST_IN_VIEW: u8 = 1;
 pub const CENTERING_ON_OVERFLOW: u8 = 2;
 pub const PLACEMENT_NEW_COLUMN: u8 = 0;
 pub const PLACEMENT_IN_COLUMN: u8 = 1;
+/// Sentinel for `once_placement`: no one-shot override is active.
+const ONCE_INACTIVE: u8 = 255;
 
 /// Shared state between the caller and the message-loop thread.
 ///
@@ -165,6 +167,10 @@ struct SharedState {
     auto_start: AtomicBool,
     centering_mode: AtomicU8,
     placement_mode: AtomicU8,
+    /// Which placement the one-shot override (`ToggleNewWindowPlacementOnce`)
+    /// is active for — `PLACEMENT_NEW_COLUMN`, `PLACEMENT_IN_COLUMN`, or
+    /// `ONCE_INACTIVE` if none is active. Drives the icon badge color.
+    once_placement: AtomicU8,
     /// `Some(tag)` when a newer release has been observed; `None` otherwise.
     available_update: Mutex<Option<String>>,
 }
@@ -233,6 +239,9 @@ impl TrayManager {
             auto_start: AtomicBool::new(initial.auto_start),
             centering_mode: AtomicU8::new(initial.centering_mode),
             placement_mode: AtomicU8::new(initial.placement_mode),
+            // Always starts inactive: the one-shot override is session-only
+            // runtime state that never survives daemon startup.
+            once_placement: AtomicU8::new(ONCE_INACTIVE),
             available_update: Mutex::new(None),
         });
         let shared_for_thread = shared.clone();
@@ -363,6 +372,30 @@ impl TrayManager {
             win32_msg::PostThreadMessageW(
                 self.msg_thread_id,
                 win32_msg::WM_APP_UPDATE_TOOLTIP,
+                0,
+                0,
+            );
+        }
+    }
+
+    /// Show or hide the one-shot new-window-placement badge on the tray icon.
+    /// `placement` is `Some(PLACEMENT_NEW_COLUMN | PLACEMENT_IN_COLUMN)` while
+    /// active (drives the badge color), or `None` when inactive. A no-op if
+    /// the requested state matches the current one, so it's cheap to call
+    /// unconditionally (e.g. after every window creation).
+    pub fn set_once_active(&self, placement: Option<u8>) {
+        let encoded = placement.unwrap_or(ONCE_INACTIVE);
+        if self.shared.once_placement.swap(encoded, Ordering::Relaxed) == encoded {
+            return;
+        }
+        unsafe {
+            // Reuses WM_APP_UPDATE_TOGGLES: its handler already recomputes
+            // the placement checkmarks and icon from current shared state
+            // (see refresh_placement_ui), which is exactly what an
+            // once_placement change needs too.
+            win32_msg::PostThreadMessageW(
+                self.msg_thread_id,
+                win32_msg::WM_APP_UPDATE_TOGGLES,
                 0,
                 0,
             );
@@ -528,13 +561,11 @@ fn run_tray_thread(
                         items
                             .centering_on_overflow_item
                             .set_checked(cm == CENTERING_ON_OVERFLOW);
-                        let pm = shared.placement_mode.load(Ordering::Relaxed);
-                        items
-                            .placement_new_column_item
-                            .set_checked(pm == PLACEMENT_NEW_COLUMN);
-                        items
-                            .placement_in_column_item
-                            .set_checked(pm == PLACEMENT_IN_COLUMN);
+                        // Placement checkmarks and the icon badge both depend
+                        // on the effective placement (once override if
+                        // active, else the persistent setting) — shared with
+                        // the once-override change path.
+                        refresh_placement_ui(&shared, &tray, &items);
                         continue;
                     }
                     win32_msg::WM_APP_UPDATE_RELEASE_INFO => {
@@ -751,8 +782,10 @@ fn build_tray(initial: &QuickToggleState) -> Result<(tray_icon::TrayIcon, TrayIt
     // Exit
     append(&MenuItem::with_id(menu_ids::EXIT, "Exit", true, None))?;
 
-    // Create the tray icon with a simple embedded icon
-    let icon = create_default_icon()?;
+    // Create the tray icon with a simple embedded icon. Never starts with
+    // the once-active badge: the one-shot placement override never survives
+    // startup. The persistent-InColumn badge reflects the loaded config.
+    let icon = create_icon(None, initial.placement_mode == PLACEMENT_IN_COLUMN)?;
 
     let tray = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
@@ -831,8 +864,68 @@ pub fn format_tooltip_text(
     tooltip
 }
 
-/// Create the tray icon from the embedded 32x32 PNG.
-fn create_default_icon() -> Result<tray_icon::Icon, TrayError> {
+/// Decode `SharedState::once_placement`'s sentinel-encoded atomic into the
+/// `Option<u8>` form `create_icon` expects.
+fn load_once_placement(shared: &SharedState) -> Option<u8> {
+    match shared.once_placement.load(Ordering::Relaxed) {
+        ONCE_INACTIVE => None,
+        p => Some(p),
+    }
+}
+
+/// The placement that will actually apply to the next tiled window: the
+/// one-shot override if active, otherwise the persistent setting. Drives the
+/// "In Focused Column" / "New Column" menu checkmarks, so an active once-
+/// override is reflected there too, not just the icon badge.
+fn effective_placement_in_column(shared: &SharedState) -> bool {
+    match load_once_placement(shared) {
+        Some(p) => p == PLACEMENT_IN_COLUMN,
+        None => shared.placement_mode.load(Ordering::Relaxed) == PLACEMENT_IN_COLUMN,
+    }
+}
+
+/// Recompute and repaint the placement checkmarks and the tray icon from
+/// current shared state. Both the persistent placement and the one-shot
+/// override change the effective placement, so both trigger this same
+/// refresh via `WM_APP_UPDATE_TOGGLES`.
+fn refresh_placement_ui(shared: &SharedState, tray: &tray_icon::TrayIcon, items: &TrayItems) {
+    let effective_in_column = effective_placement_in_column(shared);
+    items
+        .placement_new_column_item
+        .set_checked(!effective_in_column);
+    items
+        .placement_in_column_item
+        .set_checked(effective_in_column);
+
+    let once = load_once_placement(shared);
+    let persistent_in_column = shared.placement_mode.load(Ordering::Relaxed) == PLACEMENT_IN_COLUMN;
+    match create_icon(once, persistent_in_column) {
+        Ok(icon) => {
+            let _ = tray.set_icon(Some(icon));
+        }
+        Err(e) => warn!("Failed to rebuild tray icon for badge: {}", e),
+    }
+}
+
+/// Create the tray icon from the embedded 32x32 PNG, with a single badge dot
+/// in the bottom-right corner:
+///
+/// - `once_placement` active: amber for `PLACEMENT_IN_COLUMN`, light green
+///   for `PLACEMENT_NEW_COLUMN` — temporary by nature, so it takes priority.
+/// - Otherwise, `persistent_in_column`: blue — the persistent
+///   `new_window_placement = in_column` indicator.
+/// - Otherwise: no badge.
+///
+/// The once-active badge always wins over the persistent one. In practice the
+/// only case where both would apply is persistent InColumn (blue) with a
+/// one-shot override active for NewColumn (green) — activation always picks
+/// the opposite of the persistent setting, so an amber (once = InColumn)
+/// badge can only occur when persistent is NewColumn, where blue never
+/// applies.
+fn create_icon(
+    once_placement: Option<u8>,
+    persistent_in_column: bool,
+) -> Result<tray_icon::Icon, TrayError> {
     let png_bytes = include_bytes!("../../../assets/icon-32.png");
     let decoder = png::Decoder::new(std::io::Cursor::new(png_bytes));
     let mut reader = decoder
@@ -845,7 +938,7 @@ fn create_default_icon() -> Result<tray_icon::Icon, TrayError> {
     buf.truncate(info.buffer_size());
 
     // Convert RGB to RGBA if needed
-    let rgba = if info.color_type == png::ColorType::Rgb {
+    let mut rgba = if info.color_type == png::ColorType::Rgb {
         let mut out = Vec::with_capacity((info.width * info.height * 4) as usize);
         for chunk in buf.chunks(3) {
             out.extend_from_slice(chunk);
@@ -856,9 +949,54 @@ fn create_default_icon() -> Result<tray_icon::Icon, TrayError> {
         buf
     };
 
+    let fill = match once_placement {
+        Some(PLACEMENT_IN_COLUMN) => Some([255, 191, 0, 255]), // amber: once -> in column
+        Some(PLACEMENT_NEW_COLUMN) => Some([150, 245, 130, 255]), // light green: once -> new column
+        _ if persistent_in_column => Some([40, 130, 255, 255]), // blue: persistent in column
+        _ => None,
+    };
+    if let Some(fill) = fill {
+        draw_badge(&mut rgba, info.width, info.height, fill);
+    }
+
     tray_icon::Icon::from_rgba(rgba, info.width, info.height)
         .map_err(|e| TrayError::Icon(e.to_string()))
 }
+
+/// Stamp a small filled dot with a dark outline into the bottom-right
+/// corner of an RGBA buffer, for contrast against both light and dark
+/// taskbars.
+fn draw_badge(rgba: &mut [u8], width: u32, height: u32, fill: [u8; 4]) {
+    let radius = (f64::from(width.min(height)) * 0.25).round() as i32;
+    let cx = width as i32 - radius - 1;
+    let cy = height as i32 - radius - 1;
+    let outline_sq = (radius + 1) * (radius + 1);
+    let fill_sq = radius * radius;
+
+    let y_min = (cy - radius - 1).max(0);
+    let y_max = (cy + radius + 1).min(height as i32 - 1);
+    let x_min = (cx - radius - 1).max(0);
+    let x_max = (cx + radius + 1).min(width as i32 - 1);
+
+    for y in y_min..=y_max {
+        for x in x_min..=x_max {
+            let dx = x - cx;
+            let dy = y - cy;
+            let dist_sq = dx * dx + dy * dy;
+            if dist_sq > outline_sq {
+                continue;
+            }
+            let idx = ((y as u32 * width + x as u32) * 4) as usize;
+            if dist_sq > fill_sq {
+                // Dark outline ring for contrast against light and dark taskbars.
+                rgba[idx..idx + 4].copy_from_slice(&[30, 30, 30, 255]);
+            } else {
+                rgba[idx..idx + 4].copy_from_slice(&fill);
+            }
+        }
+    }
+}
+
 
 /// Errors that can occur during tray operations.
 #[derive(Debug, Error)]
@@ -879,8 +1017,131 @@ mod tests {
 
     #[test]
     fn test_create_default_icon() {
-        let icon = create_default_icon();
+        let icon = create_icon(None, false);
         assert!(icon.is_ok(), "Should create default icon successfully");
+    }
+
+    #[test]
+    fn test_create_icon_with_once_in_column_badge() {
+        let icon = create_icon(Some(PLACEMENT_IN_COLUMN), false);
+        assert!(icon.is_ok(), "Should create amber once-badged icon successfully");
+    }
+
+    #[test]
+    fn test_create_icon_with_once_new_column_badge() {
+        let icon = create_icon(Some(PLACEMENT_NEW_COLUMN), false);
+        assert!(icon.is_ok(), "Should create green once-badged icon successfully");
+    }
+
+    #[test]
+    fn test_create_icon_with_persistent_badge() {
+        let icon = create_icon(None, true);
+        assert!(icon.is_ok(), "Should create persistent-badged icon successfully");
+    }
+
+    #[test]
+    fn test_create_icon_with_both_badges() {
+        let icon = create_icon(Some(PLACEMENT_IN_COLUMN), true);
+        assert!(icon.is_ok(), "Should create dual-badged icon successfully");
+    }
+
+    #[test]
+    fn test_load_once_placement_roundtrip() {
+        let shared = SharedState {
+            paused: AtomicBool::new(false),
+            tooltip_text: Mutex::new(String::new()),
+            active_border: AtomicBool::new(false),
+            focus_new_windows: AtomicBool::new(false),
+            focus_follows_mouse: AtomicBool::new(false),
+            hide_offscreen_taskbar: AtomicBool::new(false),
+            auto_start: AtomicBool::new(false),
+            centering_mode: AtomicU8::new(CENTERING_CENTER),
+            placement_mode: AtomicU8::new(PLACEMENT_NEW_COLUMN),
+            once_placement: AtomicU8::new(ONCE_INACTIVE),
+            available_update: Mutex::new(None),
+        };
+        assert_eq!(load_once_placement(&shared), None);
+
+        shared
+            .once_placement
+            .store(PLACEMENT_IN_COLUMN, Ordering::Relaxed);
+        assert_eq!(load_once_placement(&shared), Some(PLACEMENT_IN_COLUMN));
+
+        shared
+            .once_placement
+            .store(PLACEMENT_NEW_COLUMN, Ordering::Relaxed);
+        assert_eq!(load_once_placement(&shared), Some(PLACEMENT_NEW_COLUMN));
+    }
+
+    #[test]
+    fn test_effective_placement_in_column_multiplexes_once_over_persistent() {
+        let shared = SharedState {
+            paused: AtomicBool::new(false),
+            tooltip_text: Mutex::new(String::new()),
+            active_border: AtomicBool::new(false),
+            focus_new_windows: AtomicBool::new(false),
+            focus_follows_mouse: AtomicBool::new(false),
+            hide_offscreen_taskbar: AtomicBool::new(false),
+            auto_start: AtomicBool::new(false),
+            centering_mode: AtomicU8::new(CENTERING_CENTER),
+            placement_mode: AtomicU8::new(PLACEMENT_NEW_COLUMN),
+            once_placement: AtomicU8::new(ONCE_INACTIVE),
+            available_update: Mutex::new(None),
+        };
+
+        // No override active: falls back to the persistent setting.
+        assert!(!effective_placement_in_column(&shared));
+        shared
+            .placement_mode
+            .store(PLACEMENT_IN_COLUMN, Ordering::Relaxed);
+        assert!(effective_placement_in_column(&shared));
+
+        // Persistent InColumn, once active for NewColumn: once wins.
+        shared
+            .once_placement
+            .store(PLACEMENT_NEW_COLUMN, Ordering::Relaxed);
+        assert!(!effective_placement_in_column(&shared));
+
+        // Persistent NewColumn, once active for InColumn: once wins.
+        shared
+            .placement_mode
+            .store(PLACEMENT_NEW_COLUMN, Ordering::Relaxed);
+        shared
+            .once_placement
+            .store(PLACEMENT_IN_COLUMN, Ordering::Relaxed);
+        assert!(effective_placement_in_column(&shared));
+
+        // Canceling the override reverts to the persistent setting.
+        shared.once_placement.store(ONCE_INACTIVE, Ordering::Relaxed);
+        assert!(!effective_placement_in_column(&shared));
+    }
+
+    fn badge_center(width: u32, height: u32) -> usize {
+        let radius = (f64::from(width.min(height)) * 0.25).round() as i32;
+        let cx = width as i32 - radius - 1;
+        let cy = height as i32 - radius - 1;
+        ((cy as u32 * width + cx as u32) * 4) as usize
+    }
+
+    #[test]
+    fn test_draw_badge_paints_bottom_right_only() {
+        let width = 32u32;
+        let height = 32u32;
+        let base = [10, 20, 30, 255];
+        let mut plain = vec![0u8; (width * height * 4) as usize];
+        for px in plain.chunks_mut(4) {
+            px.copy_from_slice(&base);
+        }
+
+        let mut badged = plain.clone();
+        draw_badge(&mut badged, width, height, [255, 191, 0, 255]);
+        assert_ne!(plain, badged, "badge should modify the buffer");
+
+        let top_left_idx = 0;
+        assert_eq!(&badged[top_left_idx..top_left_idx + 4], &base);
+
+        let center = badge_center(width, height);
+        assert_eq!(&badged[center..center + 4], &[255, 191, 0, 255]);
     }
 
     #[test]

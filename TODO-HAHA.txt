@@ -1,10 +1,6 @@
-- make settings (in systray icon) transient. Do not persist to file.
-- ctrl-alt-n to toggle visual cue on systray icon.
-- "once-only" variant of ctrl-alt-n
+- fix part of windows appear on another window.
 - center window (use-case: when a wide monitor is above primary display)
-- window rule: min window width (powerpoint), but capped at display's scrolling (or primary) axis, and must rounded to the next larger ratio.
-- window rule: always calculate window width (abs. pixels) wrt to the ratio of primary monitor. But when new window starts on the other monitor, must round to the next larger ratio.
-
+  => NOTE: may not be needed. To review centering configs.
 
 ========
 ========

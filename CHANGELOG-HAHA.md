@@ -51,6 +51,19 @@
   (e.g. `column_width = { "1" = 0.5, "2" = 2 }`) in addition to the existing viewport
   fraction. Map keys are quoted Windows display indices (`"1"` = `\\.\DISPLAY1`). Useful
   when the same app needs a different initial width on each monitor.
+- New-window placement: `Ctrl+Alt+Shift+N` (`hotkeys.toggle_new_window_placement_once`)
+  activates a one-shot override to the opposite of the current default placement for the
+  next window only. When active, pressing it again cancels the override instead.
+  - Explicitly changing the persistent default (tray menu or `Ctrl+Alt+N`) or reloading
+    the config always cancels a pending override.
+- Tray icon shows a badge reflecting new-window placement:
+
+  | Badge | Meaning |
+  |---|---|
+  | None | New windows always open in a new column |
+  | Amber | Only the next window opens in-column |
+  | Blue | New windows always open in-column |
+  | Green | Only the next window opens in a new column |
 
 ### New config fields
 
@@ -65,6 +78,7 @@
 | `hotkeys.toggle_desktop_peek` | `string` | `"Ctrl+Alt+Shift+'"` | Reveal desktop; focused window moves to the minimum-width mark. |
 | Window rule: `tile_on_os_monitor` | `bool` | `false` | Tile the window on whichever monitor the OS places it, instead of the focused monitor. |
 | Window rule: `column_width` (extended) | `f64 \| u32 \| { "N" = f64\|u32 }` | (none) | Now accepts a preset index or a per-display-index map in addition to a viewport fraction. |
+| `hotkeys.toggle_new_window_placement_once` | `string` | `"Ctrl+Alt+Shift+N"` | Activate a one-shot new-window-placement override for the next window only. |
 
 ### Fixes
 

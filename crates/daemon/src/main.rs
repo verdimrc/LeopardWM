@@ -352,10 +352,30 @@ fn quick_toggle_state(config: &Config) -> tray::QuickToggleState {
             config::CenteringModeConfig::JustInView => tray::CENTERING_JUST_IN_VIEW,
             config::CenteringModeConfig::OnOverflow => tray::CENTERING_ON_OVERFLOW,
         },
-        placement_mode: match config.behavior.new_window_placement {
-            config::NewWindowPlacement::NewColumn => tray::PLACEMENT_NEW_COLUMN,
-            config::NewWindowPlacement::InColumn => tray::PLACEMENT_IN_COLUMN,
-        },
+        placement_mode: placement_to_tray(config.behavior.new_window_placement),
+    }
+}
+
+/// Convert a placement mode to the `tray` crate's `u8` encoding.
+fn placement_to_tray(placement: config::NewWindowPlacement) -> u8 {
+    match placement {
+        config::NewWindowPlacement::NewColumn => tray::PLACEMENT_NEW_COLUMN,
+        config::NewWindowPlacement::InColumn => tray::PLACEMENT_IN_COLUMN,
+    }
+}
+
+/// Convert the one-shot placement override to the `tray::set_once_active` encoding.
+fn once_placement_badge(override_placement: Option<config::NewWindowPlacement>) -> Option<u8> {
+    override_placement.map(placement_to_tray)
+}
+
+/// Push the current one-shot placement override to the tray icon badge.
+fn sync_once_badge(
+    tray_manager: &Option<tray::TrayManager>,
+    override_placement: Option<config::NewWindowPlacement>,
+) {
+    if let Some(ref mgr) = tray_manager {
+        mgr.set_once_active(once_placement_badge(override_placement));
     }
 }
 
@@ -363,6 +383,18 @@ fn quick_toggle_state(config: &Config) -> tray::QuickToggleState {
 fn sync_tray_toggles(tray_manager: &Option<tray::TrayManager>, config: &Config) {
     if let Some(ref mgr) = tray_manager {
         mgr.update_quick_toggles(&quick_toggle_state(config));
+    }
+}
+
+/// Sync tray toggles with `config` and clear any active one-shot placement
+/// badge. Use this specifically where a *permanent* placement decision just
+/// took effect (persistent toggle, tray click, config reload) — never for
+/// unrelated toggles (centering mode, auto-start, ...), which must not
+/// cancel an unrelated pending override.
+fn sync_tray_and_clear_once_placement(tray_manager: &Option<tray::TrayManager>, config: &Config) {
+    sync_tray_toggles(tray_manager, config);
+    if let Some(ref mgr) = tray_manager {
+        mgr.set_once_active(None);
     }
 }
 
@@ -402,7 +434,9 @@ async fn reload_config_and_hotkeys(
     // Refresh the rejected-hotkey warning in an open settings window so it
     // reflects the new registration instead of the snapshot taken at open.
     settings::push_failed_binds(&hotkey_state.failed_binds);
-    sync_tray_toggles(tray_manager, &new_config);
+    // A reload always clears the daemon-side one-shot placement override
+    // (see AppState::handle_reload); mirror that on the tray badge too.
+    sync_tray_and_clear_once_placement(tray_manager, &new_config);
     if let Some(ref overlay) = snap_hint_overlay {
         overlay.set_opacity(new_config.snap_hints.opacity);
     }
@@ -1621,6 +1655,8 @@ async fn handle_ipc_command(
         &cmd,
         IpcCommand::TogglePause | IpcCommand::ReleaseAllWindows
     );
+    let is_once_toggle = matches!(&cmd, IpcCommand::ToggleNewWindowPlacementOnce);
+    let is_persistent_placement_toggle = matches!(&cmd, IpcCommand::ToggleNewWindowPlacement);
 
     let (response, should_animate, column_rect, hint_duration) = {
         let mut state = ctx.state.lock().await;
@@ -1675,6 +1711,16 @@ async fn handle_ipc_command(
                 aws,
             );
         }
+    }
+
+    if is_once_toggle {
+        let state = ctx.state.lock().await;
+        sync_once_badge(ctx.tray_manager, state.next_window_placement_override);
+    }
+
+    if is_persistent_placement_toggle {
+        let state = ctx.state.lock().await;
+        sync_tray_and_clear_once_placement(ctx.tray_manager, &state.config);
     }
 
     // Show snap hint for resize operations
@@ -1845,6 +1891,9 @@ async fn process_window_event(ctx: &mut EventLoopCtx<'_>, win_event: WindowEvent
                     )),
                     aws,
                 );
+                // A tiled window creation may have just consumed the one-shot
+                // placement override; set_once_active no-ops if unchanged.
+                sync_once_badge(ctx.tray_manager, state.next_window_placement_override);
             }
             // Spawn vsync-aligned animation thread for resize preview transitions.
             if let Some(req) = state.pending_resize_animation.take() {
@@ -1909,10 +1958,19 @@ async fn handle_hotkey_event(
                 (false, false, None, 200)
             } else {
                 let is_resize = matches!(cmd, IpcCommand::Resize { .. });
+                let is_once_toggle = matches!(cmd, IpcCommand::ToggleNewWindowPlacementOnce);
+                let is_persistent_placement_toggle =
+                    matches!(cmd, IpcCommand::ToggleNewWindowPlacement);
                 let mut state = ctx.state.lock().await;
                 let response = state.handle_command(cmd);
                 if let IpcResponse::Error { message } = response {
                     warn!("Hotkey command failed: {}", message);
+                }
+                if is_once_toggle {
+                    sync_once_badge(ctx.tray_manager, state.next_window_placement_override);
+                }
+                if is_persistent_placement_toggle {
+                    sync_tray_and_clear_once_placement(ctx.tray_manager, &state.config);
                 }
                 let animating = state.is_animating();
 
@@ -2390,22 +2448,38 @@ async fn handle_tray_event(ctx: &mut EventLoopCtx<'_>, tray_event: tray::TrayEve
             sync_tray_toggles(ctx.tray_manager, &state.config);
         }
         tray::TrayEvent::SetPlacementNewColumn => {
-            let mut state = ctx.state.lock().await;
-            if state.config.behavior.new_window_placement != config::NewWindowPlacement::NewColumn {
-                state.config.behavior.new_window_placement = config::NewWindowPlacement::NewColumn;
-                info!("Tray: New-window placement set to NewColumn");
-            }
-            sync_tray_toggles(ctx.tray_manager, &state.config);
+            set_persistent_placement(ctx, config::NewWindowPlacement::NewColumn).await;
         }
         tray::TrayEvent::SetPlacementInColumn => {
-            let mut state = ctx.state.lock().await;
-            if state.config.behavior.new_window_placement != config::NewWindowPlacement::InColumn {
-                state.config.behavior.new_window_placement = config::NewWindowPlacement::InColumn;
-                info!("Tray: New-window placement set to InColumn");
-            }
-            sync_tray_toggles(ctx.tray_manager, &state.config);
+            set_persistent_placement(ctx, config::NewWindowPlacement::InColumn).await;
         }
     }
+}
+
+/// Handle a tray placement-menu click: set the persistent mode and cancel
+/// any active one-shot override. An explicit menu click always means "make
+/// this permanent" — whether `placement` matches what the once-override was
+/// already showing (solidifies it, badge clears) or is the opposite
+/// (switches persistent mode and cancels the override, badge clears too).
+/// Without canceling the override here, a click that happens to match the
+/// current persistent value would appear to do nothing until the next tiled
+/// window consumed the override.
+async fn set_persistent_placement(
+    ctx: &mut EventLoopCtx<'_>,
+    placement: config::NewWindowPlacement,
+) {
+    let mut state = ctx.state.lock().await;
+    if state.config.behavior.new_window_placement != placement {
+        state.config.behavior.new_window_placement = placement;
+        info!("Tray: New-window placement set to {:?}", placement);
+    }
+    if state.next_window_placement_override.take().is_some() {
+        info!(
+            "Tray: canceled one-shot placement override ({:?} made permanent)",
+            placement
+        );
+    }
+    sync_tray_and_clear_once_placement(ctx.tray_manager, &state.config);
 }
 
 /// Silent close-to-tray disappearance fires no WinEvent. While tracking still

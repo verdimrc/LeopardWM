@@ -526,6 +526,11 @@ pub enum IpcCommand {
     /// Toggle where new windows open: their own new column or stacked into
     /// the focused column.
     ToggleNewWindowPlacement,
+    /// Activate a one-shot override of `new_window_placement` for the next
+    /// tiled window only, then revert to the persistent setting. Pressing
+    /// again while active cancels the override instead of activating a new
+    /// one.
+    ToggleNewWindowPlacementOnce,
     /// Set the focused column width as a fraction of the viewport.
     SetColumnWidth {
         /// Fraction of viewport width (e.g., 0.333, 0.5, 0.667).
@@ -1015,6 +1020,7 @@ mod tests {
             IpcCommand::ToggleOverview,
             IpcCommand::ToggleOverviewAll,
             IpcCommand::ToggleNewWindowPlacement,
+            IpcCommand::ToggleNewWindowPlacementOnce,
             IpcCommand::SetColumnWidth { fraction: 0.5 },
             IpcCommand::SetColumnWidth { fraction: 0.333 },
             IpcCommand::EqualizeColumnWidths,

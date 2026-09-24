@@ -637,6 +637,12 @@ pub(crate) struct AppState {
     /// reset `focused_monitor` back to the source monitor while Windows
     /// re-focuses the window on the destination.
     pub(crate) move_to_monitor_target: Option<(MonitorId, std::time::Instant)>,
+    /// One-shot override of `config.behavior.new_window_placement`,
+    /// activated by `ToggleNewWindowPlacementOnce`. Consumed (cleared) by
+    /// the next tiled window's placement decision; pressing the hotkey
+    /// again while active cancels it instead of activating a new one.
+    /// Never persisted.
+    pub(crate) next_window_placement_override: Option<config::NewWindowPlacement>,
     /// Session-only temporary ignore set. Keyed by HWND with a lifetime token
     /// that distinguishes recycled handles. Never persisted.
     pub(crate) temporary_ignores: HashMap<u64, crate::temporary_ignore::TemporaryIgnoreEntry>,
@@ -1157,6 +1163,7 @@ impl AppState {
             elevation_blocked: HashMap::new(),
             pending_create_retry: HashMap::new(),
             move_to_monitor_target: None,
+            next_window_placement_override: None,
             temporary_ignores: HashMap::new(),
             managed_lifetime_tokens: HashMap::new(),
             managed_lifetime_admitted_at_event_ms: HashMap::new(),

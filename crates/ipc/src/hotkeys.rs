@@ -268,6 +268,12 @@ pub fn hotkey_catalog() -> Vec<HotkeyAction> {
             "Window",
         ),
         action(
+            "toggle_new_window_placement_once",
+            Some("Ctrl+Alt+Shift+N"),
+            "Toggle new-window placement once (next window only, press again to cancel)",
+            "Window",
+        ),
+        action(
             "toggle_ignore",
             None,
             "Toggle ignore for the foreground window",
@@ -433,6 +439,7 @@ pub fn command_for_action(id: &str) -> Option<crate::IpcCommand> {
         "scratchpad_toggle" => IpcCommand::ScratchpadToggle,
         "toggle_sticky" => IpcCommand::ToggleSticky,
         "toggle_new_window_placement" => IpcCommand::ToggleNewWindowPlacement,
+        "toggle_new_window_placement_once" => IpcCommand::ToggleNewWindowPlacementOnce,
         "toggle_ignore" => IpcCommand::ToggleIgnore,
         "toggle_tabbed" => IpcCommand::ToggleTabbed,
         "width_third" => IpcCommand::SetColumnWidth { fraction: 0.333 },
@@ -563,6 +570,7 @@ mod tests {
             ("Ctrl+Alt+S", "scratchpad_toggle"),
             ("Ctrl+Alt+Shift+S", "scratchpad_stash"),
             ("Ctrl+Alt+Y", "toggle_sticky"),
+            ("Ctrl+Alt+Shift+N", "toggle_new_window_placement_once"),
             ("Ctrl+Alt+Shift+'", "toggle_desktop_peek"),
             ("Ctrl+Alt+'", "toggle_desktop_peek_anchored"),
             ("Ctrl+Alt+P", "toggle_pause"),

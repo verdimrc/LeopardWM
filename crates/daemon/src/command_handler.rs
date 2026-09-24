@@ -511,6 +511,9 @@ impl AppState {
                 IpcResponse::Ok
             }
             IpcCommand::ToggleNewWindowPlacement => self.handle_toggle_new_window_placement(),
+            IpcCommand::ToggleNewWindowPlacementOnce => {
+                self.handle_toggle_new_window_placement_once()
+            }
             IpcCommand::ToggleFullscreen => self.handle_toggle_fullscreen(),
             IpcCommand::SetColumnWidth { fraction } => {
                 if let Err(message) = validate_set_width_fraction(fraction) {
@@ -712,6 +715,10 @@ impl AppState {
         match Config::load() {
             Ok(new_config) => {
                 self.apply_config(new_config);
+                // Session-only: a reload always starts a fresh session for
+                // this override rather than carrying a stale one-shot
+                // placement intent across a config change.
+                self.next_window_placement_override = None;
                 if let Err(e) = self.apply_layout() {
                     return IpcResponse::error(format!("Failed to apply layout: {}", e));
                 }
@@ -748,7 +755,10 @@ impl AppState {
         IpcResponse::Ok
     }
 
-    /// Handle `IpcCommand::ToggleNewWindowPlacement`.
+    /// Handle `IpcCommand::ToggleNewWindowPlacement`. An explicit permanent
+    /// switch always cancels any active one-shot override — otherwise the
+    /// override would keep winning and the switch would appear to do
+    /// nothing until a window was created or the override expired on its own.
     fn handle_toggle_new_window_placement(&mut self) -> IpcResponse {
         use crate::config::NewWindowPlacement;
         let next = match self.config.behavior.new_window_placement {
@@ -757,7 +767,38 @@ impl AppState {
         };
         self.config.behavior.new_window_placement = next;
         // Transient: only the settings GUI configurator persists config.toml.
+        if self.next_window_placement_override.take().is_some() {
+            info!(
+                "Canceled one-shot placement override ({:?} made permanent)",
+                next
+            );
+        }
         info!("New-window placement set to {:?}", next);
+        IpcResponse::Ok
+    }
+
+    /// Handle `IpcCommand::ToggleNewWindowPlacementOnce`. Activates a
+    /// one-shot override of the opposite placement for the next tiled
+    /// window; pressing again while active cancels it instead of
+    /// activating a new one.
+    fn handle_toggle_new_window_placement_once(&mut self) -> IpcResponse {
+        use crate::config::NewWindowPlacement;
+        match self.next_window_placement_override.take() {
+            Some(_) => {
+                info!("New-window placement one-shot override canceled");
+            }
+            None => {
+                let opposite = match self.config.behavior.new_window_placement {
+                    NewWindowPlacement::NewColumn => NewWindowPlacement::InColumn,
+                    NewWindowPlacement::InColumn => NewWindowPlacement::NewColumn,
+                };
+                self.next_window_placement_override = Some(opposite);
+                info!(
+                    "New-window placement one-shot override active: {:?} (next tiled window only)",
+                    opposite
+                );
+            }
+        }
         IpcResponse::Ok
     }
 
