@@ -45,6 +45,10 @@ impl AppState {
         if scroll_anims_settled {
             self.sync_taskbar_buttons();
         }
+        let deferred_focus_border = self
+            .layout_transition
+            .as_ref()
+            .is_some_and(|transition| transition.defer_focus_border);
         let transition_complete = self
             .layout_transition
             .as_mut()
@@ -58,6 +62,14 @@ impl AppState {
             // The slide is done; cloak any settled off-workspace windows
             // that were skipped while animating so their taskbar buttons go.
             self.sync_taskbar_buttons();
+            // An explicit switch hid the border for the slide. Show it only
+            // after the transition is cleared, for whoever is focused now.
+            // `show_border` hides again when that window is parked or gone.
+            if deferred_focus_border {
+                if let Some(hwnd) = self.previous_focused_hwnd {
+                    self.show_border(hwnd);
+                }
+            }
             // Signal one more frame so entering windows land at their
             // exact final positions (previous frame had t < 1.0).
             still_animating = true;
@@ -65,6 +77,37 @@ impl AppState {
             still_animating = true;
         }
         still_animating
+    }
+
+    pub(crate) fn settle_interrupted_animations_for_recovery(&mut self) -> bool {
+        if !self.is_animating() {
+            return false;
+        }
+
+        // Snap remaining motion to final targets. Restarting an interrupted
+        // animation after drain would interpolate from invalidated geometry.
+        self.abort_active_ghost_transition();
+        let mut scroll_anims_settled = false;
+        for workspaces in self.workspaces.values_mut() {
+            for workspace in workspaces {
+                if workspace.is_animating() {
+                    workspace.stop_animation();
+                    scroll_anims_settled = true;
+                }
+            }
+        }
+        if scroll_anims_settled {
+            self.sync_taskbar_buttons();
+        }
+
+        if let Some(remaining) = self
+            .layout_transition
+            .as_ref()
+            .map(|transition| transition.duration_ms.saturating_sub(transition.elapsed_ms))
+        {
+            self.tick_animations(remaining);
+        }
+        true
     }
 
     /// Snapshot the current placement rects for all tiled windows.
@@ -122,7 +165,9 @@ impl AppState {
 
         // Start with one frame (~16ms) already elapsed so the first
         // apply_layout/send_animation_frame shows visible movement.
-        self.abort_layout_transition();
+        // Carry a deferred focus border onto the replacement. Aborting
+        // would paint it on the rect this transition is about to leave.
+        let defer_focus_border = self.clear_layout_transition();
         self.layout_transition = Some(LayoutTransition {
             start_rects,
             exit_rects: HashMap::new(),
@@ -132,6 +177,7 @@ impl AppState {
             easing: self.config.animation.easing,
             ghosted_wids,
             suppress_landing_focus_resync: false,
+            defer_focus_border,
         });
     }
 
@@ -153,7 +199,10 @@ impl AppState {
             return;
         }
         self.abort_active_ghost_transition();
-        self.abort_layout_transition();
+        // Clear without painting. Do not carry the deferral: a focus-follow
+        // switch shows the new window's border immediately. An explicit
+        // switch sets the flag after this returns.
+        self.clear_layout_transition();
         let exit_provenance = exit_rects
             .keys()
             .filter_map(|window_id| {
@@ -178,12 +227,35 @@ impl AppState {
             easing: self.config.animation.easing,
             ghosted_wids: std::collections::HashSet::new(),
             suppress_landing_focus_resync: false,
+            defer_focus_border: false,
         });
     }
 
-    pub(crate) fn abort_layout_transition(&mut self) {
+    /// Drop the in-flight layout transition without touching the focus border.
+    /// Returns whether that transition was still deferring the border.
+    fn clear_layout_transition(&mut self) -> bool {
+        let deferred = self
+            .layout_transition
+            .as_ref()
+            .is_some_and(|transition| transition.defer_focus_border);
         self.layout_transition = None;
         self.pending_suppress_landing_focus_resync = false;
+        deferred
+    }
+
+    fn reconcile_deferred_focus_border(&mut self) {
+        if let Some(hwnd) = self.previous_focused_hwnd {
+            self.show_border(hwnd);
+        }
+    }
+
+    pub(crate) fn abort_layout_transition(&mut self) {
+        if self.clear_layout_transition() {
+            // The slide will not finish through tick_animations, so the
+            // deferred border has to land now. show_border hides it again
+            // when that window is parked or gone.
+            self.reconcile_deferred_focus_border();
+        }
     }
 
     fn complete_layout_transition(&mut self) {
@@ -338,6 +410,14 @@ impl AppState {
             // removes that epoch's entry then. Per-epoch tracking is what
             // makes this safe under overlapping aborts.
         }
+    }
+
+    pub(crate) fn acknowledge_crossfade_complete(&mut self, epoch: u64) {
+        if self.active_crossfade.as_ref().map(|state| state.epoch) == Some(epoch) {
+            self.active_crossfade = None;
+        }
+        // A stale completion releases only its own re-registration barrier.
+        self.crossfade_sources.remove(&epoch);
     }
 
     /// Drop re-registration barriers whose `CrossfadeComplete` never

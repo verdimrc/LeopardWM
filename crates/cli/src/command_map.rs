@@ -57,6 +57,7 @@ pub(crate) fn to_ipc_command(cmd: &Commands) -> IpcCommand {
         },
         Commands::Query { what } => match what {
             QueryType::Workspace => IpcCommand::QueryWorkspace,
+            QueryType::Workspaces => IpcCommand::QueryWorkspaceState,
             QueryType::Focused => IpcCommand::QueryFocused,
             QueryType::All => IpcCommand::QueryAllWindows,
             QueryType::Hotkeys => IpcCommand::QueryHotkeys,
@@ -70,6 +71,7 @@ pub(crate) fn to_ipc_command(cmd: &Commands) -> IpcCommand {
         Commands::ScratchpadToggle => IpcCommand::ScratchpadToggle,
         Commands::ToggleSticky => IpcCommand::ToggleSticky,
         Commands::ToggleNewWindowPlacement => IpcCommand::ToggleNewWindowPlacement,
+        Commands::ToggleIgnore => IpcCommand::ToggleIgnore,
         Commands::ToggleTabbed => IpcCommand::ToggleTabbed,
         Commands::SetWidth { fraction } => IpcCommand::SetColumnWidth {
             fraction: *fraction,
@@ -82,7 +84,13 @@ pub(crate) fn to_ipc_command(cmd: &Commands) -> IpcCommand {
         Commands::CycleHeightUp => IpcCommand::CycleHeightUp,
         Commands::CycleHeightDown => IpcCommand::CycleHeightDown,
         Commands::EqualizeHeights => IpcCommand::EqualizeColumnHeights,
-        Commands::Workspace { number } => IpcCommand::SwitchWorkspace { index: *number },
+        Commands::Workspace { number, monitor } => match monitor {
+            Some(monitor_device_name) => IpcCommand::SwitchWorkspaceOnMonitor {
+                monitor_device_name: monitor_device_name.clone(),
+                index: *number,
+            },
+            None => IpcCommand::SwitchWorkspace { index: *number },
+        },
         Commands::MoveToWorkspace { number } => IpcCommand::MoveToWorkspace { index: *number },
         Commands::WorkspaceNext => IpcCommand::WorkspaceNext,
         Commands::WorkspacePrev => IpcCommand::WorkspacePrev,
@@ -103,6 +111,7 @@ pub(crate) fn to_ipc_command(cmd: &Commands) -> IpcCommand {
         Commands::EmergencyUncloak => unreachable!("EmergencyUncloak handled separately"),
         Commands::Stop => IpcCommand::Stop,
         Commands::TogglePause => IpcCommand::TogglePause,
+        Commands::ReleaseAllWindows => IpcCommand::ReleaseAllWindows,
         Commands::Ghost { action } => IpcCommand::SetGhostAnimation {
             enabled: match action {
                 GhostAction::Enable => Some(true),

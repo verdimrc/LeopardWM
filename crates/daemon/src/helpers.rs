@@ -22,6 +22,16 @@ pub(crate) enum StalePruneLayout {
     Failed(anyhow::Error),
 }
 
+/// Set only for a prune reached from `Focused`. Refresh and direct test prunes
+/// pass `None` and keep execution-time foreground sampling.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FocusedPruneContext {
+    /// `previous_focused_hwnd` captured before stale cleanup.
+    pub(crate) tracked: Option<u64>,
+    /// WinEvent time of the Focused event that reached this prune.
+    pub(crate) event_time_ms: u32,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TaskbarButtonAction {
     Show,
@@ -129,13 +139,20 @@ impl AppState {
         leopardwm_platform_win32::get_window_info(hwnd)
     }
 
-    /// Check whether a window ID is known to this state (managed or injected).
+    /// Check whether a window ID is known to this state (managed, ignored, or injected).
     ///
     /// Used by event validation to skip `is_valid_window` for windows we have
     /// info about, even if they aren't yet managed (e.g., during Created events).
+    /// Ignored HWND liveness is one identity read: matching tokens stay known,
+    /// injected transient reads stay known, Gone stays unknown, mismatch/missing
+    /// fall through. Production reads are `IsWindow` plus `GetPropW` (handle or
+    /// NULL), not a documented GetLastError path.
     pub(crate) fn is_known_window(&self, wid: u64) -> bool {
         if self.find_window_workspace(wid).is_some() {
             return true;
+        }
+        if let Some(known) = self.temporary_ignore_known(wid) {
+            return known;
         }
         #[cfg(test)]
         {
@@ -355,13 +372,94 @@ impl AppState {
     /// Some apps (e.g., Electron close-to-tray) hide windows without firing
     /// Win32 destroy/hide events. This reconciliation pass detects and removes them.
     ///
-    /// Skipped in test builds because test window IDs are not real Win32 handles.
-    /// Distinguishes no apply, successful apply, and failed apply so callers
-    /// do not treat a logged apply error as success.
+    /// Standalone entry used by Refresh and the tracked-focus liveness tick.
+    /// Focus handling passes attribution context through
+    /// `prune_stale_windows_with`. Test builds do not query Win32: an empty
+    /// injected stale list is a no-op, and a non-empty list is consumed only
+    /// when this prune runs. Distinguishes no apply, successful apply, and
+    /// failed apply so callers do not treat a logged apply error as success.
     pub(crate) fn prune_stale_windows(&mut self) -> StalePruneLayout {
+        self.prune_stale_windows_with(None)
+    }
+
+    /// Drop a tracked focus window that vanished without Destroyed or Hidden.
+    ///
+    /// No WinEvent covers that disappearance. The daemon tick calls this so the
+    /// empty workspace is discovered on its own; a later activation is then
+    /// newer than the prune instead of being attributed as auto-activation.
+    /// Returns whether the prune changed managed state. An alive tracked window
+    /// costs one liveness check and does not scan the other windows.
+    pub(crate) fn check_tracked_focus_liveness(&mut self) -> bool {
+        if self.paused {
+            return false;
+        }
+        let Some(tracked) = self.previous_focused_hwnd else {
+            return false;
+        };
+        let Some((monitor_id, ws_idx)) = self.find_window_workspace(tracked) else {
+            return false;
+        };
+        let minimized = self
+            .workspaces
+            .get(&monitor_id)
+            .and_then(|workspaces| workspaces.get(ws_idx))
+            .is_some_and(|workspace| workspace.is_minimized(tracked));
+        if !self.tracked_focus_is_gone_or_unmanageable(tracked, minimized) {
+            return false;
+        }
+
+        let now = std::time::Instant::now();
+        let pre_count = self.all_managed_window_ids().len();
+        let prune = self.prune_stale_windows();
+        let pruned = pre_count - self.all_managed_window_ids().len();
+        let changed = pruned > 0 || !matches!(prune, StalePruneLayout::Unchanged);
+        match prune {
+            StalePruneLayout::Applied => {}
+            StalePruneLayout::Failed(e) => {
+                warn!(
+                    "Failed to apply layout after pruning {} stale window(s): {}",
+                    pruned, e
+                );
+            }
+            StalePruneLayout::Unchanged if pruned > 0 => {
+                if let Err(e) = self.apply_layout() {
+                    warn!(
+                        "Failed to apply layout after pruning {} stale window(s): {}",
+                        pruned, e
+                    );
+                }
+            }
+            StalePruneLayout::Unchanged => {}
+        }
+        self.last_prune_at = Some(now);
+        changed
+    }
+
+    #[cfg(test)]
+    fn tracked_focus_is_gone_or_unmanageable(&self, tracked: u64, minimized: bool) -> bool {
+        !minimized && self.injected_stale_hwnds.contains(&tracked)
+    }
+
+    #[cfg(not(test))]
+    fn tracked_focus_is_gone_or_unmanageable(&self, tracked: u64, minimized: bool) -> bool {
+        let alive_visible = is_window_alive_and_visible(tracked);
+        let gone = !alive_visible && !minimized;
+        let unmanageable = alive_visible && is_excluded_tool_window_hwnd(tracked);
+        gone || unmanageable
+    }
+
+    pub(crate) fn prune_stale_windows_with(
+        &mut self,
+        focused_prune: Option<FocusedPruneContext>,
+    ) -> StalePruneLayout {
         #[cfg(test)]
         {
-            StalePruneLayout::Unchanged
+            let stale = std::mem::take(&mut self.injected_stale_hwnds);
+            if stale.is_empty() {
+                StalePruneLayout::Unchanged
+            } else {
+                self.finish_stale_window_prune(&stale, focused_prune)
+            }
         }
 
         #[cfg(not(test))]
@@ -401,15 +499,30 @@ impl AppState {
                     }
                 }
             }
-            self.finish_stale_window_prune(&stale)
+            self.finish_stale_window_prune(&stale, focused_prune)
         }
     }
 
-    fn finish_stale_window_prune(&mut self, stale: &[u64]) -> StalePruneLayout {
+    fn finish_stale_window_prune(
+        &mut self,
+        stale: &[u64],
+        focused_prune: Option<FocusedPruneContext>,
+    ) -> StalePruneLayout {
         if stale.is_empty() {
             self.evict_unmanaged_window_metadata();
             return StalePruneLayout::Unchanged;
         }
+
+        let selected_was_occupied = !self.selected_workspace_is_genuinely_empty();
+        let selected = (
+            self.focused_monitor,
+            self.active_workspace_idx(self.focused_monitor),
+        );
+        let stale_homes: Vec<(u64, Option<(MonitorId, usize)>)> = stale
+            .iter()
+            .copied()
+            .map(|wid| (wid, self.find_window_workspace(wid)))
+            .collect();
 
         let snapshot = self.snapshot_layout();
         let mut layout_changed = false;
@@ -429,13 +542,47 @@ impl AppState {
             snapshot.remove(&crate::state::DRAG_PLACEHOLDER_HWND);
             self.start_layout_transition(snapshot);
             match self.apply_layout() {
-                Ok(()) => StalePruneLayout::Applied,
+                Ok(crate::layout_apply::LayoutApplyOutcome::Completed) => StalePruneLayout::Applied,
+                Ok(crate::layout_apply::LayoutApplyOutcome::DeferredByRecoveryBarrier) => {
+                    StalePruneLayout::Failed(anyhow::anyhow!(
+                        "Layout application deferred while recovery animation placement finishes"
+                    ))
+                }
                 Err(e) => StalePruneLayout::Failed(e),
             }
         } else {
             StalePruneLayout::Unchanged
         };
-        if layout_changed || focus_changed {
+        if selected_was_occupied && self.selected_workspace_is_genuinely_empty() {
+            self.clear_logical_focus_for_empty_selection();
+            let sample_replacement = match focused_prune {
+                None => true,
+                Some(focus) => focus.tracked.is_some_and(|tracked| {
+                    stale_homes
+                        .iter()
+                        .any(|&(wid, home)| wid == tracked && home == Some(selected))
+                }),
+            };
+            let replacement = if sample_replacement {
+                self.departing_foreground_evidence().and_then(
+                    |(foreground, valid)| match foreground {
+                        Some(id) if id != 0 && valid && !stale.contains(&id) => Some(id),
+                        _ => None,
+                    },
+                )
+            } else {
+                None
+            };
+            let armed_at = match focused_prune {
+                Some(focus) => focus.event_time_ms,
+                None => self.event_time_now_ms(),
+            };
+            self.arm_pending_last_window_departure(
+                replacement,
+                armed_at,
+                LastWindowDepartureOrigin::EventlessPrune,
+            );
+        } else if layout_changed || focus_changed {
             self.reconcile_border_without_stealing_focus();
         }
         apply
@@ -445,6 +592,8 @@ impl AppState {
         if self.window_managed_at.is_empty()
             && self.window_last_maximized_at.is_empty()
             && self.application_fullscreen.is_empty()
+            && self.managed_lifetime_tokens.is_empty()
+            && self.managed_lifetime_admitted_at_event_ms.is_empty()
         {
             return;
         }
@@ -459,6 +608,17 @@ impl AppState {
             .retain(|hwnd, _| managed.contains(hwnd));
         self.application_fullscreen
             .retain(|hwnd, _| managed.contains(hwnd));
+        // A tiled drag or stashed scratchpad leaves its workspace while still managed.
+        self.managed_lifetime_tokens.retain(|hwnd, _| {
+            managed.contains(hwnd)
+                || self
+                    .drag_state
+                    .as_ref()
+                    .is_some_and(|drag| drag.is_tiled && drag.hwnd == *hwnd)
+                || crate::managed_lifetime::is_stashed_scratchpad(self.scratchpad, *hwnd)
+        });
+        self.managed_lifetime_admitted_at_event_ms
+            .retain(|hwnd, _| self.managed_lifetime_tokens.contains_key(hwnd));
     }
 
     fn cleanup_stale_managed_window(
@@ -472,6 +632,7 @@ impl AppState {
         {
             self.pending_workspace_switch_focus = None;
         }
+        self.take_managed_lifetime_token(wid);
         let cancel = self.cancel_matching_unfinished_move_size_ui(wid);
         self.release_departing_hwnd_ghost(wid);
         let mut layout_changed = cancel.needs_layout();
@@ -526,7 +687,7 @@ impl AppState {
 
     #[cfg(test)]
     pub(crate) fn prune_stale_windows_for_test(&mut self, stale: &[u64]) -> StalePruneLayout {
-        self.finish_stale_window_prune(stale)
+        self.finish_stale_window_prune(stale, None)
     }
 
     /// Find which workspace contains a window.
@@ -599,13 +760,41 @@ impl AppState {
     // =========================================================================
 
     /// Remove WS_MAXIMIZEBOX from a tiled window to disable Snap Layouts.
-    /// Only acts if `disable_snap_layouts` is enabled and the window isn't already tracked.
+    /// No-op when snap layouts are disabled in config, tiling is paused, or
+    /// the window is already tracked. Successful resume re-suppresses tiled
+    /// windows.
     pub(crate) fn disable_snap_for_window(&mut self, hwnd: u64) {
         if !self.config.behavior.disable_snap_layouts {
             return;
         }
+        if self.paused {
+            return;
+        }
         if self.snap_disabled_hwnds.contains(&hwnd) {
             return;
+        }
+        #[cfg(test)]
+        {
+            if let Some(result) = self.injected_snap_disable_override.clone() {
+                self.injected_snap_disable_attempt_count
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                match result {
+                    Ok(true) => {
+                        self.snap_disabled_hwnds.insert(hwnd);
+                        debug!("Removed WS_MAXIMIZEBOX from window {}", hwnd);
+                    }
+                    Ok(false) => {
+                        debug!("Window {} already lacks WS_MAXIMIZEBOX, skipping", hwnd);
+                    }
+                    Err(error) => {
+                        warn!(
+                            "Failed to remove WS_MAXIMIZEBOX for window {}: {}",
+                            hwnd, error
+                        );
+                    }
+                }
+                return;
+            }
         }
         match leopardwm_platform_win32::remove_maximizebox(hwnd) {
             Ok(true) => {
@@ -695,13 +884,13 @@ impl AppState {
             self.pending_drag_hint = Some(crate::state::DragHintAction::Hide);
         } else {
             self.pending_layout_apply_timeout_report = None;
-            if let Err(err) = self.apply_layout() {
+            if let Err(error) = self.resume_layout_after_unpause() {
                 self.paused = was_paused;
                 warn!(
                     "Resume apply failed via {}; restoring paused state: {}",
-                    source, err
+                    source, error
                 );
-                return Err(err);
+                return Err(error);
             }
             // Park inactive workspaces only after a successful active apply so a
             // failed resume cannot move them while rolling back to paused.
@@ -712,5 +901,30 @@ impl AppState {
             self.sync_foreground_window();
         }
         Ok(())
+    }
+
+    fn resume_layout_after_unpause(&mut self) -> Result<()> {
+        const RESUME_DEFERRED: &str =
+            "Resume apply deferred while recovery animation placement finishes";
+        if self.pending_idle_layout_reapply && self.is_animating() {
+            match self.try_consume_idle_layout_reapply() {
+                crate::temporary_ignore::IdleLayoutReapply::Applied => return Ok(()),
+                crate::temporary_ignore::IdleLayoutReapply::Failed { message } => {
+                    return Err(anyhow::anyhow!(message));
+                }
+                crate::temporary_ignore::IdleLayoutReapply::Waiting => {
+                    return Err(anyhow::anyhow!(RESUME_DEFERRED));
+                }
+                crate::temporary_ignore::IdleLayoutReapply::NotPending
+                | crate::temporary_ignore::IdleLayoutReapply::Paused => {}
+            }
+        }
+        match self.apply_layout() {
+            Ok(crate::layout_apply::LayoutApplyOutcome::Completed) => Ok(()),
+            Ok(crate::layout_apply::LayoutApplyOutcome::DeferredByRecoveryBarrier) => {
+                Err(anyhow::anyhow!(RESUME_DEFERRED))
+            }
+            Err(error) => Err(error),
+        }
     }
 }

@@ -4,8 +4,10 @@ use crate::config;
 use crate::state::*;
 use anyhow::Result;
 use leopardwm_core_layout::Rect;
+#[cfg(not(test))]
+use leopardwm_platform_win32::enumerate_windows;
 use leopardwm_platform_win32::{
-    enumerate_windows, find_monitor_for_rect, get_process_executable, scale_px, MonitorId,
+    find_monitor_for_rect, get_process_executable, scale_px, MonitorId, WindowInfo,
 };
 use tracing::{debug, info, warn};
 
@@ -112,6 +114,7 @@ impl AppState {
                         }
                         self.window_managed_at.remove(&wid);
                         self.window_last_maximized_at.remove(&wid);
+                        self.take_managed_lifetime_token(wid);
                         info!("Rule change: unmanaged window {} (ignore)", wid);
                     }
                 }
@@ -122,11 +125,29 @@ impl AppState {
 
     /// Enumerate windows and add them to the appropriate workspace based on position.
     pub(crate) fn enumerate_and_add_windows(&mut self) -> Result<usize> {
-        let windows = enumerate_windows()?;
+        let windows = self.windows_for_enumeration()?;
         let monitors: Vec<_> = self.monitors.values().cloned().collect();
         let mut added = 0;
+        // Reconcile the previous replaced HWND before this iteration departs,
+        // including when that window was skipped by the ignore gate or a rule.
+        let mut pending_replaced: Option<u64> = None;
 
         for win_info in windows {
+            if let Some(hwnd) = pending_replaced.take() {
+                self.reconcile_replaced_lifetime_admission(hwnd);
+            }
+            // Recycle departs before the ignore gate and rules, matching
+            // admission. The replacement is then evaluated like any new window.
+            if self.depart_replaced_managed_lifetime(win_info.hwnd) {
+                pending_replaced = Some(win_info.hwnd);
+            }
+
+            if matches!(
+                self.temporary_ignore_gate(win_info.hwnd),
+                crate::temporary_ignore::IgnoreGate::Block
+            ) {
+                continue;
+            }
             let executable = get_process_executable(win_info.process_id).unwrap_or_default();
 
             let action =
@@ -166,7 +187,9 @@ impl AppState {
 
             // Skip windows already managed on any workspace (including inactive ones)
             // to prevent duplicates during config reload re-enumeration.
+            // Persisted restores are already members here and have no record yet.
             if self.find_window_workspace(win_info.hwnd).is_some() {
+                self.record_managed_lifetime_if_unrecorded(win_info.hwnd);
                 continue;
             }
 
@@ -174,8 +197,7 @@ impl AppState {
             // skip + notify instead of reserving a column we can't fill. Mirrors
             // the live-create path; covers windows already open at startup and
             // any seen via `lwm refresh`.
-            #[cfg(not(test))]
-            if self.skip_if_elevation_blocked(
+            if self.elevation_blocks_admission(
                 win_info.hwnd,
                 win_info.process_id,
                 &win_info.title,
@@ -233,6 +255,7 @@ impl AppState {
                             Ok(()) => {
                                 self.window_managed_at
                                     .insert(win_info.hwnd, std::time::Instant::now());
+                                self.record_managed_lifetime(win_info.hwnd, None);
                                 info!(
                                     "Added floating window: {} ({}) to monitor {} - {}x{}",
                                     win_info.title,
@@ -253,6 +276,7 @@ impl AppState {
                             Ok(()) => {
                                 self.window_managed_at
                                     .insert(win_info.hwnd, std::time::Instant::now());
+                                self.record_managed_lifetime(win_info.hwnd, None);
                                 self.disable_snap_for_window(win_info.hwnd);
                                 info!(
                                     "Added tiled window: {} ({}) to monitor {} - {}x{}",
@@ -274,7 +298,20 @@ impl AppState {
             }
         }
 
+        if let Some(hwnd) = pending_replaced {
+            self.reconcile_replaced_lifetime_admission(hwnd);
+        }
+
         Ok(added)
+    }
+
+    fn windows_for_enumeration(&self) -> Result<Vec<WindowInfo>> {
+        #[cfg(test)]
+        {
+            Ok(self.injected_enumerated_windows.clone().unwrap_or_default())
+        }
+        #[cfg(not(test))]
+        Ok(enumerate_windows()?)
     }
 
     /// Evaluate window rules and return the action for a window.

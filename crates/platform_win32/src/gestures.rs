@@ -1,7 +1,10 @@
 //! Touchpad gesture detection via low-level mouse hook.
 
 use crate::{recover_poisoned_mutex, Win32Error, WM_QUIT_LLHOOK_THREAD};
-use std::sync::mpsc;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    mpsc,
+};
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -24,6 +27,97 @@ pub enum GestureEvent {
     ScrollUp,
     /// Modifier + mouse wheel scroll down
     ScrollDown,
+}
+
+impl GestureEvent {
+    /// Stable capture vocabulary for this event. Avoids `Debug` quotes.
+    pub fn as_diag_str(self) -> &'static str {
+        match self {
+            Self::SwipeLeft => "swipe_left",
+            Self::SwipeRight => "swipe_right",
+            Self::SwipeUp => "swipe_up",
+            Self::SwipeDown => "swipe_down",
+            Self::ScrollUp => "scroll_up",
+            Self::ScrollDown => "scroll_down",
+        }
+    }
+}
+
+/// Dedicated tracing target for opt-in gesture diagnostic capture.
+pub const GESTURE_DIAG_TARGET: &str = "leopardwm::gesture_diag";
+pub const GESTURE_DIAG_STAGE_HOOK_DELIVERY: &str = "hook_delivery";
+pub const GESTURE_DIAG_STAGE_CLASSIFIER: &str = "classifier";
+pub const GESTURE_DIAG_STAGE_ACCUMULATION: &str = "accumulation";
+pub const GESTURE_DIAG_STAGE_TIMEOUT: &str = "timeout";
+pub const GESTURE_DIAG_STAGE_COOLDOWN: &str = "cooldown";
+pub const GESTURE_DIAG_STAGE_RECOGNIZED: &str = "recognized";
+pub const GESTURE_DIAG_STAGE_DISPATCH: &str = "dispatch";
+pub const GESTURE_DIAG_STAGE_REGISTRATION: &str = "registration";
+
+const GESTURE_DIAGNOSTIC_GATE_OPEN: u64 = 1;
+const GESTURE_DIAGNOSTIC_ADMISSION_STEP: u64 = 2;
+
+// Bit 0 is the capture gate; the remaining bits count admitted emitters. Closing
+// clears the gate with one atomic operation, so no emitter can be admitted after
+// the worker snapshots the count for its bounded summary.
+static GESTURE_DIAGNOSTIC_CAPTURE_STATE: AtomicU64 = AtomicU64::new(0);
+
+/// Keeps an already-admitted diagnostic emitter visible to capture shutdown.
+///
+/// `admit_gesture_diagnostic_capture()` is the only source, so the admission
+/// count cannot be decremented by work that was never admitted. Neither the
+/// original unit form nor a field literal can reconstruct it externally:
+///
+/// ```compile_fail
+/// use leopardwm_platform_win32::GestureDiagnosticAdmission;
+///
+/// let _forged = GestureDiagnosticAdmission;
+/// ```
+///
+/// ```compile_fail
+/// use leopardwm_platform_win32::GestureDiagnosticAdmission;
+///
+/// let _forged = GestureDiagnosticAdmission { _private: () };
+/// ```
+pub struct GestureDiagnosticAdmission {
+    _private: (),
+}
+
+impl Drop for GestureDiagnosticAdmission {
+    fn drop(&mut self) {
+        GESTURE_DIAGNOSTIC_CAPTURE_STATE
+            .fetch_sub(GESTURE_DIAGNOSTIC_ADMISSION_STEP, Ordering::Release);
+    }
+}
+
+/// Enables trace construction for the bounded daemon diagnostic capture.
+pub fn begin_gesture_diagnostic_capture() {
+    GESTURE_DIAGNOSTIC_CAPTURE_STATE.fetch_or(GESTURE_DIAGNOSTIC_GATE_OPEN, Ordering::Release);
+}
+
+/// Stops new trace construction and returns emitters admitted at closure.
+pub fn end_gesture_diagnostic_capture() -> u64 {
+    GESTURE_DIAGNOSTIC_CAPTURE_STATE.fetch_and(!GESTURE_DIAGNOSTIC_GATE_OPEN, Ordering::AcqRel)
+        / GESTURE_DIAGNOSTIC_ADMISSION_STEP
+}
+
+/// Attempts to admit a diagnostic emitter without waiting on capture I/O.
+pub fn admit_gesture_diagnostic_capture() -> Option<GestureDiagnosticAdmission> {
+    let mut state = GESTURE_DIAGNOSTIC_CAPTURE_STATE.load(Ordering::Acquire);
+    loop {
+        if state & GESTURE_DIAGNOSTIC_GATE_OPEN == 0 {
+            return None;
+        }
+        match GESTURE_DIAGNOSTIC_CAPTURE_STATE.compare_exchange_weak(
+            state,
+            state + GESTURE_DIAGNOSTIC_ADMISSION_STEP,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return Some(GestureDiagnosticAdmission { _private: () }),
+            Err(next) => state = next,
+        }
+    }
 }
 
 /// Wheel message constants (not all exposed by windows-rs).
@@ -54,6 +148,30 @@ enum WheelMode {
     Stream,
 }
 
+impl WheelAxis {
+    fn as_diag_str(self) -> &'static str {
+        match self {
+            Self::Horizontal => "horizontal",
+            Self::Vertical => "vertical",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClassifierKind {
+    Pass,
+    Reject,
+}
+
+impl ClassifierKind {
+    fn as_diag_str(self) -> &'static str {
+        match self {
+            Self::Pass => "pass",
+            Self::Reject => "reject",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct WheelGestureInput {
     now_ms: u128,
@@ -79,6 +197,8 @@ struct EngineTrace {
     cooldown_suppressed: bool,
     mode: Option<WheelMode>,
     accumulation: Option<i32>,
+    classifier: Option<ClassifierKind>,
+    timeout_reset: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -131,7 +251,10 @@ impl WheelGestureEngine {
         WheelGestureResult {
             event: None,
             consume: false,
-            trace: EngineTrace::default(),
+            trace: EngineTrace {
+                classifier: Some(ClassifierKind::Reject),
+                ..EngineTrace::default()
+            },
         }
     }
 
@@ -140,7 +263,10 @@ impl WheelGestureEngine {
             return WheelGestureResult {
                 event: None,
                 consume: false,
-                trace: EngineTrace::default(),
+                trace: EngineTrace {
+                    classifier: Some(ClassifierKind::Reject),
+                    ..EngineTrace::default()
+                },
             };
         }
 
@@ -202,6 +328,7 @@ impl WheelGestureEngine {
 
         trace.mode = Some(self.navigation_mode);
         trace.accumulation = Some(self.navigation_accum);
+        trace.classifier = Some(ClassifierKind::Pass);
         WheelGestureResult {
             event,
             consume: true,
@@ -216,6 +343,7 @@ impl WheelGestureEngine {
         }) {
             self.swipe_accum_x = 0;
             self.swipe_accum_y = 0;
+            trace.timeout_reset = true;
         }
         self.swipe_last_event_ms = Some(input.now_ms);
 
@@ -239,6 +367,7 @@ impl WheelGestureEngine {
         };
 
         trace.accumulation = Some(*accum);
+        trace.classifier = Some(ClassifierKind::Pass);
         WheelGestureResult {
             event,
             consume: false,
@@ -322,6 +451,7 @@ impl Drop for GestureHandle {
         *state = None;
 
         tracing::debug!("Gesture detection stopped");
+        emit_gesture_registration("stopped");
     }
 }
 
@@ -475,6 +605,88 @@ fn send_gesture_event(event: GestureEvent) {
     }
 }
 
+/// Emit a registration-stage record on the dedicated diagnostic target.
+pub fn emit_gesture_registration(state: &'static str) {
+    let Some(_admission) = admit_gesture_diagnostic_capture() else {
+        return;
+    };
+    emit_gesture_registration_active(state);
+}
+
+fn emit_gesture_registration_active(state: &'static str) {
+    tracing::trace!(
+        target: GESTURE_DIAG_TARGET,
+        stage = GESTURE_DIAG_STAGE_REGISTRATION,
+        state,
+    );
+}
+
+fn emit_wheel_diagnostics(
+    axis: WheelAxis,
+    delta: i32,
+    flags: u32,
+    mods_held: bool,
+    swipe_candidate: bool,
+    result: &WheelGestureResult,
+) {
+    let Some(_admission) = admit_gesture_diagnostic_capture() else {
+        return;
+    };
+    emit_wheel_diagnostics_active(axis, delta, flags, mods_held, swipe_candidate, result);
+}
+
+fn emit_wheel_diagnostics_active(
+    axis: WheelAxis,
+    delta: i32,
+    flags: u32,
+    mods_held: bool,
+    swipe_candidate: bool,
+    result: &WheelGestureResult,
+) {
+    tracing::trace!(
+        target: GESTURE_DIAG_TARGET,
+        stage = GESTURE_DIAG_STAGE_HOOK_DELIVERY,
+        axis = axis.as_diag_str(),
+        delta,
+        flags,
+        mods_held,
+        swipe_candidate,
+    );
+    if let Some(kind) = result.trace.classifier {
+        tracing::trace!(
+            target: GESTURE_DIAG_TARGET,
+            stage = GESTURE_DIAG_STAGE_CLASSIFIER,
+            outcome = kind.as_diag_str(),
+        );
+    }
+    if let Some(accumulation) = result.trace.accumulation {
+        tracing::trace!(
+            target: GESTURE_DIAG_TARGET,
+            stage = GESTURE_DIAG_STAGE_ACCUMULATION,
+            accumulation,
+        );
+    }
+    if result.trace.timeout_reset {
+        tracing::trace!(
+            target: GESTURE_DIAG_TARGET,
+            stage = GESTURE_DIAG_STAGE_TIMEOUT,
+        );
+    }
+    if result.trace.cooldown_suppressed {
+        tracing::trace!(
+            target: GESTURE_DIAG_TARGET,
+            stage = GESTURE_DIAG_STAGE_COOLDOWN,
+        );
+    }
+    if let Some(event) = result.event {
+        tracing::trace!(
+            target: GESTURE_DIAG_TARGET,
+            stage = GESTURE_DIAG_STAGE_RECOGNIZED,
+            event = event.as_diag_str(),
+        );
+    }
+}
+
 /// Low-level mouse hook callback for gesture detection.
 ///
 /// Handles WM_MOUSEWHEEL and WM_MOUSEHWHEEL to normalize modifier navigation
@@ -508,6 +720,15 @@ unsafe extern "system" fn gesture_mouse_hook_proc(
                     mods_held,
                     swipe_candidate,
                 });
+
+                emit_wheel_diagnostics(
+                    axis,
+                    delta,
+                    mouse_struct.flags,
+                    mods_held,
+                    swipe_candidate,
+                    &result,
+                );
 
                 tracing::trace!(
                     ?axis,
@@ -570,6 +791,25 @@ unsafe extern "system" fn gesture_mouse_hook_proc(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    static DIAGNOSTIC_GATE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn diagnostic_gate_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        DIAGNOSTIC_GATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[test]
+    fn diagnostic_gate_test_lock_recovers_after_panic() {
+        let panic = std::panic::catch_unwind(|| {
+            let _guard = diagnostic_gate_test_guard();
+            panic!("intentional test-lock poisoning");
+        });
+        assert!(panic.is_err());
+        let _guard = diagnostic_gate_test_guard();
+        DIAGNOSTIC_GATE_TEST_LOCK.clear_poison();
+    }
 
     fn input(
         now_ms: u128,
@@ -780,5 +1020,276 @@ mod tests {
 
         assert_eq!(unflagged_events, injected_events);
         assert_eq!(unflagged.navigation_mode, injected.navigation_mode);
+    }
+
+    fn capture_diag(emit: impl FnOnce()) -> Vec<String> {
+        use std::sync::{Arc, Mutex};
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = DiagSubscriber {
+            events: events.clone(),
+        };
+        tracing::subscriber::with_default(subscriber, emit);
+        let lines = events.lock().unwrap().clone();
+        lines
+    }
+
+    fn process_and_capture(
+        engine: &mut WheelGestureEngine,
+        sample: WheelGestureInput,
+    ) -> (WheelGestureResult, Vec<String>) {
+        let _gate_guard = diagnostic_gate_test_guard();
+        let result = engine.process(sample);
+        begin_gesture_diagnostic_capture();
+        let lines = capture_diag(|| {
+            emit_wheel_diagnostics(
+                sample.axis,
+                sample.delta,
+                sample.flags,
+                sample.mods_held,
+                sample.swipe_candidate,
+                &result,
+            );
+        });
+        end_gesture_diagnostic_capture();
+        (result, lines)
+    }
+
+    #[derive(Default)]
+    struct DiagLine {
+        stage: Option<String>,
+        fields: Vec<(String, String)>,
+    }
+
+    impl DiagLine {
+        fn rendered(&self) -> String {
+            let mut line = format!("stage={}", self.stage.as_deref().unwrap_or(""));
+            for (key, value) in &self.fields {
+                line.push(' ');
+                line.push_str(key);
+                line.push('=');
+                line.push_str(value);
+            }
+            line
+        }
+    }
+
+    struct DiagVisitor<'a>(&'a mut DiagLine);
+
+    impl tracing::field::Visit for DiagVisitor<'_> {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "stage" {
+                self.0.stage = Some(value.to_string());
+            } else if field.name() != "message" {
+                self.0
+                    .fields
+                    .push((field.name().to_string(), value.to_string()));
+            }
+        }
+
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.record_str(field, &format!("{value:?}"));
+        }
+
+        fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+            self.0
+                .fields
+                .push((field.name().to_string(), value.to_string()));
+        }
+
+        fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+            self.0
+                .fields
+                .push((field.name().to_string(), value.to_string()));
+        }
+
+        fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+            self.0.fields.push((
+                field.name().to_string(),
+                if value { "true" } else { "false" }.to_string(),
+            ));
+        }
+    }
+
+    struct DiagSubscriber {
+        events: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl tracing::Subscriber for DiagSubscriber {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            metadata.target() == GESTURE_DIAG_TARGET
+        }
+
+        fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+            Some(tracing::level_filters::LevelFilter::TRACE)
+        }
+
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut line = DiagLine::default();
+            event.record(&mut DiagVisitor(&mut line));
+            self.events.lock().unwrap().push(line.rendered());
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    #[test]
+    fn passthrough_emits_hook_delivery_and_classifier_reject() {
+        let mut engine = WheelGestureEngine::new();
+        let (result, lines) =
+            process_and_capture(&mut engine, input(0, WheelAxis::Vertical, 120, false, 0));
+        assert_eq!(result.event, None);
+        assert!(!result.consume);
+        assert!(lines.iter().any(|line| line.contains("stage=hook_delivery")
+            && line.contains("axis=vertical")
+            && line.contains("delta=120")
+            && line.contains("flags=0")
+            && line.contains("mods_held=false")
+            && line.contains("swipe_candidate=false")));
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("stage=classifier") && line.contains("outcome=reject")));
+        assert!(!lines.iter().any(|line| line.contains("stage=recognized")));
+        assert!(!lines
+            .iter()
+            .any(|line| line.contains("hwnd") || line.contains("title")));
+    }
+
+    #[test]
+    fn injected_swipe_emits_pass_accumulation_and_recognized() {
+        let mut engine = WheelGestureEngine::new();
+        let (result, lines) = process_and_capture(
+            &mut engine,
+            input(0, WheelAxis::Horizontal, -360, false, LLMHF_INJECTED),
+        );
+        assert_eq!(result.event, Some(GestureEvent::SwipeLeft));
+        assert!(!result.consume);
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("swipe_candidate=true") && line.contains("flags=1")));
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("stage=classifier") && line.contains("outcome=pass")));
+        assert!(lines.iter().any(|line| line.contains("stage=accumulation")));
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("stage=recognized") && line.contains("event=swipe_left")));
+    }
+
+    #[test]
+    fn swipe_timeout_emits_timeout_stage() {
+        let mut engine = WheelGestureEngine::new();
+        engine.process(input(0, WheelAxis::Vertical, 240, false, LLMHF_INJECTED));
+        let (result, lines) = process_and_capture(
+            &mut engine,
+            input(
+                GESTURE_TIMEOUT_MS + 1,
+                WheelAxis::Vertical,
+                120,
+                false,
+                LLMHF_INJECTED,
+            ),
+        );
+        assert_eq!(result.event, None);
+        assert!(result.trace.timeout_reset);
+        assert!(lines.iter().any(|line| line.contains("stage=timeout")));
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("stage=classifier") && line.contains("outcome=pass")));
+    }
+
+    #[test]
+    fn navigation_cooldown_emits_cooldown_stage() {
+        let mut engine = WheelGestureEngine::new();
+        let (first, first_lines) =
+            process_and_capture(&mut engine, input(0, WheelAxis::Vertical, 120, true, 0));
+        assert_eq!(first.event, Some(GestureEvent::ScrollUp));
+        assert!(first_lines
+            .iter()
+            .any(|line| line.contains("stage=recognized") && line.contains("event=scroll_up")));
+        let (suppressed, lines) =
+            process_and_capture(&mut engine, input(40, WheelAxis::Vertical, 120, true, 0));
+        assert_eq!(suppressed.event, None);
+        assert!(suppressed.trace.cooldown_suppressed);
+        assert!(lines.iter().any(|line| line.contains("stage=cooldown")));
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("mods_held=true") && line.contains("swipe_candidate=false")));
+    }
+
+    #[test]
+    fn capture_gate_controls_production_registration_emitter() {
+        let _gate_guard = diagnostic_gate_test_guard();
+        end_gesture_diagnostic_capture();
+        let closed = capture_diag(|| emit_gesture_registration("registered"));
+        assert!(closed.is_empty());
+
+        begin_gesture_diagnostic_capture();
+        let open = capture_diag(|| emit_gesture_registration("registered"));
+        end_gesture_diagnostic_capture();
+        assert_eq!(open, vec!["stage=registration state=registered"]);
+    }
+
+    #[test]
+    fn capture_gate_controls_production_wheel_emitter() {
+        let _gate_guard = diagnostic_gate_test_guard();
+        let mut engine = WheelGestureEngine::new();
+        let sample = input(0, WheelAxis::Vertical, 120, false, 0);
+        let result = engine.process(sample);
+
+        end_gesture_diagnostic_capture();
+        let closed = capture_diag(|| {
+            emit_wheel_diagnostics(
+                sample.axis,
+                sample.delta,
+                sample.flags,
+                sample.mods_held,
+                sample.swipe_candidate,
+                &result,
+            );
+        });
+        assert!(closed.is_empty());
+
+        begin_gesture_diagnostic_capture();
+        let open = capture_diag(|| {
+            emit_wheel_diagnostics(
+                sample.axis,
+                sample.delta,
+                sample.flags,
+                sample.mods_held,
+                sample.swipe_candidate,
+                &result,
+            );
+        });
+        end_gesture_diagnostic_capture();
+        assert!(open.iter().any(|line| line.contains("stage=hook_delivery")));
+    }
+
+    #[test]
+    fn registration_emit_uses_fixed_vocabulary() {
+        let lines = capture_diag(|| {
+            emit_gesture_registration_active("disabled");
+            emit_gesture_registration_active("failed");
+            emit_gesture_registration_active("registered");
+            emit_gesture_registration_active("stopped");
+        });
+        assert_eq!(
+            lines,
+            vec![
+                "stage=registration state=disabled".to_string(),
+                "stage=registration state=failed".to_string(),
+                "stage=registration state=registered".to_string(),
+                "stage=registration state=stopped".to_string(),
+            ]
+        );
     }
 }

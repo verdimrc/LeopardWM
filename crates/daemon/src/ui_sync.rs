@@ -11,6 +11,14 @@ pub(crate) struct DepartingFocusDecision {
     pub replacement_hwnd: Option<u64>,
 }
 
+/// Why a window is leaving management. A replaced lifetime is not an OS
+/// Destroyed or Hidden: the HWND in the foreground is already the new window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DepartureCause {
+    Event,
+    ReplacedLifetime,
+}
+
 pub(crate) fn departing_focus_decision(
     was_tracked_focus: bool,
     departing_hwnd: u64,
@@ -89,6 +97,16 @@ impl AppState {
     /// During an active tiled drag, the border is hidden so it doesn't follow
     /// the OS-dragged window — the ghost overlay provides visual feedback instead.
     pub(crate) fn show_border(&self, hwnd: u64) {
+        // An explicit workspace switch paints this border on the interpolated
+        // rect, which is still sliding onto the monitor. The completion tick
+        // shows it after clearing the transition.
+        if self
+            .layout_transition
+            .as_ref()
+            .is_some_and(|transition| transition.defer_focus_border)
+        {
+            return;
+        }
         #[cfg(test)]
         {
             self.border_show_count
@@ -267,7 +285,8 @@ impl AppState {
     /// border jumps to the FINAL post-transition rect on frame 1 of a
     /// workspace switch / move-to-column / expel / drag merge while the
     /// windows are still sliding to it (border leads windows by the entire
-    /// transition duration).
+    /// transition duration). An explicit workspace-switch command defers the
+    /// border until that slide completes.
     pub(crate) fn compute_window_layout_rect(
         &self,
         hwnd: u64,
@@ -318,11 +337,12 @@ impl AppState {
         self.hide_border();
     }
 
-    /// Hide every tab strip overlay if installed. Used by paths that
-    /// know strips must not be visible (e.g., before re-applying layout
-    /// during a configuration reload, prior to fullscreen entry).
+    /// Hide every tab strip overlay when tiling is paused.
     /// Doesn't drop the overlays — `update_tab_strip` will reuse them.
     pub(crate) fn hide_tab_strip(&self) {
+        #[cfg(test)]
+        self.tab_strip_hide_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         for strip in self.tab_strip_overlays.values() {
             strip.hide();
         }
@@ -342,6 +362,9 @@ impl AppState {
     pub(crate) fn update_tab_strip(&mut self) {
         use leopardwm_platform_win32::tab_strip::{TabLabel, TabStripColors};
 
+        #[cfg(test)]
+        self.tab_strip_update_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // No-op when the action sender wasn't installed (tests / headless).
         if self.tab_strip_action_tx.is_none() {
             return;
@@ -562,15 +585,35 @@ impl AppState {
             // so border/focus don't target a window that's no longer here.
             self.previous_focused_hwnd = None;
             self.hide_border();
-            self.hide_tab_strip();
+            self.update_tab_strip();
             debug!("sync_foreground_window: no focused visible window");
             let monitor = self.focused_monitor as i64;
             self.broadcast_focused_window_if_changed(monitor, None);
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn sync_foreground_after_animation_landing(&mut self) {
-        let suppress = self.pending_suppress_landing_focus_resync;
+        self.sync_foreground_after_animation_landing_with_suppression(
+            self.pending_suppress_landing_focus_resync,
+        );
+    }
+
+    /// Keep captured landing-focus suppression only while recovery is still
+    /// pending. Successful recovery clears that flag before this runs; a paused
+    /// no-op apply does not. Non-recovery suppression still consumes even if
+    /// this landing's apply failed, so a later ordinary landing can resync.
+    pub(crate) fn finish_animation_landing_focus_resync(&mut self, captured_suppress: bool) {
+        if captured_suppress && self.pending_idle_layout_reapply {
+            return;
+        }
+        self.sync_foreground_after_animation_landing_with_suppression(captured_suppress);
+    }
+
+    pub(crate) fn sync_foreground_after_animation_landing_with_suppression(
+        &mut self,
+        suppress: bool,
+    ) {
         self.pending_suppress_landing_focus_resync = false;
         if should_sync_foreground_on_animation_landing(self.paused, suppress) {
             self.sync_foreground_window();

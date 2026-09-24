@@ -9,6 +9,12 @@ use tracing::{debug, warn};
 
 const MAX_TIMEOUT_DIAGNOSTIC_CHARS: usize = 256;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LayoutApplyOutcome {
+    Completed,
+    DeferredByRecoveryBarrier,
+}
+
 fn effective_column_widths(
     workspace: &leopardwm_core_layout::Workspace,
 ) -> impl Iterator<Item = i32> + '_ {
@@ -166,6 +172,7 @@ impl AppState {
                 frame_result.physical_request_id,
                 frame_result.physical_invalidation_id,
                 &frame_result.landings,
+                &frame_result.maximized_skipped_window_ids,
             );
         }
         if frame_result.apply_result.is_ok() {
@@ -360,7 +367,9 @@ impl AppState {
     pub(crate) fn begin_shutdown_or_revert(&mut self) -> Vec<std::thread::JoinHandle<()>> {
         self.apply_worker_cancelled.store(true, Ordering::SeqCst);
         self.apply_epoch.fetch_add(1, Ordering::SeqCst);
-        std::mem::take(&mut self.pending_apply_workers)
+        let pending_apply_workers = std::mem::take(&mut self.pending_apply_workers);
+        self.clear_matching_ignore_lifetime_tokens();
+        pending_apply_workers
     }
 
     /// Compute animated placements and send them to the animation worker.
@@ -509,7 +518,7 @@ impl AppState {
     /// Recalculate layout and apply placements for all monitors.
     /// Uses animated offsets if any workspace has an active animation.
     /// No-op when tiling is paused.
-    pub(crate) fn apply_layout(&mut self) -> Result<()> {
+    pub(crate) fn apply_layout(&mut self) -> Result<LayoutApplyOutcome> {
         let reaped_workers = self.reap_finished_pending_apply_workers();
         if reaped_workers > 0 {
             let managed_window_ids = self.all_managed_window_ids();
@@ -517,17 +526,24 @@ impl AppState {
         }
 
         if self.paused {
-            return Ok(());
-        }
-        // During layout transitions, the animation worker drives positioning.
-        if self.layout_transition.is_some() {
-            return Ok(());
+            return Ok(LayoutApplyOutcome::Completed);
         }
         if self.apply_worker_cancelled.load(Ordering::SeqCst) {
             return Err(anyhow!(
                 "Layout application skipped: shutdown/revert cleanup is in progress"
             ));
         }
+        if self.pending_idle_layout_reapply
+            && (!self.animation_placement_worker_is_idle() || self.is_animating())
+        {
+            return Ok(LayoutApplyOutcome::DeferredByRecoveryBarrier);
+        }
+        // During ordinary layout transitions, the animation worker drives positioning.
+        if self.layout_transition.is_some() {
+            return Ok(LayoutApplyOutcome::Completed);
+        }
+        let preserve_recovery_post_animation_nudge =
+            self.pending_idle_layout_reapply && self.post_animation_nudge_pending;
         if !self.pending_apply_workers.is_empty() {
             return Err(anyhow!(
                 "Layout application skipped: previous timed-out apply worker is still finishing"
@@ -616,11 +632,12 @@ impl AppState {
         if placements_unchanged
             && self.physical_fast_path_ok()
             && !self.post_animation_nudge_pending
+            && !self.pending_idle_layout_reapply
             && !bypass_fast_path
         {
             self.applying_layout = false;
             self.request_save_if_changed();
-            return Ok(());
+            return Ok(LayoutApplyOutcome::Completed);
         }
 
         self.record_last_placed_rects(&all_placements);
@@ -642,7 +659,7 @@ impl AppState {
             self.abandon_physical_request(physical_request_id, physical_invalidation_id);
             self.applying_layout = false;
             self.finalize_layout_success();
-            return Ok(());
+            return Ok(LayoutApplyOutcome::Completed);
         }
 
         let timeout_candidate_ids: Vec<u64> = dispatched_placements
@@ -662,10 +679,14 @@ impl AppState {
             Err(error) => {
                 self.abandon_physical_request(physical_request_id, physical_invalidation_id);
                 self.applying_layout = false;
+                if preserve_recovery_post_animation_nudge {
+                    self.post_animation_nudge_pending = true;
+                }
                 return Err(error);
             }
         };
 
+        let mut deferred_by_recovery_barrier = false;
         let result = match rx.recv_timeout(timeout) {
             Ok((
                 result,
@@ -698,6 +719,7 @@ impl AppState {
                         physical_request_id,
                         physical_invalidation_id,
                         &landings,
+                        &maximized_skipped_window_ids,
                     );
                     Ok(())
                 };
@@ -730,11 +752,16 @@ impl AppState {
                     self.applying_layout = false;
                     let reapply = self.apply_layout();
                     self.reapplying_after_violation = false;
-                    if let Err(e) = reapply {
-                        warn!("Re-apply after size-violation propagation failed: {}", e);
-                        Err(e)
-                    } else {
-                        result
+                    match reapply {
+                        Err(e) => {
+                            warn!("Re-apply after size-violation propagation failed: {}", e);
+                            Err(e)
+                        }
+                        Ok(LayoutApplyOutcome::DeferredByRecoveryBarrier) => {
+                            deferred_by_recovery_barrier = true;
+                            result
+                        }
+                        Ok(LayoutApplyOutcome::Completed) => result,
                     }
                 } else {
                     result
@@ -782,16 +809,20 @@ impl AppState {
             }
         };
         self.applying_layout = false;
+        if result.is_err() && preserve_recovery_post_animation_nudge {
+            self.post_animation_nudge_pending = true;
+        }
 
         // Reposition border to track the focused window after layout changes.
-        // A thumbnail-revoked source remains cloaked until this exact landing
-        // is current, confirmed, and not parked.
-        if result.is_ok() {
-            self.release_ghost_sources_after_physical_landing();
+        if result.is_ok() && !deferred_by_recovery_barrier {
             self.finalize_layout_success();
         }
 
-        result
+        if deferred_by_recovery_barrier {
+            Ok(LayoutApplyOutcome::DeferredByRecoveryBarrier)
+        } else {
+            result.map(|()| LayoutApplyOutcome::Completed)
+        }
     }
 
     /// Collect animated placements for every monitor's active workspace, with debug logging.
@@ -1235,8 +1266,18 @@ impl AppState {
         constraints_changed
     }
 
-    /// Post-success bookkeeping: border, tab strip, and deduped LayoutChanged broadcast.
+    /// Post-success bookkeeping: ghost release, border, tab strip, and deduped LayoutChanged broadcast.
     fn finalize_layout_success(&mut self) {
+        let completed_idle_recovery = self.pending_idle_layout_reapply;
+        self.pending_idle_layout_reapply = false;
+        self.idle_layout_reapply_failures = 0;
+        // A thumbnail-revoked source remains cloaked until this landing is
+        // current, confirmed, and not parked. Empty or filtered dispatch uses
+        // the same helper so a cloaked source is not stranded without a worker.
+        self.release_ghost_sources_after_physical_landing();
+        if completed_idle_recovery && self.pending_suppress_landing_focus_resync {
+            self.pending_suppress_landing_focus_resync = false;
+        }
         if let Some(hwnd) = self.previous_focused_hwnd {
             if self.config.appearance.active_border {
                 self.show_border(hwnd);

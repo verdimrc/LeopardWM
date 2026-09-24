@@ -165,6 +165,28 @@ pub(crate) const CROSSFADE_BARRIER_MAX_AGE: Duration = Duration::from_secs(2);
 pub(crate) const TRANSIENT_WINDOW_THRESHOLD: Duration = Duration::from_secs(30);
 /// How long transient window HWNDs stay in the suppression list before expiring.
 pub(crate) const RECENTLY_HIDDEN_TTL: Duration = Duration::from_secs(300);
+
+/// A short-lived Hidden of a managed window.
+///
+/// `managed_token` is the live property, or the departing recorded token when
+/// that read cannot supply one. `None` means this session never recorded a
+/// token. A real Destroyed does not create an entry.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RecentlyHiddenEntry {
+    pub(crate) hidden_at: std::time::Instant,
+    pub(crate) managed_token: Option<u64>,
+}
+
+/// Column width remembered at Hidden, with the same token as
+/// [`RecentlyHiddenEntry`].
+///
+/// `None` means this session never recorded a token.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct HiddenColumnWidth {
+    pub(crate) hidden_at: std::time::Instant,
+    pub(crate) width: i32,
+    pub(crate) managed_token: Option<u64>,
+}
 /// After "Edit Config" is clicked, how long to watch for the editor window (a
 /// single-instance editor like VS Code may raise an existing window on another
 /// workspace) so it can be pulled to the active workspace. Generous because a
@@ -280,6 +302,10 @@ pub(crate) struct LayoutTransition {
     /// declined recovery cannot steal a valid replacement at landing, and so
     /// a later unrelated transition cannot inherit the skip.
     pub(crate) suppress_landing_focus_resync: bool,
+    /// Explicit workspace-switch commands hide the focus border until the
+    /// slide completes. Focus-follow switches leave this false so adoption
+    /// can show the replacement immediately and later frames can track it.
+    pub(crate) defer_focus_border: bool,
 }
 
 /// Owns a registered DWM thumbnail handle for a single window across a
@@ -431,6 +457,10 @@ pub(crate) struct AppState {
     /// Suppresses delayed focus notifications for the exact window left by a
     /// successful workspace switch whose destination has no visible focus.
     pub(crate) pending_workspace_switch_focus: Option<PendingWorkspaceSwitchFocus>,
+    /// Suppresses an attributable replacement activation after the focused
+    /// monitor's selected workspace becomes genuinely empty. Distinct from
+    /// `pending_workspace_switch_focus`.
+    pub(crate) pending_last_window_departure: Option<PendingLastWindowDeparture>,
     /// `(monitor, hwnd)` of the most-recently-broadcast
     /// `FocusedWindowChanged` event. Independent from
     /// `previous_focused_hwnd`: command-driven focus paths
@@ -456,6 +486,10 @@ pub(crate) struct AppState {
     pub(crate) last_border_show_hwnd: AtomicU64,
     #[cfg(test)]
     pub(crate) resize_complete_count: AtomicUsize,
+    #[cfg(test)]
+    pub(crate) tab_strip_hide_count: AtomicUsize,
+    #[cfg(test)]
+    pub(crate) tab_strip_update_count: AtomicUsize,
     /// Tab strip overlays — one per tabbed column across all visible
     /// workspaces. Keyed by `(monitor, workspace_idx, column_idx)`.
     /// `helpers.rs::update_tab_strip` reconciles this map against the
@@ -576,10 +610,11 @@ pub(crate) struct AppState {
     pub(crate) pending_layout_apply_timeout_report: Option<LayoutApplyTimeoutReport>,
     /// Daemon start time for uptime reporting.
     pub(crate) start_time: std::time::Instant,
-    /// HWNDs of transient windows (managed briefly then hidden), used to suppress
-    /// re-creation of Electron popup windows (Beeper, Slack) that rapidly
-    /// show/hide the same HWND.  Entries older than 5 minutes are lazily evicted.
-    pub(crate) recently_hidden_hwnds: HashMap<u64, std::time::Instant>,
+    /// HWNDs hidden while managed only briefly, used to suppress re-creation of
+    /// Electron popup windows that show and hide the same HWND. The stored token
+    /// distinguishes that window from a later occupant of the handle. Entries
+    /// older than 5 minutes are lazily evicted.
+    pub(crate) recently_hidden_hwnds: HashMap<u64, RecentlyHiddenEntry>,
     /// Armed when "Edit Config" is clicked in the tray: `(armed_at, filename)`.
     /// A single-instance editor may raise an existing window on another
     /// workspace; within `EDIT_CONFIG_PULL_TTL` a window whose title contains
@@ -602,11 +637,23 @@ pub(crate) struct AppState {
     /// reset `focused_monitor` back to the source monitor while Windows
     /// re-focuses the window on the destination.
     pub(crate) move_to_monitor_target: Option<(MonitorId, std::time::Instant)>,
+    /// Session-only temporary ignore set. Keyed by HWND with a lifetime token
+    /// that distinguishes recycled handles. Never persisted.
+    pub(crate) temporary_ignores: HashMap<u64, crate::temporary_ignore::TemporaryIgnoreEntry>,
+    /// Session-only managed-lifetime tokens, keyed by HWND. Stamped when a
+    /// window enters management so a recycled handle is not treated as the
+    /// lifetime that was admitted. Never persisted.
+    pub(crate) managed_lifetime_tokens: HashMap<u64, u64>,
+    /// Create/Show WinEvent time for the lifetime in `managed_lifetime_tokens`.
+    /// Absent for admissions that had no window event. A Hidden strictly earlier
+    /// than this time belongs to an older lifetime.
+    pub(crate) managed_lifetime_admitted_at_event_ms: HashMap<u64, u32>,
     /// Column width a tiled window had when it was hidden, keyed by HWND, so a
     /// window that disappears and reappears (e.g. a third-party virtual-desktop
     /// tool hiding/showing windows on switch) re-tiles at its prior width
-    /// instead of resetting to default. Entries expire after RECENTLY_HIDDEN_TTL.
-    pub(crate) hidden_column_widths: HashMap<u64, (std::time::Instant, i32)>,
+    /// instead of resetting to default. The stored token keeps a recycled handle
+    /// from inheriting that width. Entries expire after RECENTLY_HIDDEN_TTL.
+    pub(crate) hidden_column_widths: HashMap<u64, HiddenColumnWidth>,
     /// Where each tiled window last sat before being moved to another workspace,
     /// keyed by HWND. Moving the window back to that workspace restores it to the
     /// original column instead of right of focus. Cleared when consumed or when
@@ -692,6 +739,15 @@ pub(crate) struct AppState {
     /// an async-frame burst, so nudging them just produces a visible 1 px
     /// resize on every Chromium / Firefox / Cascadia window with no benefit.
     pub(crate) post_animation_nudge_pending: bool,
+    /// Set when toggle-ignore aborts in-flight placement and must not start a
+    /// concurrent apply. `try_consume_idle_layout_reapply` applies once both
+    /// apply workers and the animation worker are idle. The event loop arms a
+    /// short timer to retry while this stays pending and tiling is not paused.
+    pub(crate) pending_idle_layout_reapply: bool,
+    /// Consecutive failed automatic recovery attempts. The pending request is
+    /// retained after the bounded retry budget is exhausted so a later normal
+    /// layout apply can still complete it.
+    pub(crate) idle_layout_reapply_failures: u8,
     /// Injected window info for testing. When set, `lookup_window_info()` returns
     /// entries from this map instead of calling `enumerate_windows()`.
     #[cfg(test)]
@@ -704,11 +760,56 @@ pub(crate) struct AppState {
     pub(crate) injected_foreground_is_valid: Option<bool>,
     #[cfg(test)]
     pub(crate) injected_next_foreground_hwnd: Option<Option<u64>>,
+    #[cfg(test)]
+    pub(crate) injected_lifetime_tokens: HashMap<u64, u64>,
+    #[cfg(test)]
+    pub(crate) injected_managed_tokens: HashMap<u64, u64>,
+    #[cfg(test)]
+    pub(crate) injected_live_hwnds: HashSet<u64>,
+    #[cfg(test)]
+    pub(crate) next_injected_lifetime_token: u64,
+    #[cfg(test)]
+    pub(crate) injected_identity_stamp_error: Option<String>,
+    #[cfg(test)]
+    pub(crate) injected_identity_read_error: Option<crate::temporary_ignore::IdentityReadError>,
+    #[cfg(test)]
+    pub(crate) injected_identity_read_override:
+        Option<Result<Option<u64>, crate::temporary_ignore::IdentityReadError>>,
+    #[cfg(test)]
+    pub(crate) injected_identity_clear_error: Option<String>,
+    #[cfg(test)]
+    pub(crate) injected_identity_read_count: AtomicUsize,
+    #[cfg(test)]
+    pub(crate) injected_manage_block: HashMap<u64, leopardwm_platform_win32::ManageBlock>,
+    #[cfg(test)]
+    pub(crate) injected_enumerated_windows: Option<Vec<leopardwm_platform_win32::WindowInfo>>,
+    #[cfg(test)]
+    pub(crate) injected_native_restore_error: Option<String>,
+    /// Count of uncloak requests that production would issue to DWM.
+    #[cfg(test)]
+    pub(crate) injected_native_uncloak_count: AtomicUsize,
+    /// Test-only snap-disable result that skips `remove_maximizebox`.
+    #[cfg(test)]
+    pub(crate) injected_snap_disable_override: Option<Result<bool, String>>,
+    /// Snap-disable attempts that passed pause, config, and tracking guards.
+    #[cfg(test)]
+    pub(crate) injected_snap_disable_attempt_count: AtomicUsize,
     /// Per-window native maximize responses for deterministic daemon tests.
     #[cfg(test)]
     pub(crate) injected_window_maximized: HashMap<u64, bool>,
     #[cfg(test)]
     pub(crate) departing_foreground_evidence_reads: usize,
+    /// Test-only GetTickCount stand-in for last-window departure arming.
+    #[cfg(test)]
+    pub(crate) injected_event_time_ms: Option<u32>,
+    /// Lets a test park real probe windows. Default tests leave this off so a
+    /// synthetic HWND never reaches `SetWindowPos`.
+    #[cfg(test)]
+    pub(crate) injected_native_offscreen_enabled: bool,
+    /// Stale HWNDs consumed by the next prune that actually runs. Empty is a
+    /// no-op; a throttled or same-HWND focus leaves the list pending.
+    #[cfg(test)]
+    pub(crate) injected_stale_hwnds: Vec<u64>,
     /// Optional test-only behavior override for placement application.
     #[cfg(test)]
     pub(crate) injected_apply_placements_behavior: Option<TestApplyPlacementsBehavior>,
@@ -716,6 +817,11 @@ pub(crate) struct AppState {
     pub(crate) injected_apply_placements_call_count: Arc<AtomicUsize>,
     #[cfg(test)]
     pub(crate) injected_apply_placements_batches: Arc<std::sync::Mutex<Vec<Vec<u64>>>>,
+    /// Test-only cascade result and observations for release-all behavior.
+    #[cfg(test)]
+    pub(crate) injected_release_cascade_result: Option<std::result::Result<(), String>>,
+    #[cfg(test)]
+    pub(crate) released_window_id_batches: Vec<Vec<u64>>,
     /// Number of late-worker recovery passes executed after cancellation.
     #[cfg(test)]
     pub(crate) late_worker_recovery_count: Arc<AtomicUsize>,
@@ -728,13 +834,18 @@ pub(crate) struct AppState {
     /// taskbar thread.
     #[cfg(test)]
     pub(crate) recorded_taskbar_commands: std::sync::Mutex<Vec<(u64, bool)>>,
-    /// Fanout for IPC pub/sub. The IPC server's per-client task calls
-    /// `subscribe()` on this to receive an `IpcEvent` stream.
+    /// Fanout for legacy-only IPC subscriptions. Workspace snapshot traffic
+    /// must never consume this buffer's capacity.
     pub(crate) event_broadcaster: tokio::sync::broadcast::Sender<leopardwm_ipc::IpcEvent>,
+    /// Fanout for workspace-enabled subscriptions, including mixed filters.
+    /// Carries legacy events too so snapshot transactions remain contiguous.
+    pub(crate) workspace_event_broadcaster: tokio::sync::broadcast::Sender<leopardwm_ipc::IpcEvent>,
     /// Hash of the last `IpcEvent::LayoutChanged` payload we emitted —
     /// used to dedup repeat emissions when the layout signature is
     /// unchanged (e.g. animation frames between settled positions).
     pub(crate) last_emitted_layout_sig: Option<u64>,
+    /// Last complete workspace model and its daemon-session identity.
+    pub(crate) workspace_ipc_state: crate::workspace_ipc::WorkspaceIpcState,
     /// Sender for debounced workspace-state saves. Installed at startup
     /// via `install_save_channel`; left `None` under cfg(test) and before
     /// wiring so `request_save_if_changed` is a no-op then.
@@ -780,6 +891,57 @@ pub(crate) struct PendingWorkspaceSwitchFocus {
 }
 
 impl PendingWorkspaceSwitchFocus {
+    pub(crate) const TTL: std::time::Duration = std::time::Duration::from_millis(1500);
+
+    pub(crate) fn is_fresh(&self) -> bool {
+        self.set_at.elapsed() < Self::TTL
+    }
+}
+
+/// How the last-window empty-selection guard was armed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LastWindowDepartureOrigin {
+    DirectDestroyedOrHidden,
+    EventlessPrune,
+}
+
+/// Evidence that the focused monitor's selected workspace became empty
+/// because its last tiled and floating window departed.
+///
+/// An exact replacement HWND is attributable auto-activation while this guard
+/// is fresh. A strictly newer activation (a different HWND, or the same HWND
+/// with a later WinEvent time) wins. Direct Destroyed/Hidden and standalone
+/// pruning stamp `armed_at_event_time_ms` with handler execution time, so an
+/// activation that occurred before the handler ran may compare as no-later and
+/// stay suppressed. If the departing window still appears live or pruning is
+/// throttled, follow-focus cannot attribute the sequence.
+///
+/// A prune reached from `Focused(X, t)` stamps `t`. It samples a replacement
+/// only when the tracked focus HWND was stale and was removed from the
+/// workspace that became empty. Otherwise it arms `EventlessPrune` with
+/// replacement `None`, which does not infer, so that activation follows. A
+/// tracked window that vanishes with no event is rechecked about every 500 ms
+/// and, if gone, cleared by standalone pruning at execution time. If it
+/// vanishes silently and a deliberate activation arrives before the next
+/// check, that activation can still be treated as auto-activation.
+///
+/// DirectDestroyedOrHidden with no sampled replacement binds the first
+/// no-later managed Focused on another workspace of the same monitor, then
+/// uses that exact HWND. Same-workspace activations are not inferred.
+/// EventlessPrune does not infer from None. Unmanaged samples are not rewritten.
+///
+/// Distinct from `PendingWorkspaceSwitchFocus`; the two guards are not shared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PendingLastWindowDeparture {
+    pub(crate) monitor: MonitorId,
+    pub(crate) workspace: usize,
+    pub(crate) replacement_hwnd: Option<u64>,
+    pub(crate) set_at: std::time::Instant,
+    pub(crate) armed_at_event_time_ms: u32,
+    pub(crate) origin: LastWindowDepartureOrigin,
+}
+
+impl PendingLastWindowDeparture {
     pub(crate) const TTL: std::time::Duration = std::time::Duration::from_millis(1500);
 
     pub(crate) fn is_fresh(&self) -> bool {
@@ -919,6 +1081,7 @@ impl AppState {
             layout_last_completed_at: None,
             previous_focused_hwnd: None,
             pending_workspace_switch_focus: None,
+            pending_last_window_departure: None,
             last_broadcast_focused: None,
             last_focus_change_at: None,
             last_prune_at: None,
@@ -936,6 +1099,10 @@ impl AppState {
             last_border_show_hwnd: AtomicU64::new(0),
             #[cfg(test)]
             resize_complete_count: AtomicUsize::new(0),
+            #[cfg(test)]
+            tab_strip_hide_count: AtomicUsize::new(0),
+            #[cfg(test)]
+            tab_strip_update_count: AtomicUsize::new(0),
             // Tab strip overlays are spawned on demand by `update_tab_strip`
             // — there's no global "the strip" anymore. `install_tab_strip`
             // just stashes the action sender so subsequent spawns can wire
@@ -990,6 +1157,9 @@ impl AppState {
             elevation_blocked: HashMap::new(),
             pending_create_retry: HashMap::new(),
             move_to_monitor_target: None,
+            temporary_ignores: HashMap::new(),
+            managed_lifetime_tokens: HashMap::new(),
+            managed_lifetime_admitted_at_event_ms: HashMap::new(),
             hidden_column_widths: HashMap::new(),
             desktop_peek: None,
             move_origins: HashMap::new(),
@@ -1008,6 +1178,8 @@ impl AppState {
             crossfade_epoch_counter: 0,
             animation_worker_control: None,
             post_animation_nudge_pending: false,
+            pending_idle_layout_reapply: false,
+            idle_layout_reapply_failures: 0,
             #[cfg(test)]
             injected_window_info: HashMap::new(),
             #[cfg(test)]
@@ -1019,15 +1191,55 @@ impl AppState {
             #[cfg(test)]
             injected_next_foreground_hwnd: None,
             #[cfg(test)]
+            injected_lifetime_tokens: HashMap::new(),
+            #[cfg(test)]
+            injected_managed_tokens: HashMap::new(),
+            #[cfg(test)]
+            injected_live_hwnds: HashSet::new(),
+            #[cfg(test)]
+            next_injected_lifetime_token: 1,
+            #[cfg(test)]
+            injected_identity_stamp_error: None,
+            #[cfg(test)]
+            injected_identity_read_error: None,
+            #[cfg(test)]
+            injected_identity_read_override: None,
+            #[cfg(test)]
+            injected_identity_clear_error: None,
+            #[cfg(test)]
+            injected_identity_read_count: AtomicUsize::new(0),
+            #[cfg(test)]
+            injected_manage_block: HashMap::new(),
+            #[cfg(test)]
+            injected_enumerated_windows: None,
+            #[cfg(test)]
+            injected_native_restore_error: None,
+            #[cfg(test)]
+            injected_native_uncloak_count: AtomicUsize::new(0),
+            #[cfg(test)]
+            injected_snap_disable_override: None,
+            #[cfg(test)]
+            injected_snap_disable_attempt_count: AtomicUsize::new(0),
+            #[cfg(test)]
             injected_window_maximized: HashMap::new(),
             #[cfg(test)]
             departing_foreground_evidence_reads: 0,
+            #[cfg(test)]
+            injected_event_time_ms: None,
+            #[cfg(test)]
+            injected_native_offscreen_enabled: false,
+            #[cfg(test)]
+            injected_stale_hwnds: Vec::new(),
             #[cfg(test)]
             injected_apply_placements_behavior: None,
             #[cfg(test)]
             injected_apply_placements_call_count: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
             injected_apply_placements_batches: Arc::new(std::sync::Mutex::new(Vec::new())),
+            #[cfg(test)]
+            injected_release_cascade_result: Some(Ok(())),
+            #[cfg(test)]
+            released_window_id_batches: Vec::new(),
             #[cfg(test)]
             late_worker_recovery_count: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
@@ -1038,7 +1250,9 @@ impl AppState {
             // subscriber that lags >256 events behind receives `Lagged`
             // and is expected to reconnect with a fresh Subscribe.
             event_broadcaster: tokio::sync::broadcast::channel(256).0,
+            workspace_event_broadcaster: tokio::sync::broadcast::channel(256).0,
             last_emitted_layout_sig: None,
+            workspace_ipc_state: Default::default(),
             save_request_tx: None,
             last_persisted_sig: None,
             pending_tab_focus: None,
@@ -1083,12 +1297,25 @@ impl AppState {
         self.active_workspace.get(&monitor_id).copied().unwrap_or(0)
     }
 
+    /// Current time in the WinEvent GetTickCount domain. Tests may inject it.
+    /// This is handler-execution time, not a window-departure timestamp.
+    pub(crate) fn event_time_now_ms(&self) -> u32 {
+        #[cfg(test)]
+        if let Some(event_time_ms) = self.injected_event_time_ms {
+            return event_time_ms;
+        }
+        leopardwm_platform_win32::current_event_time_ms()
+    }
+
     /// Send an event to all IPC subscribers. `broadcast::Sender::send` is
     /// sync (no .await), so this is safe to call while holding any tokio
     /// mutex. Err on zero-receivers is ignored — that just means nobody
     /// is subscribed yet.
     pub(crate) fn broadcast_event(&self, event: leopardwm_ipc::IpcEvent) {
-        let _ = self.event_broadcaster.send(event);
+        if event.kind() != leopardwm_ipc::EventKind::WorkspaceState {
+            let _ = self.event_broadcaster.send(event.clone());
+        }
+        let _ = self.workspace_event_broadcaster.send(event);
     }
 
     /// Broadcast `FocusedWindowChanged` if `hwnd` differs from the last
@@ -1111,15 +1338,13 @@ impl AppState {
             ),
             None => (None, None, None),
         };
-        let _ = self
-            .event_broadcaster
-            .send(leopardwm_ipc::IpcEvent::FocusedWindowChanged {
-                monitor,
-                hwnd,
-                title,
-                class_name,
-                executable,
-            });
+        self.broadcast_event(leopardwm_ipc::IpcEvent::FocusedWindowChanged {
+            monitor,
+            hwnd,
+            title,
+            class_name,
+            executable,
+        });
         self.last_broadcast_focused = Some((monitor, hwnd));
     }
 

@@ -18,8 +18,8 @@ pub(crate) struct SubscribeStartup {
     pub(crate) ack: IpcResponse,
     /// Initial snapshot frames to write after the ack.
     pub(crate) snapshot: Vec<IpcEvent>,
-    /// Receiver attached to the daemon's event broadcaster — guaranteed
-    /// to deliver every event sent after the snapshot was taken.
+    /// Receiver attached to the matching legacy-only or workspace-enabled
+    /// broadcaster; delivers requested events sent after the snapshot was taken.
     pub(crate) receiver: broadcast::Receiver<IpcEvent>,
 }
 
@@ -93,6 +93,10 @@ pub(crate) enum DaemonEvent {
     /// a per-window message, not a global hook — so polling is the
     /// pragmatic alternative.
     TabStripIconPoll,
+    /// Tick that checks whether the tracked focus window vanished without a
+    /// WinEvent. Silent close-to-tray disappearance has no hook, so this
+    /// bounds how long an ambiguous activation can be treated as automatic.
+    FocusLivenessCheck,
     /// User action from the overview overlay (activate a window, switch
     /// workspace, close a window, or dismiss). The overlay hit-tests its
     /// own model copy; the daemon routes the resulting intent here.
@@ -112,6 +116,10 @@ pub(crate) enum DaemonEvent {
         target_hwnd: u64,
         new_title: Option<String>,
     },
+    /// Retry a layout apply that toggle-ignore deferred until apply and
+    /// animation workers are idle. Armed by `finish_daemon_event`; the
+    /// handler re-arms while consume still reports `Waiting`.
+    IdleLayoutReapply,
     /// Debounced persist trigger. Emitted by the background save task
     /// after a quiet period following one or more persisted-state
     /// changes. Handled on the main loop, which builds the snapshot JSON

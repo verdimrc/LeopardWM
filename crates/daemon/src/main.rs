@@ -19,20 +19,30 @@ mod diagnostics_validation;
 mod drag;
 mod event_handler;
 mod events;
+mod gesture_diagnostics;
 mod helpers;
 mod hotkey_resolution;
 mod ipc_server;
 mod layout_apply;
+mod managed_lifetime;
+#[cfg(test)]
+mod managed_lifetime_tests;
 mod monitors;
 mod notify;
 mod overview;
 mod persistence;
 mod physical_placement;
+mod release;
+#[cfg(test)]
+mod release_tests;
 mod scratchpad;
 mod settings;
 mod startup;
 mod state;
 mod sticky;
+mod temporary_ignore;
+#[cfg(test)]
+mod temporary_ignore_tests;
 #[cfg(test)]
 mod tests;
 mod transitions;
@@ -40,6 +50,9 @@ mod tray;
 mod ui_sync;
 mod update_check;
 mod window_rules;
+mod workspace_ipc;
+#[cfg(test)]
+mod workspace_ipc_tests;
 
 use ipc_server::*;
 use startup::*;
@@ -52,7 +65,7 @@ use layout_apply::AnimationPlacementResult;
 use leopardwm_core_layout::Rect;
 use leopardwm_ipc::{pipe_name_candidates, preferred_pipe_name, IpcCommand, IpcResponse};
 use leopardwm_platform_win32::{
-    cascade_windows, enumerate_monitors, enumerate_windows, format_hotkey, install_event_hooks,
+    enumerate_monitors, enumerate_windows, format_hotkey, install_event_hooks,
     install_keyboard_hook, install_mouse_hook, overlay::OverlayWindow, register_gestures,
     register_system_events, restore_windows_moved_offscreen, set_display_change_sender,
     set_dpi_awareness, set_power_state_sender, set_recording, set_session_end_handler,
@@ -172,8 +185,7 @@ async fn setup_daemon_runtime(
             &apply_worker_cancelled,
             &apply_epoch,
             || {
-                if !animation_worker_control
-                    .wait_for_session_end_barrier(SESSION_END_ANIMATION_BARRIER_TIMEOUT)
+                if !animation_worker_control.wait_for_barrier(SESSION_END_ANIMATION_BARRIER_TIMEOUT)
                 {
                     warn!("Animation worker did not reach the session-end barrier before recovery");
                 }
@@ -702,6 +714,7 @@ struct EventLoopCtx<'a> {
     snap_hint_timer_handle: &'a mut Option<tokio::task::JoinHandle<()>>,
     focus_follows_mouse_timer: &'a mut Option<tokio::task::JoinHandle<()>>,
     display_change_timer: &'a mut Option<tokio::task::JoinHandle<()>>,
+    idle_layout_reapply_timer: &'a mut Option<tokio::task::JoinHandle<()>>,
     mouse_hook_handle: &'a mut Option<MouseHookHandle>,
 }
 
@@ -777,7 +790,11 @@ async fn apply_initial_layout(
 }
 
 /// Set DPI awareness, ensure a config file exists, load and validate config, and init logging.
-fn bootstrap_config() -> Result<(Config, Vec<config::ConfigWarning>)> {
+fn bootstrap_config() -> Result<(
+    Config,
+    Vec<config::ConfigWarning>,
+    Option<gesture_diagnostics::GestureCaptureHandle>,
+)> {
     // Set DPI awareness before any window/GDI operations
     if set_dpi_awareness() {
         eprintln!("[leopardwm] DPI awareness set to Per-Monitor Aware V2");
@@ -808,26 +825,11 @@ fn bootstrap_config() -> Result<(Config, Vec<config::ConfigWarning>)> {
         "error" => Level::ERROR,
         _ => Level::INFO, // default fallback for invalid values
     };
-    // Write logs to both stdout (captured by the watchdog when launched that
-    // way) and a file in the shared log dir, so the log the banner advertises
-    // and `lwm collect-logs`/"View Logs" point at actually exists regardless of
-    // how the daemon was launched.
-    use tracing_subscriber::prelude::*;
-    let log_dir = leopardwm_ipc::log_dir();
-    let _ = std::fs::create_dir_all(&log_dir);
-    let file_appender = tracing_appender::rolling::never(&log_dir, "leopardwm-daemon.log");
-    tracing_subscriber::registry()
-        .with(tracing_subscriber::filter::LevelFilter::from_level(
-            log_level,
-        ))
-        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stdout))
-        .with(
-            tracing_subscriber::fmt::layer()
-                .with_ansi(false)
-                .with_writer(file_appender),
-        )
-        .try_init()
-        .map_err(|e| anyhow::anyhow!("Failed to set tracing subscriber: {}", e))?;
+    // Clamp capture duration before logging init; validate() repeats the same
+    // bound for the in-memory config. Zero does not open or truncate a file.
+    let capture_secs =
+        config::clamp_diagnostic_capture_secs(config.gestures.diagnostic_capture_secs);
+    let capture_handle = init_logging(log_level, &config, capture_secs)?;
 
     // Validate and clamp config values
     let config_warnings = config.validate();
@@ -835,7 +837,78 @@ fn bootstrap_config() -> Result<(Config, Vec<config::ConfigWarning>)> {
         warn!("Config: {} - {}", w.field, w.message);
     }
 
-    Ok((config, config_warnings))
+    Ok((config, config_warnings, capture_handle))
+}
+
+/// Install stdout + daemon-log layers at the configured level, and optionally a
+/// dedicated gesture-capture layer that can record TRACE on
+/// `leopardwm::gesture_diag` while general logging stays at INFO.
+fn init_logging(
+    log_level: Level,
+    config: &Config,
+    capture_secs: u64,
+) -> Result<Option<gesture_diagnostics::GestureCaptureHandle>> {
+    use tracing_subscriber::prelude::*;
+    let log_dir = leopardwm_ipc::log_dir();
+    let _ = std::fs::create_dir_all(&log_dir);
+    let file_appender = tracing_appender::rolling::never(&log_dir, "leopardwm-daemon.log");
+    let capture_handle = if capture_secs > 0 {
+        gesture_diagnostics::start_capture(
+            &log_dir,
+            gesture_diagnostics::CaptureHeader {
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                gestures_enabled_config: config.gestures.enabled,
+                capture_limit_secs: capture_secs,
+                daemon_integrity: gesture_diagnostics::format_integrity(
+                    leopardwm_platform_win32::current_process_integrity(),
+                ),
+            },
+            gesture_diagnostics::CaptureLimits::from_secs(capture_secs),
+        )
+    } else {
+        None
+    };
+
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(std::io::stdout)
+                .with_filter(tracing_subscriber::filter::LevelFilter::from_level(
+                    log_level,
+                )),
+        )
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(file_appender)
+                .with_filter(tracing_subscriber::filter::LevelFilter::from_level(
+                    log_level,
+                )),
+        )
+        .with(
+            capture_handle
+                .as_ref()
+                .map(|handle| handle.layer().with_filter(handle.filter())),
+        )
+        .try_init()
+        .map_err(|e| anyhow::anyhow!("Failed to set tracing subscriber: {}", e))?;
+
+    if capture_secs > 0 {
+        if capture_handle.is_some() {
+            info!(
+                capture_secs,
+                path = %gesture_diagnostics::capture_log_path(&log_dir).display(),
+                "Gesture diagnostic capture started for this process (startup-only; reload does not start a new capture)"
+            );
+        } else {
+            warn!(
+                capture_secs,
+                "Gesture diagnostic capture was requested but did not start"
+            );
+        }
+    }
+
+    Ok(capture_handle)
 }
 
 /// Install a panic hook that uncloaks all windows and writes a crash report.
@@ -1321,6 +1394,7 @@ fn setup_gestures(
         match register_gestures() {
             Ok((handle, gesture_receiver)) => {
                 info!("Gesture detection enabled");
+                leopardwm_platform_win32::emit_gesture_registration("registered");
 
                 // Spawn thread to forward gesture events
                 match spawn_forwarding_thread(
@@ -1340,11 +1414,13 @@ fn setup_gestures(
                     "Failed to register gestures: {}. Gesture support disabled.",
                     e
                 );
+                leopardwm_platform_win32::emit_gesture_registration("failed");
                 None
             }
         }
     } else {
         info!("Gesture detection disabled by config (gestures.enabled = false)");
+        leopardwm_platform_win32::emit_gesture_registration("disabled");
         None
     }
 }
@@ -1443,8 +1519,13 @@ async fn handle_ipc_subscribe(
     // `events::SubscribeStartup` for the contract.
     use leopardwm_ipc::EventKind;
     use leopardwm_platform_win32::get_process_executable;
-    let s = state.lock().await;
-    let receiver = s.event_broadcaster.subscribe();
+    let mut s = state.lock().await;
+    let receiver = if events.contains(&EventKind::WorkspaceState) {
+        s.publish_workspace_state_if_changed();
+        s.workspace_event_broadcaster.subscribe()
+    } else {
+        s.event_broadcaster.subscribe()
+    };
     let mut snapshot = Vec::new();
 
     if events.contains(&EventKind::Workspace) {
@@ -1496,6 +1577,10 @@ async fn handle_ipc_subscribe(
         });
     }
 
+    if events.contains(&EventKind::WorkspaceState) {
+        snapshot.extend(s.workspace_snapshot_events());
+    }
+
     let ack = leopardwm_ipc::IpcResponse::Subscribed {
         events: events.clone(),
     };
@@ -1532,7 +1617,10 @@ async fn handle_ipc_command(
 
     let is_reload = matches!(&cmd, IpcCommand::Reload);
     let is_resize = matches!(&cmd, IpcCommand::Resize { .. });
-    let is_toggle_pause = matches!(&cmd, IpcCommand::TogglePause);
+    let is_pause_state_command = matches!(
+        &cmd,
+        IpcCommand::TogglePause | IpcCommand::ReleaseAllWindows
+    );
 
     let (response, should_animate, column_rect, hint_duration) = {
         let mut state = ctx.state.lock().await;
@@ -1569,7 +1657,7 @@ async fn handle_ipc_command(
         debug!("Client disconnected before receiving IPC response");
     }
 
-    if is_toggle_pause {
+    if is_pause_state_command {
         let state = ctx.state.lock().await;
         if let Some(ref mgr) = ctx.tray_manager {
             mgr.update_pause_text(state.paused);
@@ -1903,6 +1991,19 @@ fn classify_gesture_command(cmd: &str) -> GestureCommand<'_> {
     }
 }
 
+fn diagnose_gesture_dispatch(event: GestureEvent, command: &str) -> GestureCommand<'_> {
+    let classified = classify_gesture_command(command);
+    match &classified {
+        GestureCommand::NoAction => gesture_diagnostics::emit_dispatch(event, "no_action", None),
+        GestureCommand::Known(_) => {
+            let canonical = config::canonical_action_id(command);
+            gesture_diagnostics::emit_dispatch(event, "known", Some(&canonical));
+        }
+        GestureCommand::Unknown(_) => gesture_diagnostics::emit_dispatch(event, "unknown", None),
+    }
+    classified
+}
+
 /// Handle a touchpad/scroll gesture; returns true when the daemon should shut down.
 async fn handle_gesture_event(ctx: &mut EventLoopCtx<'_>, gesture_event: GestureEvent) -> bool {
     // Map gesture to command from config
@@ -1920,7 +2021,7 @@ async fn handle_gesture_event(ctx: &mut EventLoopCtx<'_>, gesture_event: Gesture
         GestureEvent::ScrollDown => &gesture_config.scroll_down,
     };
 
-    match classify_gesture_command(cmd_str) {
+    match diagnose_gesture_dispatch(gesture_event, cmd_str) {
         GestureCommand::NoAction => {}
         GestureCommand::Known(cmd) => {
             debug!("Gesture {:?} triggered, executing {:?}", gesture_event, cmd);
@@ -1948,10 +2049,33 @@ async fn handle_gesture_event(ctx: &mut EventLoopCtx<'_>, gesture_event: Gesture
                 }
             }
         }
-        GestureCommand::Unknown(cmd) => warn!("Unknown command for gesture: {}", cmd),
+        GestureCommand::Unknown(cmd) => {
+            warn!("Unknown command for gesture: {}", cmd);
+        }
     }
 
     false
+}
+
+#[cfg(test)]
+mod gesture_dispatch_tests {
+    use super::*;
+
+    #[test]
+    fn classify_empty_known_and_unknown_commands() {
+        assert!(matches!(
+            classify_gesture_command(""),
+            GestureCommand::NoAction
+        ));
+        assert!(matches!(
+            classify_gesture_command("focus_left"),
+            GestureCommand::Known(IpcCommand::FocusLeft)
+        ));
+        assert!(matches!(
+            classify_gesture_command("not a real command"),
+            GestureCommand::Unknown("not a real command")
+        ));
+    }
 }
 
 /// Open the config file in the user's editor and arm the "Edit Config" pull, so
@@ -1979,6 +2103,63 @@ async fn launch_config_editor(ctx: &mut EventLoopCtx<'_>) {
             Some((std::time::Instant::now(), filename));
     }
     leopardwm_platform_win32::shell::open(&path);
+}
+
+async fn handle_release_all_windows(ctx: &mut EventLoopCtx<'_>) {
+    warn!("Tray: Release all windows requested");
+    let release_error = {
+        let mut state = ctx.state.lock().await;
+        state.release_all_windows().err().map(|error| {
+            warn!("Tray release all windows failed: {}", error);
+            error.to_string()
+        })
+    };
+    if let Some(ref mgr) = ctx.tray_manager {
+        let state = ctx.state.lock().await;
+        mgr.update_pause_text(state.paused);
+        mgr.update_tooltip(
+            state.all_managed_window_ids().len(),
+            state.monitors.len(),
+            state.paused,
+            Some((
+                ctx.hotkey_state.registered_count,
+                ctx.hotkey_state.requested_count,
+            )),
+            (state.active_workspace_idx(state.focused_monitor) + 1) as u8,
+        );
+    }
+    if let Some(error) = release_error {
+        std::thread::spawn(move || {
+            use windows::core::{w, HSTRING};
+            use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
+            let message = HSTRING::from(format!(
+                "Windows may have been only partially released. Tiling remains paused.\n\nDetails: {error}"
+            ));
+            unsafe {
+                let _ = MessageBoxW(None, &message, w!("LeopardWM"), MB_OK | MB_ICONERROR);
+            }
+        });
+    } else {
+        let event_tx_clone = ctx.event_tx.clone();
+        std::thread::spawn(move || {
+            use windows::core::w;
+            use windows::Win32::UI::WindowsAndMessaging::{
+                MessageBoxW, IDYES, MB_ICONQUESTION, MB_YESNO,
+            };
+            let result = unsafe {
+                MessageBoxW(
+                    None,
+                    w!("All windows have been released and cascaded.\n\nWould you like to restart tiling?"),
+                    w!("LeopardWM"),
+                    MB_YESNO | MB_ICONQUESTION,
+                )
+            };
+            if result == IDYES {
+                let _ =
+                    event_tx_clone.blocking_send(DaemonEvent::Tray(tray::TrayEvent::TogglePause));
+            }
+        });
+    }
 }
 
 async fn handle_tray_event(ctx: &mut EventLoopCtx<'_>, tray_event: tray::TrayEvent) {
@@ -2089,47 +2270,7 @@ async fn handle_tray_event(ctx: &mut EventLoopCtx<'_>, tray_event: tray::TrayEve
             }
             leopardwm_platform_win32::shell::open(&log_dir);
         }
-        tray::TrayEvent::ReleaseAllWindows => {
-            warn!("Tray: Release all windows requested");
-            {
-                let mut state = ctx.state.lock().await;
-                // 1. Pause tiling
-                if !state.paused {
-                    let _ = state.toggle_pause("release all windows");
-                }
-                // 2. Clear focus and hide border
-                state.hide_border();
-                state.previous_focused_hwnd = None;
-                let monitor = state.focused_monitor as i64;
-                state.broadcast_focused_window_if_changed(monitor, None);
-                // 3. Cascade all managed windows
-                let window_ids = state.all_managed_window_ids();
-                cascade_windows(&window_ids);
-            }
-            if let Some(ref mgr) = ctx.tray_manager {
-                mgr.update_pause_text(true);
-            }
-            // 3. Ask user if they want to restart tiling
-            let event_tx_clone = ctx.event_tx.clone();
-            std::thread::spawn(move || {
-                use windows::core::w;
-                use windows::Win32::UI::WindowsAndMessaging::{
-                    MessageBoxW, IDYES, MB_ICONQUESTION, MB_YESNO,
-                };
-                let result = unsafe {
-                    MessageBoxW(
-                        None,
-                        w!("All windows have been released and cascaded.\n\nWould you like to restart tiling?"),
-                        w!("LeopardWM"),
-                        MB_YESNO | MB_ICONQUESTION,
-                    )
-                };
-                if result == IDYES {
-                    let _ = event_tx_clone
-                        .blocking_send(DaemonEvent::Tray(tray::TrayEvent::TogglePause));
-                }
-            });
-        }
+        tray::TrayEvent::ReleaseAllWindows => handle_release_all_windows(ctx).await,
         tray::TrayEvent::ToggleActiveBorder => {
             let mut state = ctx.state.lock().await;
             state.config.appearance.active_border = !state.config.appearance.active_border;
@@ -2270,6 +2411,42 @@ async fn handle_tray_event(ctx: &mut EventLoopCtx<'_>, tray_event: tray::TrayEve
                 let _ = state.config.save();
             }
             sync_tray_toggles(ctx.tray_manager, &state.config);
+        }
+    }
+}
+
+/// Silent close-to-tray disappearance fires no WinEvent. While tracking still
+/// names that window, the next Focused is indistinguishable from
+/// auto-activation, so this tick prunes a dead tracked focus on its own.
+fn spawn_focus_liveness_ticker(event_tx: &mpsc::Sender<DaemonEvent>) {
+    let tx = event_tx.clone();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_millis(500));
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            if tx.send(DaemonEvent::FocusLivenessCheck).await.is_err() {
+                break;
+            }
+        }
+    });
+}
+
+/// Prune a tracked focus window that vanished without a WinEvent, and start
+/// the animation worker when that prune changes the layout.
+async fn handle_focus_liveness_check(ctx: &mut EventLoopCtx<'_>) {
+    let mut state = ctx.state.lock().await;
+    if !state.check_tracked_focus_liveness() {
+        return;
+    }
+    if state.overview_open {
+        state.refresh_overview_model();
+    }
+    if state.is_animating() && !*ctx.animation_active {
+        state.tick_animations(0);
+        if let Ok(true) = state.send_animation_frame(ctx.animation_worker) {
+            *ctx.animation_active = true;
+            *ctx.last_frame_instant = Some(std::time::Instant::now());
         }
     }
 }
@@ -2875,6 +3052,34 @@ pub(crate) fn interrupted_animation_frame_action(
     }
 }
 
+fn resume_after_interrupted_animation_frame(
+    state: &mut AppState,
+    animation_worker: &animation_worker::AnimationWorkerHandle,
+    action: InterruptedAnimationFrameAction,
+) -> bool {
+    let can_resume = if action == InterruptedAnimationFrameAction::ReapplyThenResume {
+        match state.apply_layout() {
+            Ok(crate::layout_apply::LayoutApplyOutcome::Completed) => true,
+            Ok(crate::layout_apply::LayoutApplyOutcome::DeferredByRecoveryBarrier) => false,
+            Err(error) => {
+                warn!(
+                    "Current layout landing after invalidated animation frame failed: {}",
+                    error
+                );
+                false
+            }
+        }
+    } else {
+        true
+    };
+    if can_resume && state.is_animating() {
+        state.tick_animations(0);
+        matches!(state.send_animation_frame(animation_worker), Ok(true))
+    } else {
+        false
+    }
+}
+
 /// Process an applied animation frame: feed back violations, tick, and land the final layout.
 async fn handle_animation_frame_applied(
     ctx: &mut EventLoopCtx<'_>,
@@ -2893,20 +3098,7 @@ async fn handle_animation_frame_applied(
         }
         let resumed = {
             let mut state = ctx.state.lock().await;
-            if action == InterruptedAnimationFrameAction::ReapplyThenResume {
-                if let Err(error) = state.apply_layout() {
-                    warn!(
-                        "Current layout landing after invalidated animation frame failed: {}",
-                        error
-                    );
-                }
-            }
-            if state.is_animating() {
-                state.tick_animations(0);
-                matches!(state.send_animation_frame(ctx.animation_worker), Ok(true))
-            } else {
-                false
-            }
+            resume_after_interrupted_animation_frame(&mut state, ctx.animation_worker, action)
         };
         *ctx.animation_active = resumed;
         *ctx.last_frame_instant = resumed.then(std::time::Instant::now);
@@ -2994,10 +3186,14 @@ async fn handle_animation_frame_applied(
             // visible 1 px wobble on every Chromium / Firefox
             // window every time the layout is re-applied.
             state.post_animation_nudge_pending = true;
-            let landing_ok = state.apply_layout().is_ok();
+            let landing_suppress_focus_resync = state.pending_suppress_landing_focus_resync;
+            let landing_ok = matches!(
+                state.apply_layout(),
+                Ok(crate::layout_apply::LayoutApplyOutcome::Completed)
+            );
             if !landing_ok {
                 warn!(
-                    "Final landing layout failed; dropping any active ghosts \
+                    "Final landing layout was not completed; dropping any active ghosts \
                      without crossfade"
                 );
             }
@@ -3117,7 +3313,7 @@ async fn handle_animation_frame_applied(
             // focused_column. This re-asserts the correct focus
             // after the animation has settled.
             let pending_sticky = state.pending_sticky_refocus.take();
-            state.sync_foreground_after_animation_landing();
+            state.finish_animation_landing_focus_resync(landing_suppress_focus_resync);
             // A workspace switch left a focused pinned window behind
             // it: those same spurious foreground events can have
             // clobbered previous_focused_hwnd mid-slide, making the
@@ -3201,11 +3397,67 @@ async fn handle_display_change_settled(ctx: &mut EventLoopCtx<'_>) {
     }
 }
 
+fn abort_join_handle(handle: Option<tokio::task::JoinHandle<()>>) {
+    if let Some(handle) = handle {
+        handle.abort();
+    }
+}
+
+fn arm_idle_layout_reapply_timer(ctx: &mut EventLoopCtx<'_>) {
+    if ctx.idle_layout_reapply_timer.is_some() {
+        return;
+    }
+    let tx = ctx.event_tx.clone();
+    *ctx.idle_layout_reapply_timer = Some(tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(16)).await;
+        let _ = tx.send(DaemonEvent::IdleLayoutReapply).await;
+    }));
+}
+
+async fn handle_idle_layout_reapply(ctx: &mut EventLoopCtx<'_>) {
+    if let Some(handle) = ctx.idle_layout_reapply_timer.take() {
+        handle.abort();
+    }
+    let outcome = {
+        let mut state = ctx.state.lock().await;
+        state.try_consume_idle_layout_reapply()
+    };
+    if matches!(outcome, crate::temporary_ignore::IdleLayoutReapply::Waiting) {
+        arm_idle_layout_reapply_timer(ctx);
+    }
+}
+
+/// Finish each processed event before waiting for the next one.
+async fn finish_daemon_event(ctx: &mut EventLoopCtx<'_>) {
+    sync_pending_layout_apply_timeout_ui(ctx.state, ctx.tray_manager, &*ctx.hotkey_state).await;
+    let should_arm_idle_reapply = {
+        let mut state = ctx.state.lock().await;
+        let timer_needed = state.idle_layout_reapply_timer_needed();
+        state.publish_workspace_state_if_subscribed();
+        timer_needed
+    };
+    if should_arm_idle_reapply {
+        arm_idle_layout_reapply_timer(ctx);
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    let (config, config_warnings) = bootstrap_config()?;
+    // Reject a duplicate before bootstrap opens the opt-in capture artifact.
+    let ipc_pipe_names = pipe_name_candidates();
+    if check_already_running().await {
+        eprintln!("Error: Another leopardwm-daemon instance is already running.");
+        eprintln!("Use 'leopardwm-cli status' to check the running instance.");
+        eprintln!(
+            "[leopardwm] Another instance is already running (active pipe candidates: {})",
+            ipc_pipe_names.join(", ")
+        );
+        std::process::exit(1);
+    }
+
+    let (config, config_warnings, _gesture_capture) = bootstrap_config()?;
 
     // Install panic hook to uncloak all windows and write a crash report
     install_panic_hook();
@@ -3217,18 +3469,6 @@ async fn main() -> Result<()> {
     // user-facing notices (e.g. "can't tile this elevated window"). Non-fatal.
     if let Err(e) = notify::init() {
         warn!("Toast notification setup failed (notifications disabled): {e:#}");
-    }
-
-    // Check if another instance is already running
-    let ipc_pipe_names = pipe_name_candidates();
-    if check_already_running().await {
-        eprintln!("Error: Another leopardwm-daemon instance is already running.");
-        eprintln!("Use 'leopardwm-cli status' to check the running instance.");
-        error!(
-            "Another leopardwm-daemon instance is already running (active pipe candidates: {})",
-            ipc_pipe_names.join(", ")
-        );
-        std::process::exit(1);
     }
 
     info!(
@@ -3356,6 +3596,8 @@ async fn main() -> Result<()> {
         });
     }
 
+    spawn_focus_liveness_ticker(&event_tx);
+
     // Settings window forwarding channel + handle
     let (settings_sync_tx, settings_sync_rx) = std::sync::mpsc::channel();
     match spawn_forwarding_thread(
@@ -3415,6 +3657,7 @@ async fn main() -> Result<()> {
     // processing until the changes settle to avoid sizing windows to a
     // transient work area.
     let mut display_change_timer: Option<tokio::task::JoinHandle<()>> = None;
+    let mut idle_layout_reapply_timer: Option<tokio::task::JoinHandle<()>> = None;
 
     let mut ctx = EventLoopCtx {
         state: &state,
@@ -3430,6 +3673,7 @@ async fn main() -> Result<()> {
         snap_hint_timer_handle: &mut snap_hint_timer_handle,
         focus_follows_mouse_timer: &mut focus_follows_mouse_timer,
         display_change_timer: &mut display_change_timer,
+        idle_layout_reapply_timer: &mut idle_layout_reapply_timer,
         mouse_hook_handle: &mut mouse_hook_handle,
     };
 
@@ -3475,6 +3719,9 @@ async fn main() -> Result<()> {
             }
             DaemonEvent::TabStripIconPoll => {
                 handle_tab_strip_icon_poll(&state).await;
+            }
+            DaemonEvent::FocusLivenessCheck => {
+                handle_focus_liveness_check(&mut ctx).await;
             }
             DaemonEvent::PersistStateNow => {
                 handle_persist_state_now(&state).await;
@@ -3523,15 +3770,7 @@ async fn main() -> Result<()> {
             }
             DaemonEvent::CrossfadeComplete { epoch } => {
                 let mut state = state.lock().await;
-                let active = state.active_crossfade.as_ref().map(|s| s.epoch);
-                if active == Some(epoch) {
-                    state.active_crossfade = None;
-                }
-                // Always release this epoch's re-registration barrier.
-                // Per-epoch tracking means an aborted fade's stale
-                // CrossfadeComplete only clears its own entry, not a
-                // newer in-flight fade's.
-                state.crossfade_sources.remove(&epoch);
+                state.acknowledge_crossfade_complete(epoch);
             }
             DaemonEvent::HideSnapHint => {
                 if let Some(ref overlay) = snap_hint_overlay {
@@ -3552,6 +3791,7 @@ async fn main() -> Result<()> {
             DaemonEvent::DisplayChangeSettled => {
                 handle_display_change_settled(&mut ctx).await;
             }
+            DaemonEvent::IdleLayoutReapply => handle_idle_layout_reapply(&mut ctx).await,
             DaemonEvent::Shutdown => {
                 info!("Shutdown signal received");
                 run_shutdown_cleanup(&state, ShutdownMode::Graceful).await;
@@ -3559,23 +3799,17 @@ async fn main() -> Result<()> {
             }
         }
 
-        sync_pending_layout_apply_timeout_ui(ctx.state, ctx.tray_manager, &*ctx.hotkey_state).await;
+        finish_daemon_event(&mut ctx).await;
     }
 
     // Stop the update-checker worker so it doesn't hold up shutdown.
     update_check_cancel.store(true, std::sync::atomic::Ordering::SeqCst);
     stop_animation_worker_and_run_recovery(animation_worker, &state, event_rx).await;
 
-    // Clean up timers if running
-    if let Some(handle) = snap_hint_timer_handle {
-        handle.abort();
-    }
-    if let Some(handle) = focus_follows_mouse_timer {
-        handle.abort();
-    }
-    if let Some(handle) = display_change_timer {
-        handle.abort();
-    }
+    abort_join_handle(snap_hint_timer_handle);
+    abort_join_handle(focus_follows_mouse_timer);
+    abort_join_handle(display_change_timer);
+    abort_join_handle(idle_layout_reapply_timer);
 
     // Join forwarding threads with timeout for graceful shutdown
     info!("Waiting for forwarding threads to exit...");

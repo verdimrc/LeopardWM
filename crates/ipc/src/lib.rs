@@ -4,6 +4,9 @@
 
 pub mod config_template;
 pub mod hotkeys;
+pub mod workspace_state;
+
+pub use workspace_state::{WorkspaceStateRecord, WorkspaceStateSnapshot};
 
 use serde::{Deserialize, Serialize};
 
@@ -25,7 +28,10 @@ const MAX_PIPE_SCOPE_SEGMENT_LEN: usize = 64;
 ///   subscribers using `serde(default)` parse v1 payloads cleanly.
 /// - v3: effective hotkey query — `QueryHotkeys`, `HotkeyList`, and the
 ///   associated binding/diagnostic records.
-pub const IPC_PROTOCOL_VERSION: u32 = 3;
+/// - v4: complete workspace-state snapshots and monitor-targeted
+///   workspace switching. `ReleaseAllWindows` and `ToggleIgnore` are
+///   additive and retain v4 compatibility.
+pub const IPC_PROTOCOL_VERSION: u32 = 4;
 /// Minimum protocol version this crate supports.
 pub const IPC_MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 1;
 
@@ -56,6 +62,11 @@ pub fn log_dir() -> std::path::PathBuf {
         .map(|d| d.data_local_dir().join("leopardwm").join("logs"))
         .unwrap_or_else(|| std::env::temp_dir().join("leopardwm").join("logs"))
 }
+
+/// Dedicated opt-in gesture diagnostic capture file inside [`log_dir`].
+/// Written only when `[gestures] diagnostic_capture_secs` is non-zero at
+/// daemon startup. Default-off does not create or truncate this file.
+pub const GESTURE_CAPTURE_LOG_FILE: &str = "leopardwm-gesture-capture.log";
 
 /// Build a user-scoped pipe name from an arbitrary user/domain scope string.
 pub fn scoped_pipe_name_for_user(scope: &str) -> String {
@@ -206,11 +217,20 @@ pub enum EventKind {
     /// Periodic liveness heartbeats (`Heartbeat`). Subscribers receive
     /// one every 30s of silence so they can detect dead daemon pipes.
     Heartbeat,
+    /// Complete multi-monitor workspace-state snapshots.
+    WorkspaceState,
 }
 
 impl EventKind {
-    /// All event kinds, useful as a default subscription set.
+    /// All event kinds known to this protocol version.
     pub fn all() -> std::collections::BTreeSet<EventKind> {
+        let mut kinds = Self::legacy_default();
+        kinds.insert(EventKind::WorkspaceState);
+        kinds
+    }
+
+    /// Event kinds delivered for an empty legacy subscription filter.
+    pub fn legacy_default() -> std::collections::BTreeSet<EventKind> {
         [
             EventKind::Workspace,
             EventKind::FocusedWindow,
@@ -313,6 +333,34 @@ pub enum IpcEvent {
         /// Columns in left-to-right order.
         columns: Vec<ColumnSummary>,
     },
+    /// Start of an atomic workspace-state snapshot transaction.
+    WorkspaceSnapshotBegin {
+        /// Protocol version used by this snapshot transaction.
+        protocol_version: u32,
+        /// Opaque daemon-instance identifier.
+        session_id: String,
+        /// Monotonic semantic-state revision.
+        revision: u64,
+        /// Device name of the globally focused monitor, if known.
+        focused_monitor_device_name: Option<String>,
+    },
+    /// A contiguous group of records within a workspace-state snapshot.
+    WorkspaceSnapshotChunk {
+        /// Revision shared with the enclosing begin/end frames.
+        revision: u64,
+        /// Contiguous state records in deterministic snapshot order.
+        records: Vec<WorkspaceStateRecord>,
+    },
+    /// Successful end of a workspace-state snapshot transaction.
+    WorkspaceSnapshotEnd {
+        /// Revision shared with the preceding begin/chunk frames.
+        revision: u64,
+    },
+    /// Workspace-state snapshot generation failed.
+    WorkspaceSnapshotError {
+        /// Bounded description of the encoding failure.
+        message: String,
+    },
     /// `lwm reload` completed (config reread, rules recompiled, layout reapplied).
     ConfigReloaded,
     /// Periodic liveness signal. Sent after ~30s of silence on a stream
@@ -338,6 +386,10 @@ impl IpcEvent {
             IpcEvent::WorkspaceChanged { .. } => EventKind::Workspace,
             IpcEvent::FocusedWindowChanged { .. } => EventKind::FocusedWindow,
             IpcEvent::LayoutChanged { .. } => EventKind::Layout,
+            IpcEvent::WorkspaceSnapshotBegin { .. }
+            | IpcEvent::WorkspaceSnapshotChunk { .. }
+            | IpcEvent::WorkspaceSnapshotEnd { .. }
+            | IpcEvent::WorkspaceSnapshotError { .. } => EventKind::WorkspaceState,
             IpcEvent::ConfigReloaded => EventKind::Config,
             IpcEvent::Heartbeat { .. } => EventKind::Heartbeat,
             // Lagged is an internal control event, not subscribable; emit
@@ -424,8 +476,10 @@ pub enum IpcCommand {
         delta: f64,
     },
 
-    /// Query the current workspace state.
+    /// Query the current focused workspace layout.
     QueryWorkspace,
+    /// Query the complete multi-monitor workspace state as snapshot frames.
+    QueryWorkspaceState,
     /// Query the focused window.
     QueryFocused,
     /// Query the effective hotkey catalog and configuration diagnostics.
@@ -443,6 +497,10 @@ pub enum IpcCommand {
     PanicRevert,
     /// Toggle paused state for tiling operations.
     TogglePause,
+    /// Pause tiling and cascade every managed window without removing membership.
+    ReleaseAllWindows,
+    /// Toggle session-only ignore for the actual OS foreground window.
+    ToggleIgnore,
     /// Toggle the swap-chain ghost-animation feature at runtime.
     /// `None` queries current state; `Some(b)` sets it. Returns
     /// `BoolValue` with the new (or current) state.
@@ -499,6 +557,13 @@ pub enum IpcCommand {
         /// Workspace number (1-9).
         index: u8,
     },
+    /// Switch to workspace N (1-9) on the explicitly named monitor.
+    SwitchWorkspaceOnMonitor {
+        /// Current Win32 display device name (for example `\\.\DISPLAY2`).
+        monitor_device_name: String,
+        /// Workspace number (1-9).
+        index: u8,
+    },
     /// Move the focused window to workspace N (1-9) on the focused monitor.
     MoveToWorkspace {
         /// Workspace number (1-9).
@@ -542,7 +607,7 @@ pub enum IpcCommand {
     /// pipe cannot be used for further commands; clients open a second
     /// pipe for ad-hoc queries while subscribed.
     Subscribe {
-        /// Event kinds to receive. An empty set is treated as "all kinds".
+        /// Event kinds to receive. An empty set expands to `EventKind::legacy_default()`.
         events: std::collections::BTreeSet<EventKind>,
     },
 
@@ -618,6 +683,11 @@ pub enum IpcResponse {
     /// Command failed with an error.
     Error {
         /// Error message describing what went wrong.
+        message: String,
+    },
+    /// Apply was accepted but its recovery landing remains pending.
+    ApplyPending {
+        /// Message describing the pending recovery landing.
         message: String,
     },
     /// Workspace state query response.
@@ -703,6 +773,12 @@ pub enum IpcResponse {
         /// requested set after defaulting and validation).
         events: std::collections::BTreeSet<EventKind>,
     },
+    /// Acknowledgment for `IpcCommand::QueryWorkspaceState`. Snapshot event
+    /// frames follow on the same connection before EOF.
+    WorkspaceStateReady {
+        /// Protocol version used by the following snapshot frames.
+        protocol_version: u32,
+    },
     /// Health check response.
     HealthInfo {
         /// Whether the daemon considers itself healthy.
@@ -785,6 +861,16 @@ mod tests {
     }
 
     #[test]
+    fn test_toggle_ignore_wire_name_is_stable() {
+        let cmd = IpcCommand::ToggleIgnore;
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert_eq!(json, r#"{"type":"toggle_ignore"}"#);
+
+        let parsed: IpcCommand = serde_json::from_str(r#"{"type":"toggle_ignore"}"#).unwrap();
+        assert_eq!(parsed, IpcCommand::ToggleIgnore);
+    }
+
+    #[test]
     fn test_response_serialization() {
         let resp = IpcResponse::Ok;
         let json = serde_json::to_string(&resp).unwrap();
@@ -825,6 +911,65 @@ mod tests {
     }
 
     #[test]
+    fn test_apply_pending_response_roundtrip() {
+        let response = IpcResponse::ApplyPending {
+            message: "Recovery placement is still pending".to_string(),
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert_eq!(
+            json,
+            r#"{"status":"apply_pending","message":"Recovery placement is still pending"}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<IpcResponse>(&json).unwrap(),
+            response
+        );
+    }
+
+    #[derive(Debug, Deserialize, PartialEq)]
+    #[serde(tag = "status", rename_all = "snake_case")]
+    enum LegacyIpcResponse {
+        Ok,
+        Error {
+            message: String,
+        },
+        #[serde(other)]
+        Unknown,
+    }
+
+    #[test]
+    fn test_legacy_response_decoder_maps_apply_pending_to_unknown() {
+        let response = IpcResponse::ApplyPending {
+            message: "Recovery placement is still pending".to_string(),
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert_eq!(
+            serde_json::from_str::<LegacyIpcResponse>(&json).unwrap(),
+            LegacyIpcResponse::Unknown
+        );
+    }
+
+    #[test]
+    fn test_legacy_response_decoder_preserves_ok_and_error() {
+        assert_eq!(
+            serde_json::from_str::<LegacyIpcResponse>(
+                &serde_json::to_string(&IpcResponse::Ok).unwrap()
+            )
+            .unwrap(),
+            LegacyIpcResponse::Ok
+        );
+        assert_eq!(
+            serde_json::from_str::<LegacyIpcResponse>(
+                &serde_json::to_string(&IpcResponse::error("Test error")).unwrap()
+            )
+            .unwrap(),
+            LegacyIpcResponse::Error {
+                message: "Test error".to_string(),
+            }
+        );
+    }
+
+    #[test]
     fn test_all_command_types_roundtrip() {
         // Verify all command variants serialize and deserialize correctly
         let commands = vec![
@@ -859,6 +1004,8 @@ mod tests {
             IpcCommand::Stop,
             IpcCommand::PanicRevert,
             IpcCommand::TogglePause,
+            IpcCommand::ReleaseAllWindows,
+            IpcCommand::ToggleIgnore,
             IpcCommand::CloseWindow,
             IpcCommand::ToggleFloating,
             IpcCommand::ToggleFullscreen,
@@ -900,6 +1047,9 @@ mod tests {
             IpcResponse::Ok,
             IpcResponse::Error {
                 message: "Test error".to_string(),
+            },
+            IpcResponse::ApplyPending {
+                message: "Recovery placement is still pending".to_string(),
             },
             IpcResponse::WorkspaceState {
                 columns: 5,
@@ -1280,14 +1430,26 @@ mod tests {
     }
 
     #[test]
-    fn test_protocol_version_bumped_to_v3() {
-        // Sanity guard: bumping the version forces a deliberate review of
-        // wire-compat docs in agent_docs/ipc-events.md when this test breaks.
-        assert_eq!(IPC_PROTOCOL_VERSION, 3);
-        // Older additive-protocol clients should still negotiate.
+    fn test_protocol_version_remains_v4_for_additive_release_command() {
+        assert_eq!(IPC_PROTOCOL_VERSION, 4);
         assert!(is_protocol_version_supported(1));
         assert!(is_protocol_version_supported(2));
         assert!(is_protocol_version_supported(3));
+        assert!(is_protocol_version_supported(4));
+        assert!(!is_protocol_version_supported(5));
+    }
+
+    #[test]
+    fn release_all_windows_command_uses_the_stable_wire_name() {
+        let command = IpcCommand::ReleaseAllWindows;
+        assert_eq!(
+            serde_json::to_string(&command).unwrap(),
+            r#"{"type":"release_all_windows"}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<IpcCommand>(r#"{"type":"release_all_windows"}"#).unwrap(),
+            command
+        );
     }
 
     #[test]
@@ -1376,7 +1538,31 @@ mod tests {
         assert!(all.contains(&EventKind::Layout));
         assert!(all.contains(&EventKind::Config));
         assert!(all.contains(&EventKind::Heartbeat));
-        assert_eq!(all.len(), 5);
+        assert!(all.contains(&EventKind::WorkspaceState));
+        assert_eq!(all.len(), 6);
+
+        let legacy = EventKind::legacy_default();
+        assert_eq!(legacy.len(), 5);
+        assert!(!legacy.contains(&EventKind::WorkspaceState));
+    }
+
+    #[test]
+    fn workspace_state_wire_commands_and_filter_deserialize() {
+        let query = serde_json::from_str::<IpcCommand>(r#"{"type":"query_workspace_state"}"#);
+        assert!(query.is_ok(), "query_workspace_state must deserialize");
+
+        let targeted = serde_json::from_str::<IpcCommand>(
+            r#"{"type":"switch_workspace_on_monitor","monitor_device_name":"\\\\.\\DISPLAY2","index":2}"#,
+        );
+        assert!(
+            targeted.is_ok(),
+            "targeted workspace switch must deserialize"
+        );
+
+        let subscribe = serde_json::from_str::<IpcCommand>(
+            r#"{"type":"subscribe","events":["workspace_state"]}"#,
+        );
+        assert!(subscribe.is_ok(), "workspace_state filter must deserialize");
     }
 
     #[test]

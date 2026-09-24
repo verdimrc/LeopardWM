@@ -111,7 +111,7 @@ enum WorkerCommand {
     /// so stale inset-expanded positions don't survive as cache hits).
     ClearCache,
     /// Acknowledge after all commands queued before this one have completed.
-    SessionEndBarrier(std_mpsc::Sender<()>),
+    Barrier(std_mpsc::Sender<()>),
     #[cfg(test)]
     TestBlock(std_mpsc::Receiver<()>),
     /// Shut down the worker thread.
@@ -188,11 +188,19 @@ impl AnimationWorkerControl {
     ///
     /// Returns `true` when the barrier was acknowledged or the worker had
     /// already exited, and `false` when the bounded wait expired.
-    pub fn wait_for_session_end_barrier(&self, timeout: Duration) -> bool {
+    ///
+    /// Each call creates a fresh ack receiver and drops it on timeout. A
+    /// timeout is not idle proof: the worker may still be busy, and the
+    /// dropped receipt cannot be observed later. Production idle checks use
+    /// a 1ms probe; the 16ms idle-reapply timer retries with a new barrier.
+    /// Because each timeout discards its receipt, repeated scheduling delays
+    /// longer than the probe can keep recovery waiting. There is no scheduler
+    /// deadline or progress guarantee.
+    pub fn wait_for_barrier(&self, timeout: Duration) -> bool {
         let (ack_tx, ack_rx) = std_mpsc::channel();
         if self
             .command_tx
-            .send(WorkerCommand::SessionEndBarrier(ack_tx))
+            .send(WorkerCommand::Barrier(ack_tx))
             .is_err()
         {
             return true;
@@ -233,6 +241,15 @@ impl AnimationWorkerHandle {
         self.command_tx
             .send(WorkerCommand::Frame(request))
             .map_err(|_| "Animation worker thread has exited".to_string())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn block_for_test(&self) -> std_mpsc::Sender<()> {
+        let (release_tx, release_rx) = std_mpsc::channel();
+        self.command_tx
+            .send(WorkerCommand::TestBlock(release_rx))
+            .unwrap();
+        release_tx
     }
 
     /// Return a cloneable remote-control handle usable from AppState
@@ -340,7 +357,7 @@ fn worker_loop(
                 debug!("Animation worker: placement cache cleared");
                 continue;
             }
-            WorkerCommand::SessionEndBarrier(ack_tx) => {
+            WorkerCommand::Barrier(ack_tx) => {
                 let _ = ack_tx.send(());
                 continue;
             }
@@ -730,7 +747,7 @@ mod tests {
     }
 
     #[test]
-    fn session_end_barrier_waits_for_prior_worker_command() {
+    fn barrier_waits_for_prior_worker_command() {
         let (command_tx, command_rx) = std_mpsc::channel();
         let (event_tx, _event_rx) = tokio::sync::mpsc::channel(1);
         let worker_thread = std::thread::spawn(move || {
@@ -747,7 +764,7 @@ mod tests {
         let (wait_done_tx, wait_done_rx) = std_mpsc::channel();
 
         let wait_thread = std::thread::spawn(move || {
-            let acknowledged = control.wait_for_session_end_barrier(Duration::from_secs(2));
+            let acknowledged = control.wait_for_barrier(Duration::from_secs(2));
             wait_done_tx.send(acknowledged).unwrap();
         });
 
@@ -761,5 +778,37 @@ mod tests {
         wait_thread.join().unwrap();
         command_tx.send(WorkerCommand::Shutdown).unwrap();
         worker_thread.join().unwrap();
+    }
+
+    #[test]
+    fn delayed_barrier_ack_progresses_on_later_probe() {
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(1);
+        let worker = AnimationWorkerHandle::spawn(event_tx, Arc::new(AtomicBool::new(false)))
+            .expect("spawn animation worker");
+        let unblock = worker.block_for_test();
+        let control = worker.control();
+
+        assert!(
+            !control.wait_for_barrier(Duration::from_millis(1)),
+            "a production 1ms probe must time out while prior work is blocked"
+        );
+
+        unblock.send(()).unwrap();
+        // Production recovery also uses 1ms probes. A later 1ms probe is not
+        // guaranteed to observe idle: each timeout drops its receipt, so
+        // scheduling delays longer than 1ms can keep recovery waiting. Retry
+        // with fresh 1ms probes the same way the idle-reapply timer does.
+        // The attempt cap is a test hang bound, not a scheduler deadline.
+        let mut observed_idle = false;
+        for _ in 0..2_000 {
+            if control.wait_for_barrier(Duration::from_millis(1)) {
+                observed_idle = true;
+                break;
+            }
+        }
+        assert!(
+            observed_idle,
+            "fresh 1ms probes can observe idle after prior work finishes; this is retry evidence, not a progress guarantee"
+        );
     }
 }

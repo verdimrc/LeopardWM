@@ -2,6 +2,7 @@
 
 use crate::config::Config;
 use crate::hotkey_resolution::resolve_hotkeys;
+use crate::layout_apply::LayoutApplyOutcome;
 use crate::state::{
     validate_set_width_fraction, AppState, ElevationBlockedRecord, PendingWorkspaceSwitchFocus,
 };
@@ -11,7 +12,7 @@ use leopardwm_ipc::{
 };
 use leopardwm_platform_win32::{
     enumerate_windows, get_process_executable, monitor_above, monitor_below, monitor_to_left,
-    monitor_to_right, move_window_offscreen, ManageBlock, MonitorId, MonitorInfo,
+    monitor_to_right, ManageBlock, MonitorId, MonitorInfo,
 };
 use std::collections::HashMap;
 use tracing::{debug, info};
@@ -454,13 +455,25 @@ impl AppState {
             IpcCommand::QueryFocused => self.handle_query_focused(),
             IpcCommand::QueryHotkeys => self.handle_query_hotkeys(),
             IpcCommand::Refresh => self.handle_refresh(),
-            IpcCommand::Apply => {
-                if let Err(e) = self.apply_layout() {
-                    return IpcResponse::error(format!("Failed to apply layout: {}", e));
+            IpcCommand::Apply
+                if self.paused && self.pending_idle_layout_reapply =>
+            {
+                IpcResponse::ApplyPending {
+                    message: "Layout application remains pending while tiling is paused"
+                        .to_string(),
                 }
-                info!("Applied layout");
-                IpcResponse::Ok
             }
+            IpcCommand::Apply => match self.apply_layout() {
+                Ok(LayoutApplyOutcome::Completed) => {
+                    info!("Applied layout");
+                    IpcResponse::Ok
+                }
+                Ok(LayoutApplyOutcome::DeferredByRecoveryBarrier) => IpcResponse::ApplyPending {
+                    message: "Layout application remains pending while recovery animation placement finishes"
+                        .to_string(),
+                },
+                Err(error) => IpcResponse::error(format!("Failed to apply layout: {}", error)),
+            },
             IpcCommand::Reload => self.handle_reload(),
             IpcCommand::TogglePause => {
                 if let Err(e) = self.toggle_pause("IPC toggle") {
@@ -468,6 +481,11 @@ impl AppState {
                 }
                 IpcResponse::Ok
             }
+            IpcCommand::ReleaseAllWindows => match self.release_all_windows() {
+                Ok(()) => IpcResponse::Ok,
+                Err(e) => IpcResponse::error(format!("Failed to release all windows: {}", e)),
+            },
+            IpcCommand::ToggleIgnore => self.toggle_ignore(),
             IpcCommand::SetGhostAnimation { enabled } => self.handle_set_ghost_animation(enabled),
             IpcCommand::Stop => {
                 // This is handled specially in the event loop
@@ -563,6 +581,10 @@ impl AppState {
             IpcCommand::MoveToWorkspacePrev => self.handle_move_to_workspace_relative(false),
             IpcCommand::MoveToWorkspaceNext => self.handle_move_to_workspace_relative(true),
             IpcCommand::SwitchWorkspace { index } => self.handle_switch_workspace(index),
+            IpcCommand::SwitchWorkspaceOnMonitor {
+                monitor_device_name,
+                index,
+            } => self.handle_switch_workspace_on_monitor(&monitor_device_name, index),
             IpcCommand::MoveToWorkspace { index } => self.handle_move_to_workspace(index),
             IpcCommand::HealthCheck => self.handle_health_check(),
             IpcCommand::GetAutoStart => {
@@ -572,6 +594,10 @@ impl AppState {
                 }
             }
             IpcCommand::SetAutoStart { enabled } => self.handle_set_auto_start(enabled),
+            IpcCommand::QueryWorkspaceState => IpcResponse::error(
+                "QueryWorkspaceState must be handled by the IPC server, not the main command \
+                 loop — this is an internal routing bug.",
+            ),
             IpcCommand::Subscribe { .. } => {
                 // Subscribe is handled out-of-band by ipc_server.rs
                 // (per-client task acquires AppState directly so subscribe
@@ -1077,6 +1103,26 @@ impl AppState {
         self.handle_switch_workspace_with_direction(index, None)
     }
 
+    fn handle_switch_workspace_on_monitor(
+        &mut self,
+        monitor_device_name: &str,
+        index: u8,
+    ) -> IpcResponse {
+        if !(1..=9).contains(&index) {
+            return IpcResponse::error("Workspace index must be 1-9");
+        }
+        let Some(monitor) = self
+            .monitors
+            .values()
+            .find(|monitor| monitor.device_name == monitor_device_name)
+            .map(|monitor| monitor.id)
+        else {
+            return IpcResponse::error(format!("Monitor not found: {}", monitor_device_name));
+        };
+
+        self.switch_workspace_on_monitor(monitor, index, None, true)
+    }
+
     fn handle_switch_workspace_with_direction(
         &mut self,
         index: u8,
@@ -1085,15 +1131,40 @@ impl AppState {
         if !(1..=9).contains(&index) {
             return IpcResponse::error("Workspace index must be 1-9");
         }
-        // A switch initiated outside the overlay (hotkey, CLI) dismisses
-        // an open overview; overlay-initiated switches hid it already.
-        if self.overview_open {
-            self.hide_overview_animated(Some((index - 1) as usize));
-        }
+        self.switch_workspace_on_monitor(self.focused_monitor, index, relative_forward, false)
+    }
+
+    fn switch_workspace_on_monitor(
+        &mut self,
+        monitor: MonitorId,
+        index: u8,
+        relative_forward: Option<bool>,
+        focus_target_monitor: bool,
+    ) -> IpcResponse {
         let idx = (index - 1) as usize;
-        let monitor = self.focused_monitor;
+        let target_was_focused = monitor == self.focused_monitor;
+        // A switch initiated outside the overlay (hotkey, CLI) dismisses
+        // an open overview; overlay-initiated switches hid it already. An
+        // explicit switch to another monitor closes toward the overview's
+        // current workspace, not a workspace slot on the destination monitor.
+        if self.overview_open {
+            let overview_target = (monitor == self.focused_monitor).then_some(idx);
+            self.hide_overview_animated(overview_target);
+        }
+        if focus_target_monitor {
+            self.focused_monitor = monitor;
+        }
         let current_idx = self.active_workspace_idx(monitor);
         if idx == current_idx {
+            if focus_target_monitor {
+                if let Err(e) = self.apply_layout() {
+                    return IpcResponse::error(format!("Failed to apply layout: {}", e));
+                }
+                if !target_was_focused {
+                    self.restore_workspace_floating_focus(monitor, idx);
+                }
+                self.sync_foreground_window();
+            }
             return IpcResponse::Ok;
         }
 
@@ -1114,14 +1185,16 @@ impl AppState {
         // refocus from a previous (aborted) switch is dropped here.
         self.pending_sticky_refocus = None;
         let sticky_focus = leaving_focus.filter(|hwnd| self.sticky_windows.contains(hwnd));
-        if let Some(hwnd) = leaving_focus {
-            if self
-                .focused_workspace()
-                .is_some_and(|ws| ws.is_floating(hwnd))
-            {
-                self.floating_focus.insert((monitor, current_idx), hwnd);
-            } else {
-                self.floating_focus.remove(&(monitor, current_idx));
+        if target_was_focused {
+            if let Some(hwnd) = leaving_focus {
+                if self
+                    .focused_workspace()
+                    .is_some_and(|ws| ws.is_floating(hwnd))
+                {
+                    self.floating_focus.insert((monitor, current_idx), hwnd);
+                } else {
+                    self.floating_focus.remove(&(monitor, current_idx));
+                }
             }
         }
 
@@ -1153,12 +1226,14 @@ impl AppState {
         if let Some(ref transition) = self.layout_transition {
             for wid in transition.exit_rects.keys() {
                 if !self.is_application_fullscreen(*wid) {
+                    #[cfg(not(test))]
                     let _ = leopardwm_platform_win32::move_window_offscreen(*wid);
                 }
             }
         }
+        // The slide installed below carries a deferred focus border.
+        // Aborting here would paint it before that slide exists.
         self.abort_active_ghost_transition();
-        self.abort_layout_transition();
 
         let slide_height = self
             .monitors
@@ -1189,9 +1264,10 @@ impl AppState {
         // Ensure target workspace exists (lazy creation)
         self.ensure_workspace_exists(monitor, idx);
 
-        // A new explicit destination supersedes any earlier stale-focus guard
-        // before layout application can fail.
+        // A new explicit destination supersedes earlier switch-focus and
+        // last-window departure guards before layout application can fail.
         self.pending_workspace_switch_focus = None;
+        self.pending_last_window_departure = None;
 
         // Switch active workspace
         self.active_workspace.insert(monitor, idx);
@@ -1260,10 +1336,20 @@ impl AppState {
         if animating {
             let duration = self.config.animation.workspace_switch_duration_ms;
             self.start_workspace_switch_transition(start_rects, exit_rects, duration);
+            if let Some(transition) = self.layout_transition.as_mut() {
+                transition.defer_focus_border = true;
+            }
+            // The previous workspace's border would otherwise stay put while
+            // both workspaces slide. The incoming border waits until completion.
+            self.hide_border();
         } else {
+            // No replacement slide. A deferred border lands now; a
+            // non-deferred transition only clears.
+            self.abort_layout_transition();
             for (wid, _) in &old_placements {
                 if !self.is_application_fullscreen(*wid) {
-                    let _ = move_window_offscreen(*wid);
+                    #[cfg(not(test))]
+                    let _ = leopardwm_platform_win32::move_window_offscreen(*wid);
                 }
             }
         }
@@ -1278,16 +1364,7 @@ impl AppState {
         // Restore the floating window that was focused on this
         // workspace (if it still floats here) so it regains focus on
         // return, before syncing the OS foreground.
-        if let Some(&hwnd) = self.floating_focus.get(&(monitor, idx)) {
-            let still_floating = self
-                .workspaces
-                .get(&monitor)
-                .and_then(|v| v.get(idx))
-                .is_some_and(|ws| ws.is_floating(hwnd));
-            if still_floating {
-                self.previous_focused_hwnd = Some(hwnd);
-            }
-        }
+        self.restore_workspace_floating_focus(monitor, idx);
         self.sync_foreground_window();
         // If a summoned scratchpad lives on this workspace, restore
         // its focus (it would otherwise stay visible but lose focus
@@ -1329,6 +1406,19 @@ impl AppState {
         });
         info!("Switched to workspace {}", index);
         IpcResponse::Ok
+    }
+
+    fn restore_workspace_floating_focus(&mut self, monitor: MonitorId, idx: usize) {
+        if let Some(&hwnd) = self.floating_focus.get(&(monitor, idx)) {
+            let still_floating = self
+                .workspaces
+                .get(&monitor)
+                .and_then(|v| v.get(idx))
+                .is_some_and(|ws| ws.is_floating(hwnd));
+            if still_floating {
+                self.previous_focused_hwnd = Some(hwnd);
+            }
+        }
     }
 
     /// Handle `IpcCommand::MoveToWorkspace`.
@@ -1544,7 +1634,8 @@ impl AppState {
             let _ = leopardwm_platform_win32::snapshot::snapshot_capture(focused_hwnd);
         }
         if !self.is_application_fullscreen(focused_hwnd) {
-            let _ = move_window_offscreen(focused_hwnd);
+            #[cfg(not(test))]
+            let _ = leopardwm_platform_win32::move_window_offscreen(focused_hwnd);
         }
 
         // Ensure the source workspace scrolls to show its new focused window
@@ -2101,3 +2192,7 @@ mod set_active_tab_tests {
         assert!(state.pending_tab_focus.is_none());
     }
 }
+
+#[cfg(test)]
+#[path = "workspace_switch_tests.rs"]
+mod workspace_switch_tests;

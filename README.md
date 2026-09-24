@@ -217,6 +217,8 @@ lwm stop               # stop the daemon
 lwm status             # show version, monitor count, window count, uptime
 ```
 
+Matching versions (Recommended): use the CLI and daemon from the same release. Corrected `lwm run` pending-apply handling depends on both sides understanding `apply_pending`. A matching pair reports a still-pending recovery landing as a non-success without emergency visibility restore. An older CLI maps that status to unknown and may invoke emergency restore. Mixed versions are not negotiated or isolated on the pipe. Pending handling does not change the Apply request shape. This release still advances the overall IPC protocol from v3 to v4 for workspace-state snapshots.
+
 ### Query state
 
 ```bash
@@ -266,7 +268,33 @@ lwm toggle-fullscreen
 lwm scratchpad-stash                   # stash focused window (or release the scratchpad)
 lwm scratchpad-toggle                  # summon / hide the scratchpad
 lwm toggle-sticky                      # pin / unpin focused window on every workspace
+lwm toggle-ignore                      # session-only ignore for the OS foreground window
 ```
+
+`lwm toggle-ignore` targets the actual OS foreground window, not LeopardWM's cached
+focus. Toggling out unmanages that window for this daemon session only; toggling
+it back in re-admits it on the current monitor's active workspace. Persistent
+Ignore rules still win. The action is in the hotkey catalog with no default
+shortcut.
+
+### Release all managed windows
+
+```bash
+lwm release-all-windows
+```
+
+This pauses tiling, clears LeopardWM's active decoration, globally attempts to
+restore any top-level windows parked at LeopardWM's off-screen sentinel, and
+cascades every tiled and floating managed window. Membership and admission stay
+intact: use `lwm toggle-pause` to resume tiling. The command has no confirmation
+prompt. If recovery fails or a live window cannot be restored, cascaded, or is
+still maximized, release may be partial, tiling remains paused, and the CLI
+reports the failure. Release first invalidates older animation work and waits up
+to 100 ms for the animation worker. If that worker is busy, or a timed-out
+placement worker is still recovering, no cascade is performed and tiling stays
+paused. Retry `lwm release-all-windows` after the worker finishes; the failed
+request never schedules a later cascade. Final cascade positions are ordered
+after previously queued animation positions, and ordering failures are reported.
 
 ### Autostart (boot with Windows)
 
@@ -280,12 +308,21 @@ This is also exposed as a Settings UI toggle and a tray menu item.
 ### Subscribe to events (status bars, custom integrations)
 
 ```bash
-lwm subscribe                                       # all events, newline-delimited JSON
+lwm subscribe                                       # legacy event kinds, newline-delimited JSON
 lwm subscribe --events workspace,focused_window     # filtered subset
+lwm subscribe --events workspace_state              # complete all-monitor workspace state
+lwm query workspaces                                 # one complete workspace snapshot
+lwm workspace 2 --monitor '\\.\DISPLAY2'            # select a workspace on that display
 lwm subscribe | jq                                   # pretty-printed in another terminal
 ```
 
-After the daemon answers `Subscribed`, the connection stays open and streams `IpcEvent` frames (`workspace_changed`, `focused_window_changed`, `layout_changed`, `config_reloaded`, `heartbeat`) as state changes occur. Pipe into a status bar (Yasb, eww, custom Tauri/Electron widgets) to re-render on each event without polling. Full schemas + sample clients in `agent_docs/ipc-events.md`.
+After the daemon answers `Subscribed`, the connection stays open and streams
+`IpcEvent` frames as state changes occur. An empty filter preserves only the
+legacy event set (`workspace_changed`, `focused_window_changed`, `layout_changed`,
+`config_reloaded`, `heartbeat`); complete workspace snapshots require explicit
+`--events workspace_state` opt-in and acknowledgement (IPC v4). Targeted workspace commands
+use 1-based indices and transfer focus to the named monitor; snapshot indices are
+0-based. Full schemas and sample clients are in `agent_docs/ipc-events.md`.
 
 ### Troubleshooting
 
@@ -299,6 +336,57 @@ lwm panic-revert       # emergency: uncloak everything, drop daemon out of manag
 
 Run `lwm help` (or `lwm <subcommand> --help`) for the full surface — there are ~40 subcommands.
 
+### Touchpad gesture diagnostics
+
+Failed physical gestures are diagnosed with an opt-in, short capture — not by leaving general logging at TRACE. Capture is **default off**; turning it on does not change gesture behavior.
+
+1. In `%APPDATA%\leopardwm\config\config.toml`, set a short interval under `[gestures]`:
+
+   ```toml
+   diagnostic_capture_secs = 15
+   ```
+
+   The value is startup-only and clamped to 120 seconds. Settings saves preserve the knob; there is no live start command.
+
+2. Restart the daemon with the documented workflow. **`lwm reload` is not enough.**
+
+   ```bash
+   lwm stop
+   lwm run
+   ```
+
+   Stopping and starting can disturb off-screen client-area or DWM frame geometry. That is a known restart limitation, not a gesture-compatibility claim.
+
+3. During the capture window:
+   - Two-finger scroll **without** the configured navigation modifier (`hotkeys.scroll_modifier`, default `Ctrl+Alt`). Pass-through is expected (`stage=classifier outcome=reject`).
+   - The same scroll **with** the modifier. Navigation should classify as a pass and may `recognized`/`dispatch`.
+   - All four three-finger directions, with a pause between each.
+
+4. Record the Windows touchpad setting as observed; do not treat it as a required mapping, and do not assume it guarantees wheel delivery to LeopardWM:
+   - Windows 10: Settings → Devices → Touchpad
+   - Windows 11: Settings → Bluetooth & devices → Touchpad
+
+5. Use `lwm doctor` to inspect the daemon and CLI process-integrity lines. They do not measure the arbitrary foreground app; separately reported elevated-window blocks are different evidence. The capture header records `daemon_integrity` only. This report cannot prove elevated hook visibility, finger count, or device origin.
+
+6. When the interval ends, the daemon writes a summary even with zero input. Inspect `%LOCALAPPDATA%\leopardwm\logs\leopardwm-gesture-capture.log`, or the **Gesture Capture** section of `lwm collect-logs` (full file, not the last-100 daemon tail). For a gesture bug report, share that artifact.
+
+   Interpretation:
+
+   | Stage | Meaning |
+   |---|---|
+   | `registration` | `disabled` / `failed` / `registered` / `stopped` — config and hook setup evidence, not a claim that a capture is running now |
+   | `hook_delivery` | A wheel message reached the production hook (axis, delta, flags, modifier held, swipe candidate) |
+   | `classifier` | `pass` entered navigation or swipe handling; `reject` is pass-through |
+   | `accumulation` | Running total after this event |
+   | `timeout` | Partial swipe accumulator reset after the gesture timeout |
+   | `cooldown` | Navigation event suppressed during cooldown |
+   | `recognized` | Engine emitted `swipe_*` or `scroll_*` |
+   | `dispatch` | Daemon binding: `known` plus a canonical command name, `no_action` (empty binding), or `unknown` (command text omitted) |
+
+   `no_input=true` means the capture observed zero `hook_delivery` records and had no dropped, capped, admitted-at-deadline, or deadline-boundary in-flight records; registration alone still counts as no hook input. It is not proof that the touchpad is dead. If `records_dropped`, `records_capped`, `records_admitted_at_close`, `records_in_flight_at_close`, or `records_after_close` is non-zero, input may have been lost or crossed the bounded deadline — repeat with a shorter interval or fewer gestures.
+
+7. Set `diagnostic_capture_secs = 0` afterward so the next restart does not rearm capture and overwrite the report. Default-off does not truncate an existing file; a new capture replaces it.
+
 ## Config & Runtime Paths
 
 > **Note:** Crate names and on-disk paths still use `leopardwm` internally. A full crate rename is future work.
@@ -309,6 +397,7 @@ Run `lwm help` (or `lwm <subcommand> --help`) for the full surface — there are
 | State | `%APPDATA%\leopardwm\data\workspace-state.json` |
 | Log (stdout) | `%TEMP%\leopardwm-daemon.log` |
 | Log (stderr) | `%TEMP%\leopardwm-daemon.err.log` |
+| Gesture capture | `%LOCALAPPDATA%\leopardwm\logs\leopardwm-gesture-capture.log` |
 
 ## Architecture
 
