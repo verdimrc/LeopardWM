@@ -1,6 +1,6 @@
 # Changelog — haha branch
 
-## [Unreleased] — diff between `ed0aa13` .. HEAD
+## [Unreleased] — diff between `aee83cd` .. HEAD
 
 ### Features
 
@@ -85,10 +85,7 @@
 - Focused monitor placement is restored correctly for new windows. (The implementation is retained to
   support reverting to pre-0.2.8 behavior, but is superseded in practice by "new windows open on the
   monitor under the cursor".)
-- Tray-menu and hotkey/IPC-triggered config changes were persisted to `config.toml`, silently
-  overwriting the user's file outside of the settings GUI configurator. `config.toml` is now written
-  only by the settings GUI configurator; those changes still apply immediately but no longer persist
-  to disk.
+- Tray-menu and hotkey/IPC-triggered config changes no longer silently overwrite `config.toml`.
 - Apps that shrink themselves after being tiled no longer stay smaller than their column until the next
   layout re-apply.
 - A vacated column stays visible on the source monitor after moving a window away.
