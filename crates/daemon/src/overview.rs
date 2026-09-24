@@ -400,6 +400,7 @@ impl AppState {
     ///
     /// A fullscreen workspace collapses to ONE viewport-sized card for
     /// the fullscreen window instead of the underlying strip layout.
+    #[allow(clippy::too_many_arguments)]
     fn overview_cards_for(
         &self,
         ws: &Workspace,

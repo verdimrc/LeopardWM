@@ -1627,6 +1627,21 @@ impl AppState {
 
     /// Get the viewport width for a specific monitor. For vertical monitors,
     /// returns the work area height (the layout engine's primary axis).
+    /// Returns the 1-based display index (N in `\\.\DISPLAY{N}`) for the given
+    /// monitor, or 0 if it cannot be determined. Mirrors `is_rtl_monitor`.
+    pub(crate) fn display_index_for(&self, monitor_id: MonitorId) -> u32 {
+        self.monitors
+            .get(&monitor_id)
+            .and_then(|m| {
+                let s = m
+                    .device_name
+                    .trim_start_matches(r"\\.\")
+                    .trim_start_matches("DISPLAY");
+                s.parse::<u32>().ok().filter(|&n| n > 0)
+            })
+            .unwrap_or(0)
+    }
+
     pub(crate) fn viewport_width_for(&self, monitor_id: MonitorId) -> i32 {
         self.monitors
             .get(&monitor_id)

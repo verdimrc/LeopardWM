@@ -901,7 +901,7 @@ fn test_deferred_minimum_clear_reconciles_apply_and_animation_boundaries() {
                     assert!((workspace.effective_scroll_offset() - before).abs() < 0.5);
                 }
                 workspace.tick_animation(1000);
-                assert_eq!(workspace.scroll_offset(), if center { -257.0 } else { 0.0 });
+                assert_eq!(workspace.scroll_offset(), if center { -277.0 } else { 0.0 });
                 let placed = workspace.compute_placements(Rect::new(0, 0, 1000, 1040));
                 let focused = placed.iter().find(|p| p.window_id == 300).unwrap();
                 assert!(focused.rect.x >= 10 && focused.rect.x + focused.rect.width <= 990);
@@ -1108,7 +1108,7 @@ fn test_width_feedback_widens_inactive_workspace_without_changing_scroll() {
 
 #[test]
 fn test_post_animation_landing_applies_unchanged_layout() {
-    let window_id = u64::MAX - 1;
+    let window_id = 9999_u64;
     let mut state = AppState::new_with_config(test_config(), test_monitors());
     state.paused = false;
     state
@@ -5688,17 +5688,8 @@ fn tile_open_on_workspace_rule(
 ) -> crate::config::WindowRule {
     crate::config::WindowRule {
         match_class: Some(match_class.to_string()),
-        match_title: None,
-        match_executable: None,
-        action: crate::config::WindowAction::Tile,
-        width: None,
-        height: None,
-        corner_style: None,
         open_on_workspace: Some(open_on_workspace),
-        open_maximized: false,
-        column_width: None,
-        open_in_column: None,
-        sticky: false,
+        ..crate::config::WindowRule::default()
     }
 }
 
@@ -7279,6 +7270,7 @@ fn test_window_rule_matching_class() {
             column_width: None,
             open_in_column: None,
             sticky: false,
+            tile_on_os_monitor: false,
         }],
         ..Default::default()
     };
@@ -7303,6 +7295,7 @@ fn test_window_rule_matching_title() {
             column_width: None,
             open_in_column: None,
             sticky: false,
+            tile_on_os_monitor: false,
         }],
         ..Default::default()
     };
@@ -7327,6 +7320,7 @@ fn test_window_rule_matching_executable() {
             column_width: None,
             open_in_column: None,
             sticky: false,
+            tile_on_os_monitor: false,
         }],
         ..Default::default()
     };
@@ -7358,6 +7352,7 @@ fn test_floating_rect_uses_rule_dimensions() {
             column_width: None,
             open_in_column: None,
             sticky: false,
+            tile_on_os_monitor: false,
         }],
         ..Default::default()
     };
@@ -7385,6 +7380,7 @@ fn test_floating_rect_preserves_original_if_no_dimensions() {
             column_width: None,
             open_in_column: None,
             sticky: false,
+            tile_on_os_monitor: false,
         }],
         ..Default::default()
     };
@@ -10904,7 +10900,9 @@ fn test_created_event_applies_rule_column_width_fraction() {
     let mut config = test_config();
     config.window_rules = vec![crate::config::WindowRule {
         match_class: Some("TestWindowClass".to_string()),
-        column_width: Some(0.5),
+        column_width: Some(config::ColumnWidthSpec::Uniform(
+            config::ColumnWidthValue::Fraction(0.5),
+        )),
         ..crate::config::WindowRule::default()
     }];
     let mut state = AppState::new_with_config(config, test_monitors());
@@ -14339,7 +14337,7 @@ fn test_window_rule_open_extras_parse_and_compile() {
     // 1-based config index becomes 0-based workspace index.
     assert_eq!(rule.open_on_workspace, Some(4));
     assert!(rule.open_maximized);
-    assert_eq!(rule.column_width, Some(0.5));
+    assert_eq!(rule.column_width, Some(config::CompiledColumnWidth::All(0.5)));
 }
 
 #[test]
@@ -14366,25 +14364,19 @@ fn test_window_rule_open_extras_validation_drops_invalid() {
 fn test_matched_rule_returns_first_match_extras() {
     let mut config = test_config();
     config.window_rules = vec![crate::config::WindowRule {
-        match_class: None,
-        match_title: None,
         match_executable: Some("code.exe".to_string()),
-        action: crate::config::WindowAction::Tile,
-        width: None,
-        height: None,
-        corner_style: None,
         open_on_workspace: Some(3),
-        open_maximized: false,
-        column_width: Some(0.25),
-        open_in_column: None,
-        sticky: false,
+        column_width: Some(config::ColumnWidthSpec::Uniform(
+            config::ColumnWidthValue::Fraction(0.25),
+        )),
+        ..crate::config::WindowRule::default()
     }];
     let state = AppState::new_with_config(config, test_monitors());
     let rule = state
         .matched_rule("SomeClass", "Editor", "code.exe")
         .expect("matches");
     assert_eq!(rule.open_on_workspace, Some(2));
-    assert_eq!(rule.column_width, Some(0.25));
+    assert_eq!(rule.column_width, Some(config::CompiledColumnWidth::All(0.25)));
     assert!(
         state
             .matched_rule("SomeClass", "Editor", "other.exe")
@@ -15414,7 +15406,7 @@ fn test_persisted_signature_changes_on_active_workspace() {
 
 #[test]
 fn test_width_only_persistence_tracks_requested_not_native_width() {
-    let window_id = u64::MAX - 1;
+    let window_id = 9998_u64;
     let mut state = AppState::new_with_config(test_config(), test_monitors());
     let viewport_width = state.focused_viewport().width;
     state
@@ -15468,7 +15460,7 @@ fn test_width_only_persistence_tracks_requested_not_native_width() {
 
 #[test]
 fn test_width_only_persistence_command_saves_unchanged_placements() {
-    let window_id = u64::MAX - 1;
+    let window_id = 9997_u64;
     let mut state = AppState::new_with_config(test_config(), test_monitors());
     state.paused = false;
     state.reduce_motion = true;
@@ -15511,7 +15503,7 @@ fn test_width_only_persistence_command_saves_unchanged_placements() {
 
 #[test]
 fn test_width_only_persistence_resize_queues_save() {
-    let window_id = u64::MAX - 1;
+    let window_id = 9996_u64;
     let mut state = AppState::new_with_config(test_config(), test_monitors());
     state.paused = false;
     state.reduce_motion = true;

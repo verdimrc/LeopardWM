@@ -46,6 +46,11 @@
     peeked monitor (focus change, move, close, minimize, maximize, fullscreen) exits peek and restores
     the previous scroll position.
   - Only available on LTR horizontal monitors.
+- Window rules: `column_width` now accepts a 1-based preset index (e.g. `column_width = 2`,
+  same convention as `layout.default_width_preset`) or a per-display map
+  (e.g. `column_width = { "1" = 0.5, "2" = 2 }`) in addition to the existing viewport
+  fraction. Map keys are quoted Windows display indices (`"1"` = `\\.\DISPLAY1`). Useful
+  when the same app needs a different initial width on each monitor.
 
 ### New config fields
 
@@ -59,6 +64,7 @@
 | `hotkeys.toggle_desktop_peek_anchored` | `string` | `"Ctrl+Alt+'"` | Reveal desktop; focused window stays in place. |
 | `hotkeys.toggle_desktop_peek` | `string` | `"Ctrl+Alt+Shift+'"` | Reveal desktop; focused window moves to the minimum-width mark. |
 | Window rule: `tile_on_os_monitor` | `bool` | `false` | Tile the window on whichever monitor the OS places it, instead of the focused monitor. |
+| Window rule: `column_width` (extended) | `f64 \| u32 \| { "N" = f64\|u32 }` | (none) | Now accepts a preset index or a per-display-index map in addition to a viewport fraction. |
 
 ### Fixes
 

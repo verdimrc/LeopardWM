@@ -561,6 +561,75 @@ fn default_active_border_position() -> String {
 // Window Rules
 // ============================================================================
 
+/// A column-width value: a viewport fraction (0.05–1.0) or a 1-based index
+/// into `layout.width_presets`.
+///
+/// `PresetIndex` is listed first so that an integer like `2` deserializes as
+/// `PresetIndex(2)` rather than `Fraction(2.0)` when using serde_json
+/// (which accepts integers as f64 in untagged enums).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ColumnWidthValue {
+    PresetIndex(u32),
+    Fraction(f64),
+}
+
+/// The `column_width` field in a window rule: a uniform value for all monitors,
+/// or a per-display-index map (keys are quoted 1-based display indices like
+/// `"1"`, `"2"`, matching the `\\.\DISPLAY{N}` convention).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ColumnWidthSpec {
+    Uniform(ColumnWidthValue),
+    PerMonitor(HashMap<String, ColumnWidthValue>),
+}
+
+/// Compiled and validated column width from a window rule.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CompiledColumnWidth {
+    /// Same fraction on every monitor.
+    All(f64),
+    /// Per-display-index fractions; monitors not in the map get no override.
+    PerMonitor(HashMap<u32, f64>),
+}
+
+impl CompiledColumnWidth {
+    /// Resolve to a fraction for the given 1-based display index, or `None`
+    /// if this monitor has no override.
+    pub fn resolve(&self, display_index: u32) -> Option<f64> {
+        match self {
+            CompiledColumnWidth::All(f) => Some(*f),
+            CompiledColumnWidth::PerMonitor(map) => map.get(&display_index).copied(),
+        }
+    }
+}
+
+fn resolve_column_width_value(val: &ColumnWidthValue, presets: &[f64]) -> Option<f64> {
+    match val {
+        ColumnWidthValue::Fraction(f) if (0.05..=1.0).contains(f) => Some(*f),
+        ColumnWidthValue::Fraction(f) => {
+            tracing::warn!(
+                "Window rule column_width = {} is out of range (0.05-1.0); ignoring",
+                f
+            );
+            None
+        }
+        ColumnWidthValue::PresetIndex(n) => {
+            let idx = *n as usize;
+            if idx == 0 || idx > presets.len() {
+                tracing::warn!(
+                    "Window rule column_width preset index {} is out of range 1..={}; ignoring",
+                    n,
+                    presets.len()
+                );
+                None
+            } else {
+                presets.get(idx - 1).copied()
+            }
+        }
+    }
+}
+
 /// A rule for per-window behavior.
 ///
 /// Window rules are evaluated in order; the first matching rule wins.
@@ -619,10 +688,11 @@ pub struct WindowRule {
     #[serde(default)]
     pub open_maximized: bool,
 
-    /// Initial column width as a fraction of the viewport (0.05 to 1.0)
-    /// for tiled windows.
+    /// Initial column width for tiled windows. Accepts a viewport fraction
+    /// (0.05–1.0), a 1-based `layout.width_presets` index, or a per-display
+    /// map keyed by quoted display index (e.g. `{ "1" = 0.5, "2" = 2 }`).
     #[serde(default)]
-    pub column_width: Option<f64>,
+    pub column_width: Option<ColumnWidthSpec>,
 
     /// Open the window at this 1-based column slot as its own column. Slots
     /// past the end append; 0 is ignored. Tiled windows only.
@@ -1015,8 +1085,8 @@ pub struct CompiledWindowRule {
     pub open_on_workspace: Option<usize>,
     /// Maximize the window's column after opening.
     pub open_maximized: bool,
-    /// Initial column width as a viewport fraction for tiled windows.
-    pub column_width: Option<f64>,
+    /// Compiled initial column width; see `ColumnWidthSpec`.
+    pub column_width: Option<CompiledColumnWidth>,
     /// Open at this 0-based column slot as its own column (validated from the
     /// 1-based config; high values append, 0 is dropped).
     pub open_in_column: Option<usize>,
@@ -1410,16 +1480,37 @@ impl Config {
                 }
                 None => None,
             };
-            let column_width = match rule.column_width {
-                Some(f) if (0.05..=1.0).contains(&f) => Some(f),
-                Some(f) => {
-                    tracing::warn!(
-                        "Window rule column_width = {} is out of range (0.05-1.0); ignoring",
-                        f
-                    );
-                    None
-                }
+            let presets = &self.layout.width_presets;
+            let column_width = match rule.column_width.as_ref() {
                 None => None,
+                Some(ColumnWidthSpec::Uniform(val)) => {
+                    resolve_column_width_value(val, presets).map(CompiledColumnWidth::All)
+                }
+                Some(ColumnWidthSpec::PerMonitor(map)) => {
+                    let resolved: HashMap<u32, f64> = map
+                        .iter()
+                        .filter_map(|(key, val)| {
+                            let n: u32 = match key.parse::<u32>() {
+                                Ok(n) if n > 0 => n,
+                                _ => {
+                                    tracing::warn!(
+                                        "Window rule column_width: display index {:?} must be a \
+                                         positive integer; ignoring",
+                                        key
+                                    );
+                                    return None;
+                                }
+                            };
+                            let f = resolve_column_width_value(val, presets)?;
+                            Some((n, f))
+                        })
+                        .collect();
+                    if resolved.is_empty() {
+                        None
+                    } else {
+                        Some(CompiledColumnWidth::PerMonitor(resolved))
+                    }
+                }
             };
             // 1-based slot -> 0-based index. High values append (clamped at
             // insert time); 0 violates the 1-based contract and is dropped.
@@ -1654,7 +1745,7 @@ mod tests {
     #[test]
     fn test_hotkey_config_default() {
         let config = HotkeyConfig::default();
-        assert_eq!(config.bindings.len(), 69);
+        assert_eq!(config.bindings.len(), 71);
         assert_eq!(
             config.bindings.get("Ctrl+Alt+Space"),
             Some(&"toggle_overview".to_string())
@@ -1950,6 +2041,7 @@ mod tests {
             column_width: None,
             open_in_column: None,
             sticky: false,
+            tile_on_os_monitor: false,
         };
 
         assert!(rule.matches("Notepad", "Untitled - Notepad", "notepad.exe"));
@@ -1971,6 +2063,7 @@ mod tests {
             column_width: None,
             open_in_column: None,
             sticky: false,
+            tile_on_os_monitor: false,
         };
 
         assert!(rule.matches(
@@ -1997,6 +2090,7 @@ mod tests {
             column_width: None,
             open_in_column: None,
             sticky: false,
+            tile_on_os_monitor: false,
         };
 
         assert!(rule.matches("SpotifyClass", "Spotify - Song Title", "spotify.exe"));
@@ -2019,6 +2113,7 @@ mod tests {
             column_width: None,
             open_in_column: None,
             sticky: false,
+            tile_on_os_monitor: false,
         };
 
         // Both patterns must match
@@ -2047,6 +2142,7 @@ mod tests {
             column_width: None,
             open_in_column: None,
             sticky: false,
+            tile_on_os_monitor: false,
         };
 
         assert!(!rule.matches("AnyClass", "Any Title", "any.exe"));
@@ -2161,6 +2257,7 @@ mod tests {
                 column_width: None,
                 open_in_column: None,
                 sticky: false,
+                tile_on_os_monitor: false,
             },
             WindowRule {
                 match_class: Some("Notepad".to_string()),
@@ -2175,6 +2272,7 @@ mod tests {
                 column_width: None,
                 open_in_column: None,
                 sticky: false,
+                tile_on_os_monitor: false,
             },
         ];
 
@@ -2205,6 +2303,7 @@ mod tests {
             column_width: None,
             open_in_column: None,
             sticky: false,
+            tile_on_os_monitor: false,
         };
 
         assert!(rule.matches("AnyClass", "[DEBUG] Application started", "app.exe"));
@@ -2227,6 +2326,7 @@ mod tests {
             column_width: None,
             open_in_column: None,
             sticky: false,
+            tile_on_os_monitor: false,
         };
 
         assert!(rule.matches("AnyClass", "Error Dialog", "app.exe"));
@@ -2249,6 +2349,7 @@ mod tests {
             column_width: None,
             open_in_column: None,
             sticky: false,
+            tile_on_os_monitor: false,
         };
 
         assert!(rule.matches("AnyClass", "Error Dialog", "app.exe"));
@@ -2272,6 +2373,7 @@ mod tests {
             column_width: None,
             open_in_column: None,
             sticky: false,
+            tile_on_os_monitor: false,
         };
 
         assert!(rule.matches("MyClass", "Any Title", "any.exe"));
@@ -2295,6 +2397,7 @@ mod tests {
             column_width: None,
             open_in_column: None,
             sticky: false,
+            tile_on_os_monitor: false,
         };
 
         assert!(rule.matches("AnyClass", "App Settings", "any.exe"));
@@ -2318,6 +2421,7 @@ mod tests {
             column_width: None,
             open_in_column: None,
             sticky: false,
+            tile_on_os_monitor: false,
         };
 
         assert!(rule.matches("AnyClass", "Any Title", "notepad.exe"));
@@ -2341,6 +2445,7 @@ mod tests {
             column_width: None,
             open_in_column: None,
             sticky: false,
+            tile_on_os_monitor: false,
         };
 
         // Should return false because regex is invalid
@@ -2363,6 +2468,7 @@ mod tests {
             column_width: None,
             open_in_column: None,
             sticky: false,
+            tile_on_os_monitor: false,
         };
 
         assert!(rule.matches("", "Title", "app.exe")); // Empty class matches .*
@@ -2401,7 +2507,35 @@ mod tests {
             "column_width": 0.5,
         }))
         .unwrap();
-        assert_eq!(with_width.column_width, Some(0.5));
+        assert_eq!(
+            with_width.column_width,
+            Some(ColumnWidthSpec::Uniform(ColumnWidthValue::Fraction(0.5)))
+        );
+
+        let with_preset: WindowRule = serde_json::from_value(serde_json::json!({
+            "match_executable": "editor.exe",
+            "column_width": 2,
+        }))
+        .unwrap();
+        assert_eq!(
+            with_preset.column_width,
+            Some(ColumnWidthSpec::Uniform(ColumnWidthValue::PresetIndex(2)))
+        );
+
+        let with_per_monitor: WindowRule = serde_json::from_value(serde_json::json!({
+            "match_executable": "editor.exe",
+            "column_width": { "1": 0.5, "2": 2 },
+        }))
+        .unwrap();
+        assert_eq!(
+            with_per_monitor.column_width,
+            Some(ColumnWidthSpec::PerMonitor({
+                let mut m = std::collections::HashMap::new();
+                m.insert("1".to_string(), ColumnWidthValue::Fraction(0.5));
+                m.insert("2".to_string(), ColumnWidthValue::PresetIndex(2));
+                m
+            }))
+        );
 
         let cleared: WindowRule = serde_json::from_value(serde_json::json!({
             "match_executable": "editor.exe",
@@ -2412,22 +2546,74 @@ mod tests {
 
     #[test]
     fn test_window_rule_column_width_compilation_rejects_invalid_values() {
-        fn compiled_width(width: f64) -> Option<f64> {
+        fn compiled_fraction(width: f64) -> Option<f64> {
             let config = Config {
                 window_rules: vec![WindowRule {
-                    column_width: Some(width),
+                    column_width: Some(ColumnWidthSpec::Uniform(ColumnWidthValue::Fraction(width))),
                     ..WindowRule::default()
                 }],
                 ..Config::default()
             };
-            config.compile_window_rules()[0].column_width
+            match config.compile_window_rules()[0].column_width {
+                Some(CompiledColumnWidth::All(f)) => Some(f),
+                _ => None,
+            }
         }
 
-        assert_eq!(compiled_width(0.05), Some(0.05));
-        assert_eq!(compiled_width(1.0), Some(1.0));
+        assert_eq!(compiled_fraction(0.05), Some(0.05));
+        assert_eq!(compiled_fraction(1.0), Some(1.0));
         for invalid in [0.049, 1.001, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
-            assert_eq!(compiled_width(invalid), None);
+            assert_eq!(compiled_fraction(invalid), None);
         }
+    }
+
+    #[test]
+    fn test_window_rule_column_width_preset_index_compiles() {
+        // Default presets: [0.25, 0.5, 0.75, 1.0] (4 entries)
+        fn compiled_preset(idx: u32) -> Option<f64> {
+            let config = Config {
+                window_rules: vec![WindowRule {
+                    column_width: Some(ColumnWidthSpec::Uniform(ColumnWidthValue::PresetIndex(
+                        idx,
+                    ))),
+                    ..WindowRule::default()
+                }],
+                ..Config::default()
+            };
+            match config.compile_window_rules()[0].column_width {
+                Some(CompiledColumnWidth::All(f)) => Some(f),
+                _ => None,
+            }
+        }
+        let presets = default_width_presets();
+        assert_eq!(compiled_preset(1), Some(presets[0]));
+        assert_eq!(compiled_preset(presets.len() as u32), Some(*presets.last().unwrap()));
+        assert_eq!(compiled_preset(0), None);
+        assert_eq!(compiled_preset(presets.len() as u32 + 1), None);
+    }
+
+    #[test]
+    fn test_window_rule_column_width_per_monitor_compiles() {
+        let presets = default_width_presets();
+        let config = Config {
+            window_rules: vec![WindowRule {
+                column_width: Some(ColumnWidthSpec::PerMonitor({
+                    let mut m = std::collections::HashMap::new();
+                    m.insert("1".to_string(), ColumnWidthValue::Fraction(0.5));
+                    m.insert("2".to_string(), ColumnWidthValue::PresetIndex(1));
+                    m
+                })),
+                ..WindowRule::default()
+            }],
+            ..Config::default()
+        };
+        let compiled = &config.compile_window_rules()[0];
+        assert_eq!(compiled.column_width.as_ref().unwrap().resolve(1), Some(0.5));
+        assert_eq!(
+            compiled.column_width.as_ref().unwrap().resolve(2),
+            Some(presets[0])
+        );
+        assert_eq!(compiled.column_width.as_ref().unwrap().resolve(3), None);
     }
 
     // =========================================================================
@@ -2716,6 +2902,7 @@ mod tests {
                     column_width: None,
                     open_in_column: None,
                     sticky: false,
+                    tile_on_os_monitor: false,
                 },
                 WindowRule {
                     match_class: None,
@@ -2730,6 +2917,7 @@ mod tests {
                     column_width: None,
                     open_in_column: None,
                     sticky: false,
+                    tile_on_os_monitor: false,
                 },
             ],
             ..Default::default()
@@ -2770,6 +2958,7 @@ mod tests {
                     column_width: None,
                     open_in_column: None,
                     sticky: false,
+                    tile_on_os_monitor: false,
                 },
                 WindowRule {
                     match_class: Some("ValidClass".to_string()),
@@ -2784,6 +2973,7 @@ mod tests {
                     column_width: None,
                     open_in_column: None,
                     sticky: false,
+                    tile_on_os_monitor: false,
                 },
             ],
             ..Default::default()

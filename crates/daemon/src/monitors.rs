@@ -3,7 +3,7 @@
 use crate::helpers::ScaledLayoutParams;
 use crate::state::*;
 use leopardwm_core_layout::{Rect, Workspace};
-use leopardwm_platform_win32::{MonitorId, MonitorInfo};
+use leopardwm_platform_win32::{find_monitor_for_rect, MonitorId, MonitorInfo};
 use std::collections::{HashMap, HashSet};
 use tracing::{info, warn};
 
@@ -612,6 +612,35 @@ impl AppState {
                 .find(|m| m.contains_point(x, y))
                 .map(|m| m.id)
         }
+    }
+
+    /// Select the monitor for a newly created window. Uses the cursor monitor
+    /// first; falls back to strict rect-center containment (no primary-monitor
+    /// fallback for off-screen rects); finally uses `focused_monitor`.
+    /// When `use_os_rect` is true, uses Win32 rect-based selection instead
+    /// (for `tile_on_os_monitor` rules).
+    pub(crate) fn monitor_for_new_window(&self, win_rect: &Rect, use_os_rect: bool) -> MonitorId {
+        if use_os_rect {
+            let monitors: Vec<_> = self.monitors.values().cloned().collect();
+            return find_monitor_for_rect(&monitors, win_rect)
+                .map(|m| m.id)
+                .unwrap_or(self.focused_monitor);
+        }
+        self.monitor_under_cursor()
+            .or_else(|| self.monitor_containing_rect_center(win_rect))
+            .unwrap_or(self.focused_monitor)
+    }
+
+    /// Returns the monitor whose work area strictly contains the center of `r`,
+    /// or `None` for off-screen rects (unlike `find_monitor_for_rect` which
+    /// falls back to the primary monitor).
+    fn monitor_containing_rect_center(&self, r: &Rect) -> Option<MonitorId> {
+        let cx = r.x + r.width / 2;
+        let cy = r.y + r.height / 2;
+        self.monitors
+            .values()
+            .find(|m| m.contains_point(cx, cy))
+            .map(|m| m.id)
     }
 
     /// The layout viewport for a monitor: its full work area. Single source of

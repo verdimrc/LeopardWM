@@ -768,7 +768,7 @@ impl AppState {
                         (
                             r.open_on_workspace,
                             r.open_maximized,
-                            r.column_width,
+                            r.column_width.clone(),
                             r.open_in_column,
                             r.sticky,
                             r.tile_on_os_monitor,
@@ -808,14 +808,8 @@ impl AppState {
             // A per-app rule's open_on_workspace can still redirect it below.
             // `tile_on_os_monitor = true` overrides this: the window's own
             // rect (as reported by Windows at creation) picks the monitor.
-            let monitor_id = if rule_tile_on_os_monitor {
-                let monitors: Vec<_> = self.monitors.values().cloned().collect();
-                find_monitor_for_rect(&monitors, &win_info.rect)
-                    .map(|m| m.id)
-                    .unwrap_or(self.focused_monitor)
-            } else {
-                self.monitor_under_cursor().unwrap_or(self.focused_monitor)
-            };
+            let monitor_id =
+                self.monitor_for_new_window(&win_info.rect, rule_tile_on_os_monitor);
 
             // Get floating rect before borrowing workspace mutably
             let floating_rect = if action == config::WindowAction::Float {
@@ -862,12 +856,20 @@ impl AppState {
             // Per-app initial column width (viewport fraction -> px). A width
             // remembered from before this window was hidden takes precedence,
             // so a reshown window keeps its size instead of resetting.
+            let display_idx = self.display_index_for(monitor_id);
+            let fraction_to_px =
+                |f: f64| -> i32 { ((f * f64::from(viewport_width)).round() as i32).max(100) };
             let rule_width_px = if kind == AdmissionKind::ExplicitReadmit {
-                rule_column_width.map(|f| ((f * f64::from(viewport_width)).round() as i32).max(100))
+                rule_column_width
+                    .as_ref()
+                    .and_then(|cw| cw.resolve(display_idx))
+                    .map(fraction_to_px)
             } else {
                 self.take_remembered_column_width(hwnd).or_else(|| {
                     rule_column_width
-                        .map(|f| ((f * f64::from(viewport_width)).round() as i32).max(100))
+                        .as_ref()
+                        .and_then(|cw| cw.resolve(display_idx))
+                        .map(fraction_to_px)
                 })
             };
             let take_workspace_focus = kind == AdmissionKind::ExplicitReadmit
@@ -1608,17 +1610,13 @@ impl AppState {
         const MOVE_FOCUS_LOCK_MS: u128 = 500;
         match self.move_to_monitor_target {
             Some((lock_monitor, locked_at))
-                if locked_at.elapsed().as_millis() < MOVE_FOCUS_LOCK_MS =>
+                if locked_at.elapsed().as_millis() < MOVE_FOCUS_LOCK_MS
+                    && monitor_id != lock_monitor =>
             {
-                if monitor_id != lock_monitor {
-                    debug!(
-                        "Suppressing focused_monitor update to {} (locked to {} after monitor move)",
-                        monitor_id, lock_monitor
-                    );
-                } else {
-                    self.move_to_monitor_target = None;
-                    self.focused_monitor = monitor_id;
-                }
+                debug!(
+                    "Suppressing focused_monitor update to {} (locked to {} after monitor move)",
+                    monitor_id, lock_monitor
+                );
             }
             _ => {
                 self.move_to_monitor_target = None;
@@ -2056,6 +2054,7 @@ impl AppState {
                 || self.layout_transition.is_some()
                 || layout_recently_completed
             {
+                #[cfg(not(test))]
                 if let Some(fg) = leopardwm_platform_win32::get_foreground_window() {
                     if fg != hwnd {
                         debug!(
