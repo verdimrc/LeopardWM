@@ -5,9 +5,10 @@ rules **before** showing it — don't draft and wait to be corrected.
 
 ## Source
 
-Draft only from the diff being committed: `git diff --cached --stat` and `git diff --cached`
-(or `git diff HEAD` if nothing is staged). Never from what was discussed in the session. If staged
-and unstaged changes are mixed, say which one the draft covers.
+Draft only from the staged changes: `git diff --cached --stat` and `git diff --cached`. If nothing
+is staged, say so and stop — don't fall back to unstaged changes. Never draft from what was
+discussed in the session. If unstaged changes also exist, say the draft covers only the staged
+part.
 
 If the staged diff mixes unrelated changes (e.g. a code fix plus `.claude/` tooling), they belong
 in separate commits: draft for the main change, name the other paths, and give the exact
@@ -37,7 +38,13 @@ The whole first line, including `type(scope): `, is at most **79 characters** so
   window", not "a window opened during desktop peek that takes focus". Prefer a natural action
   subject ("exiting desktop peek") over noun stacks ("desktop peek exit").
 - Grammar: a gerund subject takes a singular verb ("exiting desktop peek no longer hides…").
-- Join two changes with `;` only when they are parts of one feature, e.g.
+- A commit with several parts: the first line just names the parts and says which changed and
+  which are new, joined with `;` — e.g. `chore(claude): update /haha-dcm; add /haha-dcm2` — and
+  stops there. Don't describe what they do in the first line; that goes in the detail.
+- A part is something the user uses — a command, feature, or behavior — never a file. A file
+  that only supports a part (a rules file, helper, test) goes under the part it serves: never
+  name it in the first line or give it its own bullet.
+- `;` joins only parts of one change set, e.g.
   `feat(daemon): extend new window placement; tray status badge`. Unrelated changes are separate
   commits (see Source).
 
@@ -49,19 +56,27 @@ if the body's content is guessable from the subject, delete it. Diff size is irr
 - Body needed: `moving a window between monitors no longer gains or loses pixels` — nobody can
   guess from that how a move changes a width (repeated rounding) or how it was fixed
   (remembering the proportion).
-- No body: `exiting desktop peek no longer hides a newly focused window` — the condition is in
-  the subject, and the cause (the old view came back) and fix (show the focused window) are
-  implied.
-- Never explain a setting or behavior the config and docs already describe (e.g. that a new
-  window takes focus when "focus new windows" is on).
+- No body: `rename /reconcile-merge to /haha-rcm and /dcm to /haha-dcm` — there is nothing to add.
+- Borderline: `exiting desktop peek no longer hides a newly focused window` — the cause and fix
+  are implied, but the trigger (opening a window from the revealed desktop while "focus new
+  windows" is on) isn't. A trigger-steps body is worth offering as the alternative version.
+- Never explain what a setting does — the config and docs already describe it. Naming a setting
+  as part of the steps that trigger a bug is fine (see below).
 
 When a body is needed, keep it short:
 
 - Define any term in the subject a reader may not know, e.g. "External tools are anything
   subscribed to LeopardWM's workspace updates over IPC, such as a status bar."
+- Give the steps that trigger a bug when a reader couldn't guess them, e.g. "Triggered by
+  opening a window while desktop peek is on, e.g. double-clicking a file on the revealed
+  desktop, with "focus new windows" enabled."
 - For a fix whose cause or approach a reader couldn't predict, use two short paragraphs:
   "Previously, <what went wrong and why>." then "This fix <how, in plain terms>."
-- For the parts of one feature joined with `;`, use a short bullet list, one bullet per part.
+- For a commit with several parts, one bullet per part. A changed part reads
+  "X changed: previously …; now …". A new part is marked "(new)". If one part has several
+  changes, write "X changed:" and nest one "previously …; now …" bullet per change under it.
+  Apply the predictability test to each bullet: drop any bullet that only repeats the first
+  line.
 - Never restate the diff line by line. A message longer than the diff is a red flag.
 
 ## Merges
