@@ -31,7 +31,7 @@ node_modules/
 bash.exe.stackdump
 
 # Claude Code
-.claude/
+.claude/settings.local.json
 CLAUDE.local.md
 
 # Local recording / launch-footage working folder (scripts + captured media)
