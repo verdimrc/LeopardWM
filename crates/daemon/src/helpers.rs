@@ -493,11 +493,8 @@ impl AppState {
         for ws_vec in self.workspaces.values() {
             for workspace in ws_vec.iter() {
                 for &wid in &workspace.all_window_ids() {
-                    // Skip sentinel pseudo-HWNDs — they are not real Win32
-                    // windows and would always probe as gone.
-                    if wid == crate::state::DESKTOP_PEEK_HWND
-                        || wid == crate::state::DRAG_PLACEHOLDER_HWND
-                    {
+                    // Sentinel pseudo-windows would always probe as gone.
+                    if crate::state::is_pseudo_hwnd(wid) {
                         continue;
                     }
                     observed.insert(wid);

@@ -4,7 +4,7 @@
 //! membership only when the managed property still matches the token recorded
 //! for that admission.
 
-use crate::state::{AppState, ScratchpadState, DRAG_PLACEHOLDER_HWND};
+use crate::state::{is_pseudo_hwnd, AppState, ScratchpadState};
 use crate::temporary_ignore::IdentityReadError;
 #[cfg(not(test))]
 use leopardwm_platform_win32::Win32Error;
@@ -23,7 +23,7 @@ impl AppState {
     /// readmit, or any other eventless admission) records no Hidden-guard time and
     /// drops one left by an older lifetime.
     pub(crate) fn record_managed_lifetime(&mut self, hwnd: u64, admitted_at_event_ms: Option<u32>) {
-        if hwnd == DRAG_PLACEHOLDER_HWND {
+        if is_pseudo_hwnd(hwnd) {
             return;
         }
         match self.stamp_managed_identity(hwnd) {

@@ -145,6 +145,7 @@ fn complete_membership_includes_inactive_and_floating_excludes_placeholders() {
     ws.mark_minimized(101);
     ws.add_floating(200, Rect::new(0, 0, 100, 100)).unwrap();
     ws.insert_window(DRAG_PLACEHOLDER_HWND, None).unwrap();
+    ws.insert_window(crate::state::DESKTOP_PEEK_HWND, None).unwrap();
     state.sticky_windows.insert(200);
     state.config.workspaces.names = vec![" code ".into()];
     state.publish_workspace_state_if_changed();

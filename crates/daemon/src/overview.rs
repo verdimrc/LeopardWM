@@ -214,7 +214,7 @@ impl AppState {
         for ws in ws_vec.iter() {
             let ids = ws.all_window_ids();
             icon_wids.extend(ids.into_iter().filter(|&wid| {
-                wid != crate::state::DRAG_PLACEHOLDER_HWND && !ws.is_minimized(wid)
+                !crate::state::is_pseudo_hwnd(wid) && !ws.is_minimized(wid)
             }));
         }
         // Fill the icon cache before the row loop re-borrows the
@@ -435,7 +435,7 @@ impl AppState {
                 .into_iter()
                 .filter(|p| {
                     p.visibility == Visibility::Visible
-                        && p.window_id != crate::state::DRAG_PLACEHOLDER_HWND
+                        && !crate::state::is_pseudo_hwnd(p.window_id)
                         && p.column_index != usize::MAX // floats handled below
                 })
                 .map(|p| {

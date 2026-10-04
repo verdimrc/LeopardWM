@@ -123,6 +123,13 @@ pub(crate) const DRAG_PLACEHOLDER_HWND: u64 = u64::MAX;
 /// Sentinel window ID for the desktop-peek ghost column. Never sent to Win32.
 pub(crate) const DESKTOP_PEEK_HWND: u64 = u64::MAX - 1;
 
+/// Whether `hwnd` is one of the sentinel pseudo-windows the daemon inserts
+/// into workspaces (drag placeholder, desktop-peek ghost column). They are not
+/// real Win32 windows: never position, probe, list, or track them.
+pub(crate) fn is_pseudo_hwnd(hwnd: u64) -> bool {
+    hwnd == DRAG_PLACEHOLDER_HWND || hwnd == DESKTOP_PEEK_HWND
+}
+
 /// Saved state for the desktop-peek toggle so it can be undone exactly.
 pub(crate) struct DesktopPeekState {
     pub monitor: isize,

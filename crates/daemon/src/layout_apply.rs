@@ -487,17 +487,15 @@ impl AppState {
             Self::apply_transition_interpolation(transition, &mut all_placements);
         }
 
-        // Filter out the dragged window and placeholder so SetWindowPos doesn't
-        // fight the OS drag or try to position the sentinel.
+        // Filter out the dragged window so SetWindowPos doesn't fight the OS drag.
         if let Some(ref drag) = self.drag_state {
             if drag.is_tiled {
-                all_placements.retain(|p| {
-                    p.window_id != drag.hwnd && p.window_id != crate::state::DRAG_PLACEHOLDER_HWND
-                });
+                all_placements.retain(|p| p.window_id != drag.hwnd);
             }
         }
-        // Desktop-peek ghost column is always a sentinel — never sent to Win32.
-        all_placements.retain(|p| p.window_id != crate::state::DESKTOP_PEEK_HWND);
+        // Sentinel pseudo-windows (drag placeholder, desktop-peek ghost column)
+        // are never sent to Win32.
+        all_placements.retain(|p| !crate::state::is_pseudo_hwnd(p.window_id));
 
         let dispatched_placements = self.filter_application_fullscreen_placements(all_placements);
         let maximized = self.observe_maximized_placements(&dispatched_placements);
@@ -670,17 +668,15 @@ impl AppState {
             Self::apply_transition_interpolation(transition, &mut all_placements);
         }
 
-        // Filter out the dragged window and placeholder so SetWindowPos doesn't
-        // fight the OS drag or try to position the sentinel.
+        // Filter out the dragged window so SetWindowPos doesn't fight the OS drag.
         if let Some(ref drag) = self.drag_state {
             if drag.is_tiled {
-                all_placements.retain(|p| {
-                    p.window_id != drag.hwnd && p.window_id != crate::state::DRAG_PLACEHOLDER_HWND
-                });
+                all_placements.retain(|p| p.window_id != drag.hwnd);
             }
         }
-        // Desktop-peek ghost column is always a sentinel — never sent to Win32.
-        all_placements.retain(|p| p.window_id != crate::state::DESKTOP_PEEK_HWND);
+        // Sentinel pseudo-windows (drag placeholder, desktop-peek ghost column)
+        // are never sent to Win32.
+        all_placements.retain(|p| !crate::state::is_pseudo_hwnd(p.window_id));
 
         // Fast path: unchanged placements and visible-set need no worker
         // unless a post-animation landing is pending. Spawning

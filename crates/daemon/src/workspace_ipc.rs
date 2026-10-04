@@ -2,7 +2,7 @@
 //!
 //! Projection and publication run under AppState's mutex. This module performs
 //! no Win32 lookup or pipe I/O; transport writes the frozen frames separately.
-use crate::state::{AppState, DRAG_PLACEHOLDER_HWND};
+use crate::state::{is_pseudo_hwnd, AppState};
 use leopardwm_ipc::{IpcEvent, WorkspaceStateRecord, WorkspaceStateSnapshot};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -75,7 +75,7 @@ impl AppState {
                 windows.sort_unstable();
                 windows.dedup();
                 for hwnd in windows {
-                    if hwnd == DRAG_PLACEHOLDER_HWND
+                    if is_pseudo_hwnd(hwnd)
                         || self
                             .scratchpad
                             .is_some_and(|s| !s.shown && s.window_id == hwnd)

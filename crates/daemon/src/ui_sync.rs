@@ -468,7 +468,7 @@ impl AppState {
                 let tabs: Vec<TabLabel> = col
                     .windows()
                     .iter()
-                    .filter(|&&w| w != crate::state::DRAG_PLACEHOLDER_HWND)
+                    .filter(|&&w| !crate::state::is_pseudo_hwnd(w))
                     .map(|&w| TabLabel {
                         title: self
                             .tab_title_overrides
