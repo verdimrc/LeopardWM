@@ -1,6 +1,6 @@
 # Changelog — haha branch
 
-## [Unreleased] — diff between `aee83cd` .. HEAD
+## [Unreleased] — diff between `c2c8643` .. HEAD
 
 ### Features
 
@@ -18,9 +18,8 @@
   so your eyes barely move between the two screens.
 - Overview improvements:
   - Shows on all monitors simultaneously with Ctrl+Alt+Win+Space (`hotkeys.toggle_overview_all`).
-  - Secondary monitor overlays are now clickable and highlight on hover.
-  - Shows the monitor device name and empty workspace rows on monitors with no windows.
-  - Panels and monitor labels are right-aligned on RTL monitors.
+  - Shows the monitor device name
+  - Shows empty workspace rows on monitors with no windows.
 - Window rules support `tile_on_os_monitor` to respect the OS-chosen monitor.
   Useful for PowerPoint presentation mode: respects where PowerPoint places both the slide show and the
   presenter view windows, while still tiling the presenter view.
