@@ -40,7 +40,7 @@ Omit it when the subject is self-explanatory. When needed, keep it short:
 
 ## Merges
 
-When concluding a `/reconcile-merge`, the merge commit uses git's default message
+When concluding a `/haha-rcm`, the merge commit uses git's default message
 ("Merge branch 'main' into haha"); don't draft one.
 
 ## Words to avoid

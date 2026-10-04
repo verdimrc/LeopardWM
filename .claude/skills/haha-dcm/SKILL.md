@@ -1,6 +1,6 @@
 ---
-name: dcm
-description: Draft a commit message for the currently staged changes in LeopardWM, following .claude/rules/commit-messages.md. Never commits. Only run when the user invokes /dcm.
+name: haha-dcm
+description: Draft a commit message for the currently staged changes in LeopardWM, following .claude/rules/commit-messages.md. Never commits. Only run when the user invokes /haha-dcm.
 disable-model-invocation: true
 ---
 

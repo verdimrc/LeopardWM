@@ -1,6 +1,6 @@
 ---
-name: reconcile-merge
-description: Finish merging the local main branch into the haha branch of LeopardWM after the user has run `git merge --no-commit --no-ff main` — verify preconditions, resolve conflicts per the agreed policy, fix build/clippy/tests, and update CHANGELOG-HAHA.md, leaving all commits to the user. Only run when the user invokes /reconcile-merge.
+name: haha-rcm
+description: Finish merging the local main branch into the haha branch of LeopardWM after the user has run `git merge --no-commit --no-ff main` — verify preconditions, resolve conflicts per the agreed policy, fix build/clippy/tests, and update CHANGELOG-HAHA.md, leaving all commits to the user. Only run when the user invokes /haha-rcm.
 disable-model-invocation: true
 ---
 
