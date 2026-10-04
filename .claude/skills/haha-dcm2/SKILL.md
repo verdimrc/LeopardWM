@@ -16,7 +16,8 @@ Read `.claude/skills/haha-dcm/SKILL.md` and follow it exactly — steps 1 (read 
   - **Version A — one-liner:** `type(scope): subject` plus the trailer, no body.
   - **Version B — with a detail message:** the same first line plus the most useful body the
     rules allow: the steps that trigger the bug, an unguessable cause or fix
-    ("Previously, …" / "This fix …"), an unfamiliar term, or one bullet per part ("X changed:
+    ("Previously, …" / "This fix …"), an unfamiliar term, a new config key's example syntax
+    (only that), or one bullet per part ("X changed:
     previously …; now …", or "(new)"; several changes to one part nested under it), dropping any bullet that only repeats the first line.
 - **Step 4:** run every check on both versions, but don't drop version B for being guessable.
   Its body must still follow the rules: short, no restating the diff, no explaining what a

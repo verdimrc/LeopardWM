@@ -285,6 +285,7 @@ impl AppState {
                 &self.config.appearance,
                 scale,
                 vw,
+                self.monitors.get(&monitor_id).map_or("", |m| m.device_name.as_str()),
             );
             params.apply_to(&mut ws);
             ws.set_centering_mode(self.config.layout.centering_mode.into());
@@ -374,6 +375,7 @@ impl AppState {
                         &self.config.appearance,
                         scale,
                         vw,
+                        self.monitors.get(&id).map_or("", |m| m.device_name.as_str()),
                     );
                     let device_name = self.monitors.get(&id).map(|m| m.device_name.clone()).unwrap_or_default();
                     while ws_vec.len() <= ws_idx {

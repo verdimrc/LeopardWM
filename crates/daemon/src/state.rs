@@ -1104,6 +1104,7 @@ impl AppState {
                 &config.appearance,
                 monitor.scale_factor,
                 crate::monitors::monitor_viewport_width(&monitor),
+                &monitor.device_name,
             );
             let mut workspace = Workspace::with_directional_gaps(
                 params.gap,
@@ -1683,6 +1684,7 @@ impl AppState {
             &self.config.appearance,
             scale,
             vw,
+            self.monitors.get(&monitor_id).map_or("", |m| m.device_name.as_str()),
         );
 
         let config = &self.config;

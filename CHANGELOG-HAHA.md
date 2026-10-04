@@ -50,6 +50,9 @@
   (e.g. `column_width = { "1" = 0.5, "2" = 2 }`) in addition to the existing viewport
   fraction. Map keys are quoted Windows display indices (`"1"` = `\\.\DISPLAY1`). Useful
   when the same app needs a different initial width on each monitor.
+- `layout.default_width_preset_monitor_overrides` lets each monitor open new columns at its
+  own width preset (e.g. `default_width_preset_monitor_overrides = { "2" = 3 }`). Keys are
+  Windows display numbers; monitors not listed use `layout.default_width_preset`.
 - New-window placement: `Ctrl+Alt+Shift+N` (`hotkeys.toggle_new_window_placement_once`)
   activates a one-shot override to the opposite of the current default placement for the
   next window only. When active, pressing it again cancels the override instead.
@@ -68,15 +71,16 @@
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `layout.rtl_monitor_indices` | `[u32]` | `[]` | Monitor display numbers that use RTL layout. |
-| `layout.desktop_peek_min_width` | `f64` | `0.25` | Minimum ghost column width as a fraction of monitor width. |
-| `behavior.notify_elevation_blocked` | `bool` | `true` | Show a toast when a privilege-elevated window is excluded from tiling. Set to `false` to silence it. |
-| `behavior.symmetric_modifiers` | `bool` | `false` | Treat Right Ctrl / Right Alt as interchangeable with their left counterparts in hotkeys. |
+| `layout.rtl_monitor_indices` | `[u32]` | `[]` | Monitor display numbers that use RTL layout. ⚠️ [Known issue with GUI settings](#known-issues-with-gui-settings) |
+| `layout.desktop_peek_min_width` | `f64` | `0.25` | Minimum ghost column width as a fraction of monitor width. ⚠️ [Known issue with GUI settings](#known-issues-with-gui-settings) |
+| `behavior.notify_elevation_blocked` | `bool` | `true` | Show a toast when a privilege-elevated window is excluded from tiling. Set to `false` to silence it. ⚠️ [Known issue with GUI settings](#known-issues-with-gui-settings) |
+| `behavior.symmetric_modifiers` | `bool` | `false` | Treat Right Ctrl / Right Alt as interchangeable with their left counterparts in hotkeys. ⚠️ [Known issue with GUI settings](#known-issues-with-gui-settings) |
 | `hotkeys.toggle_overview_all` | `string` | `"Ctrl+Alt+Win+Space"` | Toggle overview on all monitors simultaneously. |
 | `hotkeys.toggle_desktop_peek_anchored` | `string` | `"Ctrl+Alt+'"` | Reveal desktop; focused window stays in place. |
 | `hotkeys.toggle_desktop_peek` | `string` | `"Ctrl+Alt+Shift+'"` | Reveal desktop; focused window moves to the minimum-width mark. |
 | Window rule: `tile_on_os_monitor` | `bool` | `false` | Tile the window on whichever monitor the OS places it, instead of the focused monitor. |
-| Window rule: `column_width` (extended) | `f64 \| u32 \| { "N" = f64\|u32 }` | (none) | Now accepts a preset index or a per-display-index map in addition to a viewport fraction. |
+| `layout.default_width_preset_monitor_overrides` | `{ "N" = u32 }` | `{}` | Per-display-index override of `layout.default_width_preset`. ⚠️ [Known issue with GUI settings](#known-issues-with-gui-settings) |
+| Window rule: `column_width` (extended) | `f64 \| u32 \| { "N" = f64\|u32 }` | (none) | Now accepts a preset index or a per-display-index map in addition to a viewport fraction. ⚠️ [Known issue with GUI settings](#known-issues-with-gui-settings) |
 | `hotkeys.toggle_new_window_placement_once` | `string` | `"Ctrl+Alt+Shift+N"` | Activate a one-shot new-window-placement override for the next window only. |
 
 ### Fixes
@@ -102,3 +106,17 @@
 
   Note: main's `ed2f51f` and `00e9b66` fix DPI rescaling on display-settings changes and floating/monitor-removal
   edge cases; these are different bugs than the ones above.
+
+### Known issues with GUI settings
+
+Saving from the settings window rewrites `config.toml` from the fields the window shows. Fields it
+doesn't show are reset or removed:
+
+| Field | After saving from the settings window |
+|---|---|
+| `layout.rtl_monitor_indices` | Reset to `[]`. |
+| `layout.desktop_peek_min_width` | Reset to `0.25`. |
+| `behavior.notify_elevation_blocked` | Reset to `true`. |
+| `behavior.symmetric_modifiers` | Reset to `false`. |
+| `layout.default_width_preset_monitor_overrides` | Removed. |
+| Window rule: `column_width` (extended) | Fractions and preset index `1` are kept; preset index `2` or higher and per-display maps are removed. |

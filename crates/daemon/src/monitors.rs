@@ -35,6 +35,7 @@ impl AppState {
     /// This handles:
     /// - Removing workspaces for disconnected monitors (migrating windows to primary)
     /// - Adding workspaces for newly connected monitors
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn reconcile_monitors(&mut self, new_monitors: Vec<MonitorInfo>) {
         let new_ids: HashSet<MonitorId> = new_monitors.iter().map(|m| m.id).collect();
         let old_ids: HashSet<MonitorId> = self.monitors.keys().copied().collect();
@@ -113,6 +114,7 @@ impl AppState {
                         &self.config.appearance,
                         scale,
                         viewport_width,
+                        self.monitors.get(&monitor_id).map_or("", |m| m.device_name.as_str()),
                     );
                     let source_viewport_width = source_viewport_widths
                         .get(&monitor_id)
@@ -221,6 +223,7 @@ impl AppState {
                     &self.config.appearance,
                     monitor.scale_factor,
                     mvw,
+                    &monitor.device_name,
                 );
                 let mut workspace = Workspace::with_directional_gaps(
                     params.gap,
@@ -362,6 +365,7 @@ impl AppState {
                 &self.config.appearance,
                 scale,
                 viewport_width,
+                self.monitors.get(&monitor_id).map_or("", |m| m.device_name.as_str()),
             );
 
             let source_viewport_width = source_viewport_widths

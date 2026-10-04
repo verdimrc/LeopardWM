@@ -38,6 +38,10 @@ Run commands from the repository root.
 - Prefer reuse over new code; search existing patterns before adding.
 - Verify before done: tests, logs, or diffs.
 - Prefer minimal, scoped changes; avoid unrelated refactors.
+- Never run `cargo fmt`, or `rustfmt` without `--check`: the repo isn't rustfmt-formatted, so it
+  rewrites unrelated code. Format new code (new functions, statements, tests) as rustfmt would:
+  run `rustfmt --check <file>` and apply only the suggestions that touch those lines. When making
+  a small edit to an existing line, such as adding an argument, keep its current layout.
 - Do not edit generated files or vendor folders unless explicitly asked.
 - Check `git status` before destructive operations.
 

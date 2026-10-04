@@ -18,14 +18,17 @@ in separate commits: draft for the main change, name the other paths, and give t
 
 `type(scope): subject`, then the attribution trailer given in the session.
 
-The whole first line, including `type(scope): `, is at most **79 characters** so it fits in
-`git log`. Measure it (`printf '%s' '<line>' | wc -m`); don't estimate.
+There is no hard length limit on the first line. Make it as short as it can be while staying
+plain and humane: every word should carry what the user gets, or how they turn it on.
 
 ## Subject (one-liner)
 
 - Describe what the user experiences, in plain language. Not mechanics.
 - No internal names: struct/function names, config keys, IPC variants, or internal concepts
   ("placeholder", "sentinel", "override", "fraction cache").
+- Exception: a new feature the user turns on with a config key. The subject names the key and
+  what it gives the user, e.g.
+  `feat(daemon): layout.default_width_preset_monitor_overrides to set the per-monitor width preset`.
 - Bug fix shape: "<thing> no longer <bad behavior>". The thing can be the action that goes
   wrong, e.g. `fix(daemon): exiting desktop peek no longer hides a newly focused window`.
 - If the bug only happens under a condition, the condition is part of the subject:
@@ -34,7 +37,7 @@ The whole first line, including `type(scope): `, is at most **79 characters** so
   ("1-2 pixels off") — say exactly what happens ("gains or loses pixels").
 - Avoid words with a second meaning in this project, e.g. "permanent" (reads as "saved to
   config.toml"). Use "default", "persistent setting", or rephrase.
-- To fit 79 characters, compress noun phrases rather than dropping meaning: "a newly focused
+- To keep it short, compress noun phrases rather than dropping meaning: "a newly focused
   window", not "a window opened during desktop peek that takes focus". Prefer a natural action
   subject ("exiting desktop peek") over noun stacks ("desktop peek exit").
 - Grammar: a gerund subject takes a singular verb ("exiting desktop peek no longer hides…").
@@ -70,6 +73,9 @@ When a body is needed, keep it short:
 - Give the steps that trigger a bug when a reader couldn't guess them, e.g. "Triggered by
   opening a window while desktop peek is on, e.g. double-clicking a file on the revealed
   desktop, with "focus new windows" enabled."
+- For a new config key, show its syntax with an example value, e.g.
+  `default_width_preset_monitor_overrides = { "2" = 3 }`. Nothing else: fallbacks, validation,
+  and settings-window behavior are mechanics.
 - For a fix whose cause or approach a reader couldn't predict, use two short paragraphs:
   "Previously, <what went wrong and why>." then "This fix <how, in plain terms>."
 - For a commit with several parts, one bullet per part. A changed part reads

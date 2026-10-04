@@ -9820,6 +9820,30 @@ fn test_reconcile_new_monitor_keeps_destination_default_width() {
 }
 
 #[test]
+fn test_default_width_preset_monitor_override_applies_per_monitor() {
+    // DISPLAY2 has an override; DISPLAY1 is unlisted and uses default_width_preset.
+    let mut config = test_config();
+    config.layout.default_width_preset = 3;
+    config
+        .layout
+        .default_width_preset_monitor_overrides
+        .insert("2".to_string(), 1);
+    let state = AppState::new_with_config(config, two_monitors());
+
+    let default_width = |id: MonitorId| state.workspaces[&id][0].default_column_width();
+    let expected = |id: MonitorId, preset: usize| {
+        let m = &state.monitors[&id];
+        let mut layout = state.config.layout.clone();
+        layout.default_width_preset = preset;
+        layout.default_width_preset_monitor_overrides.clear();
+        layout.default_column_width_px(crate::monitors::monitor_viewport_width(m), "")
+    };
+    assert_eq!(default_width(1), expected(1, 3));
+    assert_eq!(default_width(2), expected(2, 1));
+    assert_ne!(default_width(1), default_width(2));
+}
+
+#[test]
 fn test_reconcile_remove_monitor() {
     let mut state = AppState::new_with_config(test_config(), two_monitors());
     assert_eq!(state.workspaces.len(), 2);

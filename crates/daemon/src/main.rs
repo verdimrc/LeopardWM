@@ -1140,7 +1140,7 @@ fn init_workspace_state(state: &mut AppState) {
         }
     }
 
-    // Normalize all column widths to the first width preset on startup.
+    // Normalize all column widths to each monitor's default width preset on startup.
     // Windows may have arbitrary sizes before tiling; using a uniform width
     // ensures consistent initial layout.
     let monitor_widths_for_default: HashMap<_, _> = state
@@ -1148,7 +1148,7 @@ fn init_workspace_state(state: &mut AppState) {
         .iter()
         .map(|(&id, m)| {
             let vw = crate::monitors::monitor_viewport_width(m);
-            (id, state.config.layout.default_column_width_px(vw))
+            (id, state.config.layout.default_column_width_px(vw, &m.device_name))
         })
         .collect();
     // Restored slots keep their saved per-column widths; only freshly-enumerated

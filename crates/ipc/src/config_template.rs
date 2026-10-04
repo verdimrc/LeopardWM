@@ -47,6 +47,10 @@ width_presets = [0.333, 0.5, 0.667]
 # 1 = first preset. Out-of-range values fall back to the first preset.
 default_width_preset = 1
 
+# Per-monitor overrides of default_width_preset. Keys are Windows display
+# numbers ("2" = \\.\DISPLAY2); unlisted monitors use default_width_preset.
+# default_width_preset_monitor_overrides = {{ "2" = 3 }}
+
 # Height presets (fractions of column height / weight).
 height_presets = [0.333, 0.5, 0.667]
 

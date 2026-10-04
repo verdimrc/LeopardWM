@@ -150,6 +150,13 @@ pub struct LayoutConfig {
     #[serde(default = "default_width_preset")]
     pub default_width_preset: usize,
 
+    /// Per-display overrides of `default_width_preset`: quoted Windows display
+    /// indices (`"2"` = `\\.\DISPLAY2`) mapped to a 1-based index into
+    /// `width_presets`. Displays not listed use `default_width_preset`.
+    /// Example: `default_width_preset_monitor_overrides = { "2" = 3 }`.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub default_width_preset_monitor_overrides: std::collections::BTreeMap<String, usize>,
+
     /// Height presets for cycling (fractions of column height / weight).
     #[serde(default = "default_height_presets")]
     pub height_presets: Vec<f64>,
@@ -207,6 +214,7 @@ impl Default for LayoutConfig {
             center_past_edges: false,
             width_presets: default_width_presets(),
             default_width_preset: default_width_preset(),
+            default_width_preset_monitor_overrides: std::collections::BTreeMap::new(),
             height_presets: default_height_presets(),
             rtl_monitor_indices: Vec::new(),
             desktop_peek_min_width: default_desktop_peek_min_width(),
@@ -236,10 +244,19 @@ impl LayoutConfig {
         display_index(device_name).is_some_and(|n| self.rtl_monitor_indices.contains(&n))
     }
 
-    /// The width fraction new columns open at: the `default_width_preset`-th
-    /// preset (1-based), falling back to the first preset if out of range.
-    pub fn default_width_fraction(&self) -> f64 {
-        let idx = self.default_width_preset.saturating_sub(1);
+    /// The width fraction new columns open at on the monitor with the given
+    /// device name (e.g. `\\.\DISPLAY2`): the preset (1-based) from its entry in
+    /// `default_width_preset_monitor_overrides`, else `default_width_preset`,
+    /// falling back to the first preset if out of range.
+    pub fn default_width_fraction(&self, device_name: &str) -> f64 {
+        let preset = display_index(device_name)
+            .and_then(|n| {
+                self.default_width_preset_monitor_overrides
+                    .get(&n.to_string())
+            })
+            .copied()
+            .unwrap_or(self.default_width_preset);
+        let idx = preset.saturating_sub(1);
         self.width_presets
             .get(idx)
             .or_else(|| self.width_presets.first())
@@ -251,13 +268,13 @@ impl LayoutConfig {
     /// using the configured default width preset as a fraction.
     /// Formula: `width = fraction * (viewport - OL - OR + gap) - gap`
     /// This is independent of column count — same result whether 1 or 10 columns.
-    pub fn default_column_width_px(&self, viewport_width: i32) -> i32 {
+    pub fn default_column_width_px(&self, viewport_width: i32, device_name: &str) -> i32 {
         let base = viewport_width
             .saturating_sub(self.outer_gap_left.max(0))
             .saturating_sub(self.outer_gap_right.max(0))
             .saturating_add(self.gap.max(0));
         let gap = self.gap.max(0);
-        let frac = self.default_width_fraction();
+        let frac = self.default_width_fraction(device_name);
         (base as f64 * frac - gap as f64).floor().max(100.0) as i32
     }
 
@@ -1294,6 +1311,35 @@ impl Config {
             self.layout.default_width_preset = 1;
         }
 
+        // Each monitor override needs a positive display index key and a valid
+        // preset index; bad entries are dropped (that display then uses
+        // default_width_preset). Keys are canonicalized ("01" -> "1") so
+        // lookups match.
+        let overrides = std::mem::take(&mut self.layout.default_width_preset_monitor_overrides);
+        for (key, n) in overrides {
+            let field = format!("layout.default_width_preset_monitor_overrides.{}", key);
+            let Some(display) = key.parse::<u32>().ok().filter(|&d| d > 0) else {
+                warnings.push(ConfigWarning {
+                    field,
+                    message: format!(
+                        "display index {:?} must be a positive integer; ignoring",
+                        key
+                    ),
+                });
+                continue;
+            };
+            if n == 0 || n > preset_count {
+                warnings.push(ConfigWarning {
+                    field,
+                    message: format!("preset ({}) out of range 1..={}; ignoring", n, preset_count),
+                });
+                continue;
+            }
+            self.layout
+                .default_width_preset_monitor_overrides
+                .insert(display.to_string(), n);
+        }
+
         // height_presets must not be empty
         if self.layout.height_presets.is_empty() {
             warnings.push(ConfigWarning {
@@ -2022,7 +2068,7 @@ mod tests {
         let config = LayoutConfig::default();
         // base = 1920 - 10 - 10 + 10 = 1910
         // width = 0.333 * 1910 - 10 = 626
-        let width = config.default_column_width_px(1920);
+        let width = config.default_column_width_px(1920, "");
         let base = 1920 - config.outer_gap_left - config.outer_gap_right + config.gap;
         assert_eq!(
             width,
@@ -2034,19 +2080,19 @@ mod tests {
     fn test_default_width_preset_selects_fraction() {
         let mut config = LayoutConfig::default();
         // Default is preset 1 (0.333).
-        assert_eq!(config.default_width_fraction(), 0.333);
+        assert_eq!(config.default_width_fraction(""), 0.333);
 
         // Selecting the 2nd/3rd preset picks the matching fraction.
         config.default_width_preset = 2;
-        assert_eq!(config.default_width_fraction(), 0.5);
+        assert_eq!(config.default_width_fraction(""), 0.5);
         config.default_width_preset = 3;
-        assert_eq!(config.default_width_fraction(), 0.667);
+        assert_eq!(config.default_width_fraction(""), 0.667);
 
         // Out-of-range (0 or beyond the list) falls back to the first preset.
         config.default_width_preset = 0;
-        assert_eq!(config.default_width_fraction(), 0.333);
+        assert_eq!(config.default_width_fraction(""), 0.333);
         config.default_width_preset = 99;
-        assert_eq!(config.default_width_fraction(), 0.333);
+        assert_eq!(config.default_width_fraction(""), 0.333);
     }
 
     #[test]
@@ -2058,6 +2104,84 @@ mod tests {
             .iter()
             .any(|w| w.field == "layout.default_width_preset"));
         assert_eq!(config.layout.default_width_preset, 1);
+    }
+
+    #[test]
+    fn test_default_width_preset_monitor_overrides_absent_means_none() {
+        let mut config: Config = toml::from_str("[layout]\ndefault_width_preset = 2\n").unwrap();
+        assert!(config.validate().is_empty());
+        assert!(config
+            .layout
+            .default_width_preset_monitor_overrides
+            .is_empty());
+        assert!(Config::default()
+            .layout
+            .default_width_preset_monitor_overrides
+            .is_empty());
+        // Every display uses default_width_preset.
+        assert_eq!(config.layout.default_width_fraction(r"\\.\DISPLAY2"), 0.5);
+        // Saving doesn't write an empty override table.
+        let saved = toml::to_string_pretty(&config).unwrap();
+        assert!(
+            !saved.contains("default_width_preset_monitor_overrides"),
+            "{saved}"
+        );
+    }
+
+    #[test]
+    fn test_default_width_preset_monitor_overrides_resolve_by_display() {
+        let toml_str = r#"
+[layout]
+default_width_preset = 2
+default_width_preset_monitor_overrides = { "2" = 3 }
+"#;
+        let mut config: Config = toml::from_str(toml_str).unwrap();
+        assert!(config.validate().is_empty());
+        let layout = &config.layout;
+        assert_eq!(layout.default_width_fraction(r"\\.\DISPLAY2"), 0.667);
+        // Unlisted and unknown displays use default_width_preset.
+        assert_eq!(layout.default_width_fraction(r"\\.\DISPLAY1"), 0.5);
+        assert_eq!(layout.default_width_fraction(""), 0.5);
+    }
+
+    #[test]
+    fn test_default_width_preset_monitor_overrides_reject_fractions() {
+        let toml_str = "[layout]\ndefault_width_preset_monitor_overrides = { \"2\" = 0.5 }\n";
+        assert!(toml::from_str::<Config>(toml_str).is_err());
+    }
+
+    #[test]
+    fn test_default_width_preset_monitor_overrides_drop_bad_entries() {
+        let toml_str = r#"
+[layout]
+default_width_preset_monitor_overrides = { "01" = 2, "0" = 2, "main" = 2, "2" = 9 }
+"#;
+        let mut config: Config = toml::from_str(toml_str).unwrap();
+        let warnings = config.validate();
+        // "0" and "main" are bad keys; "2" = 9 is out of range.
+        assert_eq!(warnings.len(), 3, "{warnings:?}");
+        // "01" is kept, canonicalized to display 1.
+        let expected: std::collections::BTreeMap<String, usize> =
+            [("1".to_string(), 2)].into_iter().collect();
+        assert_eq!(
+            config.layout.default_width_preset_monitor_overrides,
+            expected
+        );
+    }
+
+    #[test]
+    fn test_default_width_preset_monitor_overrides_round_trip() {
+        let mut config = Config::default();
+        config
+            .layout
+            .default_width_preset_monitor_overrides
+            .insert("2".to_string(), 3);
+        let toml_str = toml::to_string_pretty(&config).unwrap();
+        let parsed: Config = toml::from_str(&toml_str).unwrap();
+        assert_eq!(
+            parsed.layout.default_width_preset_monitor_overrides,
+            config.layout.default_width_preset_monitor_overrides
+        );
     }
 
     #[test]

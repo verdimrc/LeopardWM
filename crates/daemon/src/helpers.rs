@@ -73,12 +73,14 @@ pub(crate) struct ScaledLayoutParams {
 }
 
 impl ScaledLayoutParams {
-    /// Compute scaled layout parameters from config + monitor DPI + viewport width.
+    /// Compute scaled layout parameters from config + monitor DPI + viewport width + monitor
+    /// device name (for its per-monitor default width preset).
     pub fn from_config(
         layout: &config::LayoutConfig,
         appearance: &config::AppearanceConfig,
         scale_factor: f64,
         viewport_width: i32,
+        device_name: &str,
     ) -> Self {
         let gap = scale_px(layout.gap, scale_factor);
         let outer_gap_left = scale_px(layout.outer_gap_left, scale_factor);
@@ -98,7 +100,7 @@ impl ScaledLayoutParams {
             .saturating_sub(outer_gap_left.max(0))
             .saturating_sub(outer_gap_right.max(0))
             .saturating_add(gap.max(0));
-        let frac = layout.default_width_fraction();
+        let frac = layout.default_width_fraction(device_name);
         let default_column_width = (base as f64 * frac - gap as f64).floor().max(100.0) as i32;
 
         Self {
@@ -213,6 +215,7 @@ impl AppState {
                 &self.config.appearance,
                 scale,
                 viewport_width,
+                self.monitors.get(&monitor_id).map_or("", |m| m.device_name.as_str()),
             );
 
             let device_name = self.monitors.get(&monitor_id).map(|m| m.device_name.clone()).unwrap_or_default();
