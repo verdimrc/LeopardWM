@@ -632,8 +632,9 @@ impl AppState {
         // re-anchor the scroll so the ghost stays at screen_x=0 (e.g. when an
         // unrelated column on the same workspace is removed).
         if let Some(ref ps) = self.desktop_peek {
-            let (mon, ws_idx, initial_col_count, saved_scroll) =
-                (ps.monitor, ps.ws_idx, ps.initial_column_count, ps.saved_scroll);
+            let (mon, ws_idx, initial_col_count) =
+                (ps.monitor, ps.ws_idx, ps.initial_column_count);
+            let viewport_width = self.viewport_width_for(mon);
             if let Some(ws) = self
                 .workspaces
                 .get_mut(&mon)
@@ -644,10 +645,15 @@ impl AppState {
                 if real_col_count > initial_col_count {
                     // A new window landed on the peeked workspace — exit peek
                     // inline to avoid recursion (exit_desktop_peek calls
-                    // apply_layout; doing it here would re-enter).
-                    let _ = ws.remove_window(crate::state::DESKTOP_PEEK_HWND);
-                    ws.set_scroll_offset_immediate(saved_scroll);
-                    self.desktop_peek = None;
+                    // apply_layout; doing it here would re-enter). The new
+                    // window may have taken focus, so it's scrolled into view.
+                    if let Some(ps) = self.desktop_peek.take() {
+                        crate::command_handler::restore_workspace_after_desktop_peek(
+                            ws,
+                            &ps,
+                            viewport_width,
+                        );
+                    }
                     tracing::info!(
                         "desktop_peek: new window on peeked monitor {} — auto-exit",
                         mon

@@ -9,33 +9,59 @@ Draft only from the diff being committed: `git diff --cached --stat` and `git di
 (or `git diff HEAD` if nothing is staged). Never from what was discussed in the session. If staged
 and unstaged changes are mixed, say which one the draft covers.
 
+If the staged diff mixes unrelated changes (e.g. a code fix plus `.claude/` tooling), they belong
+in separate commits: draft for the main change, name the other paths, and give the exact
+`git restore --staged <paths>` to split them off.
+
 ## Format
 
 `type(scope): subject`, then the attribution trailer given in the session.
+
+The whole first line, including `type(scope): `, is at most **79 characters** so it fits in
+`git log`. Measure it (`printf '%s' '<line>' | wc -m`); don't estimate.
 
 ## Subject (one-liner)
 
 - Describe what the user experiences, in plain language. Not mechanics.
 - No internal names: struct/function names, config keys, IPC variants, or internal concepts
   ("placeholder", "sentinel", "override", "fraction cache").
-- Bug fix shape: "<thing> no longer <bad behavior>", e.g.
-  `fix(daemon): moving a window between monitors no longer gains or loses pixels`.
+- Bug fix shape: "<thing> no longer <bad behavior>". The thing can be the action that goes
+  wrong, e.g. `fix(daemon): exiting desktop peek no longer hides a newly focused window`.
+- If the bug only happens under a condition, the condition is part of the subject:
+  "…hides a newly focused window", not "…hides a new window". Leaving it out misstates the bug.
 - Be literal about the symptom. No vague words ("drifts its width") and no unverified numbers
   ("1-2 pixels off") — say exactly what happens ("gains or loses pixels").
 - Avoid words with a second meaning in this project, e.g. "permanent" (reads as "saved to
   config.toml"). Use "default", "persistent setting", or rephrase.
-- Two separate changes may share a subject joined by `;`, e.g.
-  `feat(daemon): extend new window placement; tray status badge`.
+- To fit 79 characters, compress noun phrases rather than dropping meaning: "a newly focused
+  window", not "a window opened during desktop peek that takes focus". Prefer a natural action
+  subject ("exiting desktop peek") over noun stacks ("desktop peek exit").
+- Grammar: a gerund subject takes a singular verb ("exiting desktop peek no longer hides…").
+- Join two changes with `;` only when they are parts of one feature, e.g.
+  `feat(daemon): extend new window placement; tray status badge`. Unrelated changes are separate
+  commits (see Source).
 
 ## Body (detail)
 
-Omit it when the subject is self-explanatory. When needed, keep it short:
+Default to a one-liner. Add a body only if a reader couldn't predict it from the subject —
+if the body's content is guessable from the subject, delete it. Diff size is irrelevant.
+
+- Body needed: `moving a window between monitors no longer gains or loses pixels` — nobody can
+  guess from that how a move changes a width (repeated rounding) or how it was fixed
+  (remembering the proportion).
+- No body: `exiting desktop peek no longer hides a newly focused window` — the condition is in
+  the subject, and the cause (the old view came back) and fix (show the focused window) are
+  implied.
+- Never explain a setting or behavior the config and docs already describe (e.g. that a new
+  window takes focus when "focus new windows" is on).
+
+When a body is needed, keep it short:
 
 - Define any term in the subject a reader may not know, e.g. "External tools are anything
   subscribed to LeopardWM's workspace updates over IPC, such as a status bar."
-- For a fix whose cause isn't obvious, use two short paragraphs:
+- For a fix whose cause or approach a reader couldn't predict, use two short paragraphs:
   "Previously, <what went wrong and why>." then "This fix <how, in plain terms>."
-- For two distinct changes, use a short bullet list, one bullet per change.
+- For the parts of one feature joined with `;`, use a short bullet list, one bullet per part.
 - Never restate the diff line by line. A message longer than the diff is a red flag.
 
 ## Merges

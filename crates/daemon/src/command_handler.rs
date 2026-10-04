@@ -1990,6 +1990,7 @@ impl AppState {
         let Some(state) = self.desktop_peek.take() else {
             return;
         };
+        let viewport_width = self.viewport_width_for(state.monitor);
         let Some(ws) = self
             .workspaces
             .get_mut(&state.monitor)
@@ -1997,8 +1998,7 @@ impl AppState {
         else {
             return;
         };
-        let _ = ws.remove_window(crate::state::DESKTOP_PEEK_HWND);
-        ws.set_scroll_offset_immediate(state.saved_scroll);
+        restore_workspace_after_desktop_peek(ws, &state, viewport_width);
         if let Err(e) = self.apply_layout() {
             tracing::warn!("desktop peek restore apply_layout: {e}");
         }
@@ -2014,6 +2014,22 @@ impl AppState {
         {
             self.exit_desktop_peek();
         }
+    }
+}
+
+/// Remove the desktop-peek ghost column and restore the scroll from before
+/// peek. If a different window took focus while peek was on (e.g. a file
+/// opened from the revealed desktop), scroll that window into view instead of
+/// leaving it off-screen behind the restored position.
+pub(crate) fn restore_workspace_after_desktop_peek(
+    ws: &mut leopardwm_core_layout::Workspace,
+    state: &crate::state::DesktopPeekState,
+    viewport_width: i32,
+) {
+    let _ = ws.remove_window(crate::state::DESKTOP_PEEK_HWND);
+    ws.set_scroll_offset_immediate(state.saved_scroll);
+    if ws.focused_window() != Some(state.focused_hwnd) {
+        ws.ensure_focused_visible(viewport_width);
     }
 }
 

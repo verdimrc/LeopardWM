@@ -21,14 +21,19 @@ is the single source of truth; follow it exactly. This skill is the procedure ar
      unstaged changes (the user still has to stage them).
 3. `git diff --stat` — if there are also unstaged changes, say the draft covers only the staged
    part.
-4. `git log --oneline -5` for the repo's `type(scope)` conventions.
+4. Look at the staged paths: if they mix unrelated changes (e.g. a code fix plus `.claude/`
+   tooling), draft for the main change, name the other paths, and give the exact
+   `git restore --staged <paths>` to split them off. Don't join unrelated changes with `;`.
+5. `git log --oneline -5` for the repo's `type(scope)` conventions.
 
 Base the draft only on that diff — not on what was discussed in the session.
 
 ## 2. Understand the change before writing
 
 - What does the user experience differently? (feature, fixed bug, behavior change)
-- For a fix: what was the visible symptom, and is its cause obvious from the subject?
+- For a fix: what was the visible symptom, and under what condition does it happen (e.g. only
+  when the new window takes focus)? That condition belongs in the subject.
+- Could a reader predict the cause and the fix from the subject alone? If so, no body.
 - Does the subject need a term a reader may not know?
 - Is this one change, or two distinct ones?
 
@@ -46,15 +51,25 @@ Go through this list against the draft. Fix anything that fails, then show it.
 - [ ] Subject describes what the user experiences, in plain language — not mechanics.
 - [ ] Subject has no internal names (structs, functions, config keys, IPC variants) or internal
       concepts ("placeholder", "sentinel", "override").
+- [ ] The first line is at most 79 characters, measured with
+      `printf '%s' '<first line>' | wc -m` — not estimated.
 - [ ] A bug fix reads "<thing> no longer <bad behavior>".
+- [ ] The condition under which the bug happens is in the subject.
 - [ ] The symptom is stated literally: no vague words ("drifts"), no unverified numbers.
 - [ ] No double-meaning words (e.g. "permanent").
-- [ ] Body omitted if the subject is self-explanatory; otherwise it only defines unfamiliar
-      terms, gives "Previously, …" / "This fix …" for a non-obvious fix, or lists two distinct
-      changes as bullets. It doesn't restate the diff.
+- [ ] Noun phrases are compressed ("a newly focused window"), the subject reads naturally
+      ("exiting desktop peek", not "desktop peek exit"), and the verb agrees with it.
+- [ ] `;` joins only parts of one feature; unrelated changes are split off instead.
+- [ ] Could I have guessed this body from the subject? If yes, delete it — one-liner is the
+      default, regardless of diff size.
+- [ ] Any remaining body only defines unfamiliar terms, gives "Previously, …" / "This fix …"
+      for a fix whose cause or approach a reader couldn't predict, or lists the parts of one
+      feature as bullets. It doesn't restate the diff or explain a documented setting.
 - [ ] None of the words to avoid ("clean", "checks out", "landing").
 
 ## 5. Output
 
 Show the message in a single code block, ready to paste, followed by one line saying what it
-covers (staged changes, or staged-only if unstaged changes also exist). Nothing else.
+covers (staged changes, or staged-only if unstaged changes also exist) and the measured length
+of the first line. If unrelated changes are staged, add the `git restore --staged <paths>`
+command to split them off. Nothing else.

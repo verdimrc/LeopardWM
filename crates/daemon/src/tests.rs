@@ -17761,3 +17761,103 @@ mod maximized_admission_regression;
 
 #[path = "display_change_regression.rs"]
 mod display_change_regression;
+
+/// Put the focused workspace into desktop peek the way `enter_desktop_peek`
+/// does (that function needs a real OS foreground window, so tests set the
+/// state up directly): a ghost column of `ghost_w` px left of `focused`, the
+/// scroll aligned to it, and the pre-peek scroll saved.
+fn enter_desktop_peek_for_test(state: &mut AppState, focused: u64, ghost_w: i32) {
+    let monitor = state.focused_monitor;
+    let ws_idx = state.active_workspace_idx(monitor);
+    let ws = &mut state.workspaces.get_mut(&monitor).unwrap()[ws_idx];
+    let saved_scroll = ws.scroll_offset();
+    let initial_column_count = ws.column_count();
+    let ghost_x = ws.focused_column_layout_x();
+    let focused_col = ws.focused_column_index();
+    ws.insert_window_at_column_no_focus(crate::state::DESKTOP_PEEK_HWND, Some(ghost_w), focused_col)
+        .unwrap();
+    ws.set_scroll_offset_immediate(ghost_x as f64);
+    state.desktop_peek = Some(crate::state::DesktopPeekState {
+        monitor,
+        ws_idx,
+        saved_scroll,
+        focused_hwnd: focused,
+        initial_column_count,
+    });
+}
+
+#[test]
+fn test_desktop_peek_new_focused_window_is_shown_after_auto_exit() {
+    // Peek on: [ghost 25%][window1 100%]. A file opened from the revealed
+    // desktop creates window2, which takes focus; peek auto-exits and the view
+    // must show window2, not snap back to window1.
+    let mut config = test_config();
+    config.behavior.focus_new_windows = true;
+    let mut state = AppState::new_with_config(config, test_monitors());
+    state.paused = false;
+    let monitor = state.focused_monitor;
+    let viewport = state.layout_viewport(monitor);
+    let viewport_width = state.viewport_width_for(monitor);
+    state
+        .injected_window_info
+        .insert(100, make_test_window_info(100));
+    state.handle_window_event(WindowEvent::Created(100, 0));
+    state
+        .focused_workspace_mut()
+        .unwrap()
+        .set_focused_column_width_fraction(1.0, viewport_width);
+    enter_desktop_peek_for_test(&mut state, 100, viewport_width / 4);
+
+    state
+        .injected_window_info
+        .insert(200, make_test_window_info(200));
+    state.handle_window_event(WindowEvent::Created(200, 0));
+    // The open animation defers layout; peek auto-exits on the apply that
+    // follows once it settles (the event loop's post-animation apply).
+    state.tick_animations(10_000);
+    let _ = state.apply_layout();
+
+    assert!(state.desktop_peek.is_none(), "a new window exits peek");
+    let ws = state.focused_workspace().unwrap();
+    assert!(!ws.contains_window(crate::state::DESKTOP_PEEK_HWND));
+    assert_eq!(ws.focused_window(), Some(200));
+    let placement = ws
+        .compute_placements(viewport)
+        .into_iter()
+        .find(|p| p.window_id == 200)
+        .expect("window2 is placed");
+    assert_eq!(
+        placement.visibility,
+        leopardwm_core_layout::Visibility::Visible,
+        "the focused new window is in view"
+    );
+    assert!(
+        placement.rect.x >= viewport.x
+            && placement.rect.x + placement.rect.width <= viewport.x + viewport.width,
+        "window2 is fully on screen: {:?} in {:?}",
+        placement.rect,
+        viewport
+    );
+}
+
+#[test]
+fn test_desktop_peek_exit_without_focus_change_restores_exact_scroll() {
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    let monitor = state.focused_monitor;
+    let viewport_width = state.viewport_width_for(monitor);
+    for hwnd in [100, 101, 102] {
+        state
+            .injected_window_info
+            .insert(hwnd, make_test_window_info(hwnd));
+        state.handle_window_event(WindowEvent::Created(hwnd, 0));
+    }
+    let saved = state.focused_workspace().unwrap().scroll_offset();
+    let focused = state.focused_workspace().unwrap().focused_window().unwrap();
+    enter_desktop_peek_for_test(&mut state, focused, viewport_width / 4);
+
+    state.exit_desktop_peek();
+
+    let ws = state.focused_workspace().unwrap();
+    assert!(!ws.contains_window(crate::state::DESKTOP_PEEK_HWND));
+    assert_eq!(ws.scroll_offset(), saved, "same focus: exact pre-peek view");
+}
