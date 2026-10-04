@@ -552,24 +552,25 @@ impl AppState {
                 .add_floating(window_id, translated_rect)
                 .map_err(|e| format!("Failed to add floating window to target: {}", e))?;
         } else {
-            let source_column_width = source_workspace.column_width_for_window(window_id);
+            // Carry the column's width as a fraction of the viewport, so the
+            // window keeps its proportion on the target monitor. The exact
+            // fraction stays cached, so moving back and forth doesn't drift.
+            let fraction = source_workspace.column_width_fraction_for_window(
+                window_id,
+                self.viewport_width_for(source_monitor),
+            );
             source_workspace
                 .remove_window(window_id)
                 .map_err(|e| format!("Failed to remove window: {}", e))?;
-            let source_viewport_w = self.viewport_width_for(source_monitor);
-            let target_viewport_w = self.viewport_width_for(target_monitor);
-            let new_column_width = source_column_width.map(|w| {
-                if source_viewport_w > 0 {
-                    let frac = w as f64 / source_viewport_w as f64;
-                    ((frac * target_viewport_w as f64).round() as i32)
-                        .clamp(100, target_viewport_w)
-                } else {
-                    w.min(target_viewport_w)
-                }
-            });
-            target_workspace
-                .insert_window(window_id, new_column_width)
-                .map_err(|e| format!("Failed to add window to target: {}", e))?;
+            let inserted = match fraction {
+                Some(fraction) => target_workspace.insert_window_with_width_fraction(
+                    window_id,
+                    fraction,
+                    self.viewport_width_for(target_monitor),
+                ),
+                None => target_workspace.insert_window(window_id, None),
+            };
+            inserted.map_err(|e| format!("Failed to add window to target: {}", e))?;
         }
 
         let target_viewport = self.viewport_width_for(target_monitor);

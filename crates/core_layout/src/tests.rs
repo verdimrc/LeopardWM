@@ -2998,6 +2998,34 @@ mod tests {
     }
 
     #[test]
+    fn test_width_fraction_round_trip_across_workspaces_is_exact() {
+        // A window moved to a narrower monitor and back keeps its exact width:
+        // the fraction travels with it instead of being re-derived from a
+        // rounded pixel width.
+        let mut a = Workspace::with_gaps(10, 10);
+        a.insert_window(1, Some(613)).unwrap();
+        let fraction = a.column_width_fraction_for_window(1, 1920).unwrap();
+        a.remove_window(1).unwrap();
+
+        let mut b = Workspace::with_gaps(10, 10);
+        b.insert_window_with_width_fraction(1, fraction, 1366).unwrap();
+        let back = b.column_width_fraction_for_window(1, 1366).unwrap();
+        assert_eq!(back, fraction, "cached fraction survives the move");
+        b.remove_window(1).unwrap();
+
+        a.insert_window_with_width_fraction(1, back, 1920).unwrap();
+        assert_eq!(a.column_width_for_window(1), Some(613));
+    }
+
+    #[test]
+    fn test_insert_window_with_width_fraction_caps_at_viewport() {
+        // base = 1000 - 10 - 10 + 10 = 990; full width = base - gap = 980.
+        let mut ws = Workspace::with_gaps(10, 10);
+        ws.insert_window_with_width_fraction(1, 1.5, 1000).unwrap();
+        assert_eq!(ws.column_width_for_window(1), Some(980));
+    }
+
+    #[test]
     fn test_rescale_column_widths_cancels_animation_at_current_position() {
         let mut ws = Workspace::with_gaps(10, 10);
         for id in 1..=3 {

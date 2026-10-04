@@ -164,6 +164,58 @@ impl Workspace {
         }
     }
 
+    /// Width fraction of the tiled column holding `window_id`, in the same
+    /// gap-aware model `rescale_columns` uses (`(width + gap) / base`). Reuses
+    /// the column's exact cached fraction while it still matches the column's
+    /// width and this geometry, so round trips don't accumulate rounding.
+    pub fn column_width_fraction_for_window(
+        &self,
+        window_id: WindowId,
+        viewport_width: i32,
+    ) -> Option<f64> {
+        let (col_idx, _) = self.find_window_location(window_id)?;
+        let column = self.columns.get(col_idx)?;
+        let base = self.width_base(viewport_width).max(1);
+        let gap = self.gap.max(0);
+        Some(match &column.width_fraction_cache {
+            Some(cached) if cached.width == column.width && cached.base == base && cached.gap == gap => {
+                cached.fraction
+            }
+            _ => column.width.saturating_add(gap) as f64 / base as f64,
+        })
+    }
+
+    /// Insert `window_id` as a new column (see `insert_window`) sized to
+    /// `fraction` of this viewport, and cache the exact fraction on the new
+    /// column. A fraction above 1.0 is capped so the column fits the viewport.
+    ///
+    /// # Errors
+    ///
+    /// Returns `LayoutError::DuplicateWindow` if the window ID already exists.
+    pub fn insert_window_with_width_fraction(
+        &mut self,
+        window_id: WindowId,
+        fraction: f64,
+        viewport_width: i32,
+    ) -> Result<(), LayoutError> {
+        let fraction = fraction.min(1.0);
+        let base = self.width_base(viewport_width).max(1);
+        let gap = self.gap.max(0);
+        let width = (base as f64 * fraction - gap as f64)
+            .round()
+            .clamp(MIN_COLUMN_WIDTH as f64, i32::MAX as f64) as i32;
+        self.insert_window(window_id, Some(width))?;
+        if let Some(column) = self.columns.get_mut(self.focused_column) {
+            column.width_fraction_cache = Some(crate::column::WidthFractionCache {
+                fraction,
+                width: column.width,
+                base,
+                gap,
+            });
+        }
+        Ok(())
+    }
+
     /// Equalize all column widths to share the viewport equally.
     /// Uses gap-aware formula so equalized columns perfectly fill the viewport.
     /// Only counts active (non-fully-minimized) columns to match layout calculations.
