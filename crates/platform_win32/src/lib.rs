@@ -11,6 +11,7 @@
 pub mod autostart;
 pub mod border;
 pub mod dialog;
+pub mod focus_placeholder;
 pub mod gestures;
 pub mod hotkeys;
 pub mod ipc_security;
@@ -18,6 +19,7 @@ pub mod keyboard_hook;
 pub mod mouse_hook;
 pub mod overlay;
 pub mod overview;
+mod raw_touchpad;
 pub mod shell;
 pub mod snapshot;
 pub mod tab_strip;
@@ -54,10 +56,11 @@ pub use elevation::{
     INTEGRITY_MEDIUM,
 };
 pub use enumeration::{
-    enumerate_monitors, enumerate_windows, find_monitor_by_id, find_monitor_for_rect,
-    get_primary_monitor, get_process_executable, get_window_info, is_excluded_tool_window_hwnd,
-    is_excluded_window_class_hwnd, monitor_above, monitor_below, monitor_to_left, monitor_to_right,
-    monitors_by_position,
+    collect_all_top_level_window_ids, enumerate_monitors, enumerate_windows, find_monitor_by_id,
+    find_monitor_for_rect, get_primary_monitor, get_process_executable, get_window_info,
+    is_excluded_tool_window_hwnd, is_excluded_topmost_popup_hwnd, is_excluded_window_class_hwnd,
+    monitor_above, monitor_below, monitor_to_left, monitor_to_right, monitors_by_position,
+    TopLevelWindowIdCollection,
 };
 pub use event_hooks::{install_event_hooks, EventHookHandle, WindowEvent};
 pub use focus::{
@@ -68,12 +71,12 @@ pub use focus::{
 pub use placement::apply_cloak_state;
 pub use placement::clear_suspected_oversize;
 pub use placement::{
-    apply_placements, clear_inset_cache, drain_ghost_cloaked, dwm_cloak_window, dwm_uncloak_all,
-    dwm_uncloak_window, get_window_frame_insets, get_window_invisible_insets,
-    get_window_style_bits, is_placement_cloaked, is_placement_parked, mark_ghost_cloaked,
-    park_window_for_placement, set_dwm_transitions_disabled, unmark_ghost_cloaked,
-    visible_rect_to_frame_rect, ApplyPlacementsResult, HeightViolation, PlacementCache,
-    PlacementLanding, WidthViolation,
+    apply_display_change_placements, apply_placements, clear_inset_cache, drain_ghost_cloaked,
+    dwm_cloak_window, dwm_uncloak_all, dwm_uncloak_window, get_window_frame_insets,
+    get_window_invisible_insets, get_window_style_bits, is_placement_cloaked, is_placement_parked,
+    mark_ghost_cloaked, park_window_for_placement, set_dwm_transitions_disabled,
+    unmark_ghost_cloaked, visible_rect_to_frame_rect, ApplyPlacementsResult, HeightViolation,
+    PlacementCache, PlacementLanding, WidthViolation,
 };
 pub use system::{
     are_animations_enabled, get_system_highlight_color_bgr, is_high_contrast_enabled,
@@ -81,8 +84,9 @@ pub use system::{
 };
 pub use types::{MonitorId, MonitorInfo, PlatformConfig, Win32Error, WindowInfo};
 pub use visibility::{
-    cascade_windows, is_move_offscreen_sentinel_position, is_move_offscreen_sentinel_rect,
-    move_window_offscreen, position_window, restore_all_windows_moved_offscreen_best_effort,
+    cascade_windows, emergency_restore_windows, is_move_offscreen_sentinel_position,
+    is_move_offscreen_sentinel_rect, move_window_offscreen, position_window,
+    queue_window_offscreen, restore_all_windows_moved_offscreen_best_effort,
     restore_window_moved_offscreen, restore_windows_moved_offscreen, uncloak_all_managed_windows,
     uncloak_all_visible_windows,
 };
@@ -93,13 +97,14 @@ pub use window_identity::{
 pub use window_query::{
     cursor_is_over_window, get_cursor_pos, get_window_chrome_rect, get_window_corner_radius,
     get_window_icon, get_window_visible_rect, is_cursor_on_resize_border, is_dialog_like_window,
-    is_frameless_popup, is_shift_key_pressed, is_valid_window, is_window_alive_and_visible,
-    is_window_maximized, is_window_shell_cloaked, is_window_valid, is_window_visible,
-    window_minimized_state,
+    is_frameless_popup, is_shift_key_pressed, is_valid_window, is_window_maximized,
+    is_window_shell_cloaked, is_window_valid, is_window_visible, window_minimized_state,
+    window_presence, WindowPresence,
 };
 pub use window_style::{
-    remove_maximizebox, reset_window_border_color, restore_maximizebox, restore_maximizebox_all,
-    restore_maximizebox_panic_recovery, set_window_border_color,
+    queue_maximized_window_restore, remove_maximizebox, reset_window_border_color,
+    restore_maximizebox, restore_maximizebox_all, restore_maximizebox_panic_recovery,
+    set_window_border_color, wait_for_window_style_requests,
 };
 
 use leopardwm_core_layout::WindowId;

@@ -147,6 +147,8 @@ impl AppState {
 
     /// Drop the recorded lifetime and its admission time together.
     pub(crate) fn take_managed_lifetime_token(&mut self, hwnd: u64) -> Option<u64> {
+        self.pending_maximized_admission_restores.remove(&hwnd);
+        self.forget_recreated_window_lifetime(hwnd);
         self.managed_lifetime_admitted_at_event_ms.remove(&hwnd);
         self.managed_lifetime_tokens.remove(&hwnd)
     }
@@ -184,7 +186,7 @@ impl AppState {
         }
     }
 
-    fn is_managed_member(&self, hwnd: u64) -> bool {
+    pub(crate) fn is_managed_member(&self, hwnd: u64) -> bool {
         self.find_window_workspace(hwnd).is_some()
             || self
                 .drag_state

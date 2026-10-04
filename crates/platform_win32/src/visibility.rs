@@ -13,8 +13,8 @@ use windows::Win32::UI::HiDpi::{
     SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetWindowRect, IsIconic, IsWindow, SetWindowPos, ShowWindow, HWND_TOP, SWP_NOACTIVATE,
-    SWP_NOSIZE, SWP_NOZORDER, SW_RESTORE,
+    GetWindowRect, IsIconic, IsWindow, SetWindowPos, ShowWindow, HWND_TOP, SET_WINDOW_POS_FLAGS,
+    SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SW_RESTORE,
 };
 
 // ============================================================================
@@ -34,6 +34,24 @@ pub fn is_move_offscreen_sentinel_rect(rect: &Rect) -> bool {
 /// Move a single window to the off-screen sentinel position.
 /// Used by workspace switching to hide inactive workspace windows.
 pub fn move_window_offscreen(window_id: WindowId) -> Result<(), Win32Error> {
+    move_window_offscreen_with_flags(window_id, SET_WINDOW_POS_FLAGS(0))
+}
+
+pub fn queue_window_offscreen(window_id: WindowId) -> Result<(), Win32Error> {
+    // Always mark wait_for_owner: the event loop cannot block; a cache-less apply's owner probe clears it.
+    move_window_offscreen_with_flags(window_id, SWP_ASYNCWINDOWPOS)?;
+    crate::placement::record_queued_owner_position(
+        window_id,
+        MOVE_OFFSCREEN_SENTINEL_COORD,
+        MOVE_OFFSCREEN_SENTINEL_COORD,
+    );
+    Ok(())
+}
+
+fn move_window_offscreen_with_flags(
+    window_id: WindowId,
+    extra_flags: SET_WINDOW_POS_FLAGS,
+) -> Result<(), Win32Error> {
     let hwnd = window_id_to_hwnd(window_id)?;
     unsafe {
         if let Err(e) = SetWindowPos(
@@ -43,7 +61,7 @@ pub fn move_window_offscreen(window_id: WindowId) -> Result<(), Win32Error> {
             MOVE_OFFSCREEN_SENTINEL_COORD,
             0,
             0,
-            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | extra_flags,
         ) {
             return Err(Win32Error::SetPositionFailed(format!(
                 "Failed to move window {} offscreen: {}",
@@ -99,9 +117,36 @@ fn compute_restore_rect_from_offscreen(current_rect: &Rect, work_area: &Rect) ->
     Rect::new(work_area.x, work_area.y, width, height)
 }
 
+fn recovery_work_areas() -> Option<Vec<Rect>> {
+    match crate::enumeration::enumerate_monitors() {
+        Ok(monitors) if !monitors.is_empty() => Some(
+            monitors
+                .into_iter()
+                .map(|monitor| monitor.work_area)
+                .collect(),
+        ),
+        Ok(_) => {
+            tracing::warn!(
+                "Skipping non-sentinel queued owner recovery: monitor enumeration returned no monitors"
+            );
+            None
+        }
+        Err(error) => {
+            tracing::warn!(%error, "Skipping non-sentinel queued owner recovery: monitor enumeration failed");
+            None
+        }
+    }
+}
+
+fn queued_target_is_offscreen(target: &Rect, work_areas: Option<&[Rect]>) -> bool {
+    is_move_offscreen_sentinel_rect(target)
+        || work_areas.is_some_and(|areas| areas.iter().all(|area| !target.intersects(area)))
+}
+
 fn restore_window_if_offscreen_to_work_area(
     window_id: WindowId,
     work_area: &Rect,
+    work_areas: Option<&[Rect]>,
 ) -> Result<bool, Win32Error> {
     let hwnd = window_id_to_hwnd(window_id)?;
 
@@ -125,11 +170,22 @@ fn restore_window_if_offscreen_to_work_area(
             current_rect.bottom - current_rect.top,
         );
 
-        if !is_move_offscreen_sentinel_rect(&current_rect) {
+        let owner_target = crate::placement::owner_wait_target(window_id, &current_rect);
+        let owner_wait = owner_target.is_some();
+        let restore_needed = owner_target.as_ref().map_or_else(
+            || is_move_offscreen_sentinel_rect(&current_rect),
+            |target| queued_target_is_offscreen(target, work_areas),
+        );
+        if !restore_needed {
             return Ok(false);
         }
 
         let restore_rect = compute_restore_rect_from_offscreen(&current_rect, work_area);
+        let async_flag = if owner_wait {
+            SWP_ASYNCWINDOWPOS
+        } else {
+            SET_WINDOW_POS_FLAGS(0)
+        };
 
         if let Err(e) = SetWindowPos(
             hwnd,
@@ -138,7 +194,7 @@ fn restore_window_if_offscreen_to_work_area(
             restore_rect.y,
             restore_rect.width,
             restore_rect.height,
-            SWP_NOZORDER | SWP_NOACTIVATE,
+            SWP_NOZORDER | SWP_NOACTIVATE | async_flag,
         ) {
             if !IsWindow(Some(hwnd)).as_bool() {
                 return Err(Win32Error::WindowNotFound(window_id));
@@ -147,6 +203,9 @@ fn restore_window_if_offscreen_to_work_area(
                 "Failed to restore off-screen window {}: {}",
                 window_id, e
             )));
+        }
+        if owner_wait {
+            crate::placement::record_queued_owner_rect(window_id, &restore_rect);
         }
     }
 
@@ -182,6 +241,98 @@ impl Drop for RecoveryDpiContext {
     }
 }
 
+fn emergency_sentinel_pass(window_ids: &[WindowId], work_area: &Rect, work_areas: Option<&[Rect]>) {
+    for &id in window_ids {
+        let Ok(hwnd) = window_id_to_hwnd(id) else {
+            continue;
+        };
+        unsafe {
+            let mut rect = RECT::default();
+            if GetWindowRect(hwnd, &mut rect).is_err() {
+                continue;
+            }
+            let current = Rect::new(
+                rect.left,
+                rect.top,
+                rect.right - rect.left,
+                rect.bottom - rect.top,
+            );
+            let owner_target = crate::placement::owner_wait_target(id, &current);
+            let owner_wait = owner_target.is_some();
+            let restore_needed = owner_target.as_ref().map_or_else(
+                || is_move_offscreen_sentinel_rect(&current),
+                |target| queued_target_is_offscreen(target, work_areas),
+            );
+            if !restore_needed {
+                continue;
+            }
+            let restored = compute_restore_rect_from_offscreen(&current, work_area);
+            if SetWindowPos(
+                hwnd,
+                None,
+                restored.x,
+                restored.y,
+                restored.width,
+                restored.height,
+                SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS,
+            )
+            .is_ok()
+                && owner_wait
+            {
+                crate::placement::record_queued_owner_rect(id, &restored);
+            }
+        }
+    }
+}
+
+fn emergency_primary_work_area() -> Option<Rect> {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTOPRIMARY,
+    };
+    unsafe {
+        let monitor = MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY);
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if !GetMonitorInfoW(monitor, &mut info).as_bool() {
+            return None;
+        }
+        let work = info.rcWork;
+        Some(Rect::new(
+            work.left,
+            work.top,
+            work.right - work.left,
+            work.bottom - work.top,
+        ))
+    }
+}
+
+/// Best-effort tray Quit recovery. The caller must independently enforce `deadline`:
+/// shell, DWM, tracing, and style calls can block even though window moves are asynchronous.
+pub fn emergency_restore_windows(window_ids: &[WindowId], deadline: std::time::Instant) {
+    let Ok(_dpi) = RecoveryDpiContext::enter() else {
+        return;
+    };
+    let Some(work_area) = emergency_primary_work_area() else {
+        return;
+    };
+    let work_areas = recovery_work_areas();
+    emergency_sentinel_pass(window_ids, &work_area, work_areas.as_deref());
+    tracing::warn!("Tray Quit fallback fired: shutdown did not complete before its deadline");
+    crate::placement::emergency_uncloak_tracked(window_ids);
+    if let Some(stopped) = crate::taskbar::emergency_disconnect() {
+        while !stopped.load(std::sync::atomic::Ordering::Acquire)
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+    crate::window_style::emergency_restore_maximizebox(window_ids, deadline);
+    emergency_sentinel_pass(window_ids, &work_area, work_areas.as_deref());
+}
+
 /// Restore one window from MoveOffScreen sentinel coordinates to the primary monitor.
 ///
 /// Returns `Ok(true)` if the window was restored, `Ok(false)` if it was not at
@@ -189,22 +340,24 @@ impl Drop for RecoveryDpiContext {
 pub fn restore_window_moved_offscreen(window_id: WindowId) -> Result<bool, Win32Error> {
     let _dpi = RecoveryDpiContext::enter()?;
     let primary = get_primary_monitor()?;
-    restore_window_if_offscreen_to_work_area(window_id, &primary.work_area)
+    let work_areas = recovery_work_areas();
+    restore_window_if_offscreen_to_work_area(window_id, &primary.work_area, work_areas.as_deref())
 }
 
 pub(crate) fn restore_windows_moved_offscreen_with_work_area<F>(
     window_ids: &[WindowId],
     work_area: &Rect,
+    work_areas: Option<&[Rect]>,
     mut restore_one: F,
 ) -> (usize, Vec<String>)
 where
-    F: FnMut(WindowId, &Rect) -> Result<bool, Win32Error>,
+    F: FnMut(WindowId, &Rect, Option<&[Rect]>) -> Result<bool, Win32Error>,
 {
     let mut restored_count: usize = 0;
     let mut failures: Vec<String> = Vec::new();
 
     for &window_id in window_ids {
-        match restore_one(window_id, work_area) {
+        match restore_one(window_id, work_area, work_areas) {
             Ok(true) => restored_count += 1,
             Ok(false) => {}
             Err(e) if is_benign_side_effect_error(&e) => {
@@ -228,10 +381,10 @@ where
     (restored_count, failures)
 }
 
-/// Restore all windows currently parked at MoveOffScreen sentinel coordinates.
+/// Restore windows parked at MoveOffScreen sentinel coordinates or queued off-screen.
 ///
-/// Returns the number of restored windows. If any window restore fails, this
-/// returns an aggregated error after attempting all windows.
+/// Returns the number of restored windows or queued restores. If any window restore
+/// fails, this returns an aggregated error after attempting all windows.
 pub fn restore_windows_moved_offscreen(window_ids: &[WindowId]) -> Result<usize, Win32Error> {
     if window_ids.is_empty() {
         return Ok(0);
@@ -239,9 +392,11 @@ pub fn restore_windows_moved_offscreen(window_ids: &[WindowId]) -> Result<usize,
 
     let _dpi = RecoveryDpiContext::enter()?;
     let primary = get_primary_monitor()?;
+    let work_areas = recovery_work_areas();
     let (restored_count, failures) = restore_windows_moved_offscreen_with_work_area(
         window_ids,
         &primary.work_area,
+        work_areas.as_deref(),
         restore_window_if_offscreen_to_work_area,
     );
 
@@ -307,9 +462,11 @@ fn restore_all_windows_moved_offscreen() -> OffscreenRecovery {
         }
     };
     let collection = collect_all_top_level_window_ids();
+    let work_areas = recovery_work_areas();
     let (restored_count, mut failures) = restore_windows_moved_offscreen_with_work_area(
         &collection.window_ids,
         &primary.work_area,
+        work_areas.as_deref(),
         restore_window_if_offscreen_to_work_area,
     );
     if let Some(error) = collection.error {
@@ -566,6 +723,7 @@ mod tests {
                             actual_outer_rect: None,
                             failed: true,
                             unreadable: false,
+                            measurement_deferred: false,
                         },
                         crate::placement::PlacementLanding {
                             window_id: 20,
@@ -575,6 +733,7 @@ mod tests {
                             actual_outer_rect: None,
                             failed: false,
                             unreadable: true,
+                            measurement_deferred: false,
                         },
                     ],
                     ..Default::default()
@@ -604,6 +763,7 @@ mod tests {
                         actual_outer_rect: Some(Rect::new(0, 0, 804, 604)),
                         failed: false,
                         unreadable: false,
+                        measurement_deferred: false,
                     }],
                     ..Default::default()
                 })
@@ -659,6 +819,7 @@ mod tests {
                             actual_outer_rect: None,
                             failed: true,
                             unreadable: false,
+                            measurement_deferred: false,
                         },
                         crate::placement::PlacementLanding {
                             window_id: 50,
@@ -668,6 +829,7 @@ mod tests {
                             actual_outer_rect: None,
                             failed: false,
                             unreadable: true,
+                            measurement_deferred: false,
                         },
                     ],
                     ..Default::default()
@@ -812,7 +974,8 @@ mod tests {
         let (restored, failures) = restore_windows_moved_offscreen_with_work_area(
             &window_ids,
             &work_area,
-            |window_id, _| {
+            None,
+            |window_id, _, _| {
                 seen.push(window_id);
                 match window_id {
                     10 => Ok(true),
@@ -835,7 +998,8 @@ mod tests {
         let (restored, failures) = restore_windows_moved_offscreen_with_work_area(
             &window_ids,
             &work_area,
-            |window_id, _| match window_id {
+            None,
+            |window_id, _, _| match window_id {
                 7 => Ok(true),
                 8 => Err(Win32Error::SetPositionFailed("boom".to_string())),
                 _ => unreachable!(),
@@ -927,7 +1091,7 @@ mod tests {
             assert!(!IsWindowVisible(window.0).as_bool());
 
             let work_area = Rect::new(100, 100, 1920, 1080);
-            assert!(restore_window_if_offscreen_to_work_area(window_id, &work_area).unwrap());
+            assert!(restore_window_if_offscreen_to_work_area(window_id, &work_area, None).unwrap());
             let mut restored = RECT::default();
             GetWindowRect(window.0, &mut restored).unwrap();
             assert_eq!(
@@ -935,7 +1099,9 @@ mod tests {
                 (100, 100, 740, 580)
             );
             assert!(!IsWindowVisible(window.0).as_bool());
-            assert!(!restore_window_if_offscreen_to_work_area(window_id, &work_area).unwrap());
+            assert!(
+                !restore_window_if_offscreen_to_work_area(window_id, &work_area, None).unwrap()
+            );
 
             let primary = get_primary_monitor().unwrap();
             let expected =

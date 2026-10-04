@@ -22,6 +22,7 @@ All source in `crates/daemon/src/`. All AppState fields are `pub(crate)` for mul
 |---|---|
 | `main.rs` | DaemonEvent enum, hotkey registration/dispatch, shutdown handler, main event loop, main() |
 | `state.rs` | AppState struct, constructor, constants, basic accessors, drag type enums |
+| `recreated_window_slot.rs` | Suspend/resume-gated same-process/class hidden-window column and tab restoration |
 | `event_handler.rs` | handle_window_event (Created/Destroyed/Focused/Hidden/etc.), apply_focus_follows_mouse |
 | `command_handler.rs` | handle_command — dispatches 26 IPC commands (focus, move, resize, scroll, config, etc.) |
 | `helpers.rs` | Shared helpers: layout recalc, border management, config reload, persistence, window rules |
@@ -29,6 +30,7 @@ All source in `crates/daemon/src/`. All AppState fields are `pub(crate)` for mul
 | `config.rs` | TOML config parsing, defaults, validation, HotkeyConfig, WindowRule, theme |
 | `ipc_server.rs` | Named-pipe IPC server, client handler, forwarding threads, join_with_timeout |
 | `startup.rs` | StartupInfo, ASCII banner, crash report, duplicate-instance detection |
+| `quit_fallback.rs` | One-shot tray Quit deadline, graceful completion arbitration, and bounded emergency exit |
 | `tray.rs` | System tray icon + context menu (settings, restart, quit) |
 | `settings/` | WebView-based settings UI (win32.rs creates WebView2 window, HTML/CSS/JS bundled) |
 | `animation_worker.rs` | DwmFlush vsync frame loop, drives animated placement transitions |

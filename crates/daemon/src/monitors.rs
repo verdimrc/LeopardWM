@@ -415,12 +415,12 @@ impl AppState {
                         continue;
                     }
                     #[cfg(not(test))]
-                    if let Err(e) = leopardwm_platform_win32::move_window_offscreen(wid) {
+                    if let Err(e) = leopardwm_platform_win32::queue_window_offscreen(wid) {
                         warn!("Failed to park inactive workspace window {:#x}: {}", wid, e);
                     }
                     #[cfg(test)]
                     if self.injected_native_offscreen_enabled {
-                        if let Err(e) = leopardwm_platform_win32::move_window_offscreen(wid) {
+                        if let Err(e) = leopardwm_platform_win32::queue_window_offscreen(wid) {
                             warn!("Failed to park inactive workspace window {:#x}: {}", wid, e);
                         }
                     }
@@ -627,20 +627,13 @@ impl AppState {
                 .unwrap_or(self.focused_monitor);
         }
         self.monitor_under_cursor()
-            .or_else(|| self.monitor_containing_rect_center(win_rect))
+            .or_else(|| {
+                self.monitors
+                    .values()
+                    .find(|m| m.contains_rect_center(win_rect))
+                    .map(|m| m.id)
+            })
             .unwrap_or(self.focused_monitor)
-    }
-
-    /// Returns the monitor whose work area strictly contains the center of `r`,
-    /// or `None` for off-screen rects (unlike `find_monitor_for_rect` which
-    /// falls back to the primary monitor).
-    fn monitor_containing_rect_center(&self, r: &Rect) -> Option<MonitorId> {
-        let cx = r.x + r.width / 2;
-        let cy = r.y + r.height / 2;
-        self.monitors
-            .values()
-            .find(|m| m.contains_point(cx, cy))
-            .map(|m| m.id)
     }
 
     /// The layout viewport for a monitor: its full work area. Single source of

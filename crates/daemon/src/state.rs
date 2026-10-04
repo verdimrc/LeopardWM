@@ -3,6 +3,7 @@
 use crate::config::{self, Config};
 use crate::physical_placement::PhysicalPresentation;
 use leopardwm_core_layout::{Rect, Workspace};
+use leopardwm_ipc::NativeSwipeStatus;
 use leopardwm_platform_win32::{MonitorId, MonitorInfo, PlatformConfig};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -142,6 +143,7 @@ pub(crate) struct DesktopPeekState {
 /// Genuinely hung windows hit Windows' own ~5s hung-app timeout anyway, so
 /// this doesn't materially weaken responsiveness guarantees.
 pub(crate) const APPLY_LAYOUT_TIMEOUT: Duration = Duration::from_millis(5000);
+pub(crate) const DISPLAY_CHANGE_APPLY_RETRY_DELAY: Duration = Duration::from_secs(3);
 /// Suppress MovedOrResized events after placements are applied, so the
 /// target window's own WM_SIZE-driven EVENT_OBJECT_LOCATIONCHANGE (which is
 /// our own feedback) is not re-interpreted as a user-initiated move.
@@ -165,6 +167,8 @@ pub(crate) const CROSSFADE_BARRIER_MAX_AGE: Duration = Duration::from_secs(2);
 pub(crate) const TRANSIENT_WINDOW_THRESHOLD: Duration = Duration::from_secs(30);
 /// How long transient window HWNDs stay in the suppression list before expiring.
 pub(crate) const RECENTLY_HIDDEN_TTL: Duration = Duration::from_secs(300);
+/// Keep restore placement exemptions brief to avoid affecting unrelated follows.
+pub(crate) const RECENTLY_RESTORED_MANAGED_WINDOW_TTL: Duration = Duration::from_millis(1500);
 
 /// A short-lived Hidden of a managed window.
 ///
@@ -239,6 +243,38 @@ pub(crate) struct LayoutApplyTimeoutCandidate {
 pub(crate) struct LayoutApplyTimeoutReport {
     pub(crate) timeout: Duration,
     pub(crate) candidates: Vec<LayoutApplyTimeoutCandidate>,
+}
+
+#[derive(Debug)]
+pub(crate) struct DisplayChangeApplyRetry {
+    pub(crate) generation: u64,
+    pub(crate) timeout: Duration,
+    pub(crate) candidate_window_ids: Vec<u64>,
+}
+
+pub(crate) fn derive_native_swipe_status(
+    raw_input: bool,
+    gestures_enabled: bool,
+    registration_error: Option<&str>,
+    raw_input_error: Option<&str>,
+) -> NativeSwipeStatus {
+    if !raw_input {
+        NativeSwipeStatus::Off
+    } else if !gestures_enabled {
+        NativeSwipeStatus::Inactive {
+            reason: "gesture detection is disabled (gestures.enabled = false)".to_string(),
+        }
+    } else if let Some(error) = registration_error {
+        NativeSwipeStatus::Inactive {
+            reason: error.to_string(),
+        }
+    } else if let Some(error) = raw_input_error {
+        NativeSwipeStatus::Inactive {
+            reason: format!("{error}; wheel-based swipes remain active"),
+        }
+    } else {
+        NativeSwipeStatus::Active
+    }
 }
 
 /// Admission-time snapshot for a window the daemon left unmanaged.
@@ -461,6 +497,7 @@ pub(crate) struct AppState {
     /// monitor's selected workspace becomes genuinely empty. Distinct from
     /// `pending_workspace_switch_focus`.
     pub(crate) pending_last_window_departure: Option<PendingLastWindowDeparture>,
+    pub(crate) recently_restored_managed_windows: HashMap<u64, std::time::Instant>,
     /// `(monitor, hwnd)` of the most-recently-broadcast
     /// `FocusedWindowChanged` event. Independent from
     /// `previous_focused_hwnd`: command-driven focus paths
@@ -478,6 +515,9 @@ pub(crate) struct AppState {
     pub(crate) last_prune_at: Option<std::time::Instant>,
     /// Border frame overlay for the active window.
     pub(crate) border_frame: Option<leopardwm_platform_win32::border::BorderFrame>,
+    /// Transparent foreground target used when the selected workspace is empty.
+    pub(crate) focus_placeholder:
+        Option<leopardwm_platform_win32::focus_placeholder::FocusPlaceholder>,
     #[cfg(test)]
     pub(crate) border_hide_count: AtomicUsize,
     #[cfg(test)]
@@ -544,6 +584,10 @@ pub(crate) struct AppState {
     /// Suppress MovedOrResized snap-backs while a display change is being debounced.
     /// Set on WM_DISPLAYCHANGE, cleared after the debounced handler runs.
     pub(crate) display_change_pending: bool,
+    pub(crate) display_change_apply_in_progress: bool,
+    pub(crate) display_change_apply_retry: Option<DisplayChangeApplyRetry>,
+    pub(crate) display_change_apply_retry_generation: u64,
+    pub(crate) display_change_apply_retry_used: bool,
     /// Whether the pending debounced change needs the full topology/DPI
     /// reconcile (clearing stale min-size constraints, resizing the thumbnail
     /// host) vs a lightweight work-area-only refit. A real display change sets
@@ -604,10 +648,15 @@ pub(crate) struct AppState {
     pub(crate) apply_epoch: Arc<AtomicU64>,
     /// Timed-out placement workers retained for join during shutdown/revert.
     pub(crate) pending_apply_workers: Vec<std::thread::JoinHandle<()>>,
+    /// Workers whose late visibility recovery is deferred to a replacement apply.
+    pub(crate) suppressed_late_recovery_workers: HashMap<std::thread::ThreadId, Arc<AtomicBool>>,
     /// Max time allowed for Win32 placement calls before auto-pausing tiling.
     pub(crate) layout_apply_timeout: Duration,
     /// One-shot report consumed by the main loop after an automatic timeout pause.
     pub(crate) pending_layout_apply_timeout_report: Option<LayoutApplyTimeoutReport>,
+    /// Startup snapshot of native three-finger swipe activation.
+    pub(crate) native_swipes: NativeSwipeStatus,
+    pub(crate) daemon_log: Option<crate::daemon_log::LogHealth>,
     /// Daemon start time for uptime reporting.
     pub(crate) start_time: std::time::Instant,
     /// HWNDs hidden while managed only briefly, used to suppress re-creation of
@@ -650,6 +699,7 @@ pub(crate) struct AppState {
     /// window enters management so a recycled handle is not treated as the
     /// lifetime that was admitted. Never persisted.
     pub(crate) managed_lifetime_tokens: HashMap<u64, u64>,
+    pub(crate) recreated_window_slots: crate::recreated_window_slot::RecreatedWindowSlots,
     /// Create/Show WinEvent time for the lifetime in `managed_lifetime_tokens`.
     /// Absent for admissions that had no window event. A Hidden strictly earlier
     /// than this time belongs to an older lifetime.
@@ -677,6 +727,7 @@ pub(crate) struct AppState {
     /// distinguish transient popups (managed briefly) from real windows
     /// (managed for a long time, e.g., close-to-tray apps).
     pub(crate) window_managed_at: HashMap<u64, std::time::Instant>,
+    pub(crate) pending_maximized_admission_restores: HashSet<u64>,
     /// Last time each tiled window was seen maximized. Lets a window that opens
     /// maximized and momentarily restores itself mid-burst (an app opening
     /// several windows/tabs at once) re-assert maximize instead of being snapped
@@ -763,6 +814,8 @@ pub(crate) struct AppState {
     #[cfg(test)]
     pub(crate) injected_foreground_hwnd: Option<Option<u64>>,
     #[cfg(test)]
+    pub(crate) foreground_release_requests: Vec<(u64, Rect)>,
+    #[cfg(test)]
     pub(crate) injected_foreground_is_valid: Option<bool>,
     #[cfg(test)]
     pub(crate) injected_next_foreground_hwnd: Option<Option<u64>>,
@@ -816,6 +869,8 @@ pub(crate) struct AppState {
     /// no-op; a throttled or same-HWND focus leaves the list pending.
     #[cfg(test)]
     pub(crate) injected_stale_hwnds: Vec<u64>,
+    #[cfg(test)]
+    pub(crate) injected_iconic_hwnds: HashSet<u64>,
     /// Optional test-only behavior override for placement application.
     #[cfg(test)]
     pub(crate) injected_apply_placements_behavior: Option<TestApplyPlacementsBehavior>,
@@ -831,6 +886,12 @@ pub(crate) struct AppState {
     /// Number of late-worker recovery passes executed after cancellation.
     #[cfg(test)]
     pub(crate) late_worker_recovery_count: Arc<AtomicUsize>,
+    /// Number of paused display retries that request layout recovery.
+    #[cfg(test)]
+    pub(crate) paused_display_retry_recovery_count: Arc<AtomicUsize>,
+    /// Number of late-worker reaping recovery passes requested, including test no-ops.
+    #[cfg(test)]
+    pub(crate) late_apply_worker_reap_recovery_count: Arc<AtomicUsize>,
     /// Test-only display-change topology so `on_display_change` does not
     /// enumerate the physical desktop.
     #[cfg(test)]
@@ -904,23 +965,24 @@ impl PendingWorkspaceSwitchFocus {
     }
 }
 
-/// How the last-window empty-selection guard was armed.
+/// How the last-window departure focus guard was armed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LastWindowDepartureOrigin {
     DirectDestroyedOrHidden,
+    Minimized,
     EventlessPrune,
 }
 
-/// Evidence that the focused monitor's selected workspace became empty
-/// because its last tiled and floating window departed.
+/// Evidence that the focused monitor's selected workspace lost its tracked
+/// focus because the window departed or was minimized.
 ///
 /// An exact replacement HWND is attributable auto-activation while this guard
-/// is fresh. A strictly newer activation (a different HWND, or the same HWND
-/// with a later WinEvent time) wins. Direct Destroyed/Hidden and standalone
-/// pruning stamp `armed_at_event_time_ms` with handler execution time, so an
-/// activation that occurred before the handler ran may compare as no-later and
-/// stay suppressed. If the departing window still appears live or pruning is
-/// throttled, follow-focus cannot attribute the sequence.
+/// is fresh. Direct Destroyed/Hidden and EventlessPrune suppress only Focused
+/// events no later than the arm tick. A real Minimized event uses its OS event
+/// time and accepts Focused handoff events through 500 ms after that tick;
+/// reconciliation-sourced Minimized calls use handler time. If the departing
+/// window still appears live or pruning is throttled, follow-focus cannot
+/// attribute the sequence.
 ///
 /// A prune reached from `Focused(X, t)` stamps `t`. It samples a replacement
 /// only when the tracked focus HWND was stale and was removed from the
@@ -931,10 +993,12 @@ pub(crate) enum LastWindowDepartureOrigin {
 /// vanishes silently and a deliberate activation arrives before the next
 /// check, that activation can still be treated as auto-activation.
 ///
-/// DirectDestroyedOrHidden with no sampled replacement binds the first
-/// no-later managed Focused on another workspace of the same monitor, then
-/// uses that exact HWND. Same-workspace activations are not inferred.
+/// DirectDestroyedOrHidden and Minimized with no sampled replacement bind the
+/// first eligible managed Focused on another workspace of the same monitor,
+/// then use that exact HWND. Same-workspace activations are not inferred.
 /// EventlessPrune does not infer from None. Unmanaged samples are not rewritten.
+/// A managed restore clears a Minimized-origin guard only when it is unbound
+/// or bound to that restored HWND.
 ///
 /// Distinct from `PendingWorkspaceSwitchFocus`; the two guards are not shared.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1088,6 +1152,7 @@ impl AppState {
             previous_focused_hwnd: None,
             pending_workspace_switch_focus: None,
             pending_last_window_departure: None,
+            recently_restored_managed_windows: HashMap::new(),
             last_broadcast_focused: None,
             last_focus_change_at: None,
             last_prune_at: None,
@@ -1097,6 +1162,7 @@ impl AppState {
             } else {
                 leopardwm_platform_win32::border::BorderFrame::new().ok()
             },
+            focus_placeholder: None,
             #[cfg(test)]
             border_hide_count: AtomicUsize::new(0),
             #[cfg(test)]
@@ -1127,6 +1193,10 @@ impl AppState {
             applying_layout: false,
             reapplying_after_violation: false,
             display_change_pending: false,
+            display_change_apply_in_progress: false,
+            display_change_apply_retry: None,
+            display_change_apply_retry_generation: 0,
+            display_change_apply_retry_used: false,
             display_change_needs_full: false,
             drag_state: None,
             resize_hwnd: None,
@@ -1155,8 +1225,11 @@ impl AppState {
             apply_worker_cancelled: Arc::new(AtomicBool::new(false)),
             apply_epoch: Arc::new(AtomicU64::new(0)),
             pending_apply_workers: Vec::new(),
+            suppressed_late_recovery_workers: HashMap::new(),
             layout_apply_timeout: APPLY_LAYOUT_TIMEOUT,
             pending_layout_apply_timeout_report: None,
+            native_swipes: NativeSwipeStatus::Off,
+            daemon_log: None,
             start_time: std::time::Instant::now(),
             recently_hidden_hwnds: HashMap::new(),
             pending_edit_config_pull: None,
@@ -1166,12 +1239,14 @@ impl AppState {
             next_window_placement_override: None,
             temporary_ignores: HashMap::new(),
             managed_lifetime_tokens: HashMap::new(),
+            recreated_window_slots: Default::default(),
             managed_lifetime_admitted_at_event_ms: HashMap::new(),
             hidden_column_widths: HashMap::new(),
             desktop_peek: None,
             move_origins: HashMap::new(),
             stashed_monitor_layouts: HashMap::new(),
             window_managed_at: HashMap::new(),
+            pending_maximized_admission_restores: HashSet::new(),
             window_last_maximized_at: HashMap::new(),
             snap_disabled_hwnds: HashSet::new(),
             on_battery_or_saver,
@@ -1193,6 +1268,8 @@ impl AppState {
             injected_visible_hwnds: HashSet::new(),
             #[cfg(test)]
             injected_foreground_hwnd: None,
+            #[cfg(test)]
+            foreground_release_requests: Vec::new(),
             #[cfg(test)]
             injected_foreground_is_valid: None,
             #[cfg(test)]
@@ -1238,6 +1315,8 @@ impl AppState {
             #[cfg(test)]
             injected_stale_hwnds: Vec::new(),
             #[cfg(test)]
+            injected_iconic_hwnds: HashSet::new(),
+            #[cfg(test)]
             injected_apply_placements_behavior: None,
             #[cfg(test)]
             injected_apply_placements_call_count: Arc::new(AtomicUsize::new(0)),
@@ -1249,6 +1328,10 @@ impl AppState {
             released_window_id_batches: Vec::new(),
             #[cfg(test)]
             late_worker_recovery_count: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            paused_display_retry_recovery_count: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            late_apply_worker_reap_recovery_count: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
             injected_display_monitors: None,
             #[cfg(test)]
@@ -1639,13 +1722,7 @@ impl AppState {
     pub(crate) fn display_index_for(&self, monitor_id: MonitorId) -> u32 {
         self.monitors
             .get(&monitor_id)
-            .and_then(|m| {
-                let s = m
-                    .device_name
-                    .trim_start_matches(r"\\.\")
-                    .trim_start_matches("DISPLAY");
-                s.parse::<u32>().ok().filter(|&n| n > 0)
-            })
+            .and_then(|m| config::display_index(&m.device_name))
             .unwrap_or(0)
     }
 
@@ -1717,7 +1794,7 @@ pub(crate) fn run_visibility_recovery_pass(managed_window_ids: &[u64], context_l
         Ok(restored) => {
             if restored > 0 {
                 info!(
-                    "Restored {} windows from MoveOffScreen sentinel positions",
+                    "Restored or queued restoration for {} off-screen windows",
                     restored
                 );
             }

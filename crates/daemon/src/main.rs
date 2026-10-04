@@ -14,6 +14,7 @@
 mod animation_worker;
 mod command_handler;
 mod config;
+mod daemon_log;
 #[cfg(test)]
 mod diagnostics_validation;
 mod drag;
@@ -32,6 +33,10 @@ mod notify;
 mod overview;
 mod persistence;
 mod physical_placement;
+mod quit_fallback;
+mod recreated_window_slot;
+#[cfg(test)]
+mod recreated_window_slot_tests;
 mod release;
 #[cfg(test)]
 mod release_tests;
@@ -66,11 +71,12 @@ use leopardwm_core_layout::Rect;
 use leopardwm_ipc::{pipe_name_candidates, preferred_pipe_name, IpcCommand, IpcResponse};
 use leopardwm_platform_win32::{
     enumerate_monitors, enumerate_windows, format_hotkey, install_event_hooks,
-    install_keyboard_hook, install_mouse_hook, overlay::OverlayWindow, register_gestures,
-    register_system_events, restore_windows_moved_offscreen, set_display_change_sender,
-    set_dpi_awareness, set_power_state_sender, set_recording, set_session_end_handler,
-    uncloak_all_visible_windows, GestureEvent, HotkeyBind, HotkeyId, KeyboardHookEvent,
-    KeyboardHookHandle, Modifiers, MonitorId, MonitorInfo, MouseHookHandle, WindowEvent,
+    install_keyboard_hook, install_mouse_hook, overlay::OverlayWindow,
+    register_gestures_with_raw_input, register_system_events, restore_windows_moved_offscreen,
+    set_display_change_sender, set_dpi_awareness, set_power_state_sender, set_recording,
+    set_session_end_handler, uncloak_all_visible_windows, wait_for_window_style_requests,
+    GestureEvent, HotkeyBind, HotkeyId, KeyboardHookEvent, KeyboardHookHandle, Modifiers,
+    MonitorId, MonitorInfo, MouseHookHandle, WindowEvent,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -582,7 +588,12 @@ fn setup_hotkeys(config: &Config, event_tx: mpsc::Sender<DaemonEvent>) -> Hotkey
 }
 
 /// Shared shutdown/recovery cleanup used by all daemon exit paths.
-async fn run_shutdown_cleanup(state: &Arc<Mutex<AppState>>, mode: ShutdownMode) {
+async fn run_shutdown_cleanup(
+    state: &Arc<Mutex<AppState>>,
+    mode: ShutdownMode,
+    quit_fallback: &quit_fallback::QuitFallback,
+) {
+    quit_fallback.started();
     info!("Running {} shutdown cleanup", mode.label());
 
     let (managed_window_ids, pending_apply_workers, apply_timeout) = {
@@ -619,6 +630,13 @@ async fn run_shutdown_cleanup(state: &Arc<Mutex<AppState>>, mode: ShutdownMode) 
     }
     pending_workers.retain(Option::is_some);
 
+    if !wait_for_window_style_requests(apply_timeout) {
+        warn!(
+            "Timed out waiting for window style restores before {} visibility recovery; continuing",
+            mode.label()
+        );
+        leopardwm_platform_win32::restore_maximizebox_panic_recovery();
+    }
     run_visibility_recovery_pass(&managed_window_ids, mode.label());
 
     if !pending_workers.is_empty() {
@@ -735,6 +753,7 @@ fn resize_preview_animation_loop(
 
 /// Borrowed event-loop state shared by the main-loop event handlers.
 struct EventLoopCtx<'a> {
+    quit_fallback: &'a quit_fallback::QuitFallback,
     state: &'a Arc<Mutex<AppState>>,
     event_tx: &'a mpsc::Sender<DaemonEvent>,
     hotkey_state: &'a mut HotkeyState,
@@ -749,6 +768,7 @@ struct EventLoopCtx<'a> {
     focus_follows_mouse_timer: &'a mut Option<tokio::task::JoinHandle<()>>,
     display_change_timer: &'a mut Option<tokio::task::JoinHandle<()>>,
     idle_layout_reapply_timer: &'a mut Option<tokio::task::JoinHandle<()>>,
+    display_change_apply_retry_timer: &'a mut Option<(u64, tokio::task::JoinHandle<()>)>,
     mouse_hook_handle: &'a mut Option<MouseHookHandle>,
 }
 
@@ -828,6 +848,7 @@ fn bootstrap_config() -> Result<(
     Config,
     Vec<config::ConfigWarning>,
     Option<gesture_diagnostics::GestureCaptureHandle>,
+    daemon_log::LogHealth,
 )> {
     // Set DPI awareness before any window/GDI operations
     if set_dpi_awareness() {
@@ -863,7 +884,7 @@ fn bootstrap_config() -> Result<(
     // bound for the in-memory config. Zero does not open or truncate a file.
     let capture_secs =
         config::clamp_diagnostic_capture_secs(config.gestures.diagnostic_capture_secs);
-    let capture_handle = init_logging(log_level, &config, capture_secs)?;
+    let (capture_handle, log_health) = init_logging(log_level, &config, capture_secs)?;
 
     // Validate and clamp config values
     let config_warnings = config.validate();
@@ -871,7 +892,7 @@ fn bootstrap_config() -> Result<(
         warn!("Config: {} - {}", w.field, w.message);
     }
 
-    Ok((config, config_warnings, capture_handle))
+    Ok((config, config_warnings, capture_handle, log_health))
 }
 
 /// Install stdout + daemon-log layers at the configured level, and optionally a
@@ -881,11 +902,13 @@ fn init_logging(
     log_level: Level,
     config: &Config,
     capture_secs: u64,
-) -> Result<Option<gesture_diagnostics::GestureCaptureHandle>> {
+) -> Result<(
+    Option<gesture_diagnostics::GestureCaptureHandle>,
+    daemon_log::LogHealth,
+)> {
     use tracing_subscriber::prelude::*;
     let log_dir = leopardwm_ipc::log_dir();
-    let _ = std::fs::create_dir_all(&log_dir);
-    let file_appender = tracing_appender::rolling::never(&log_dir, "leopardwm-daemon.log");
+    let (file_appender, log_health) = daemon_log::open(&log_dir, log_level);
     let capture_handle = if capture_secs > 0 {
         gesture_diagnostics::start_capture(
             &log_dir,
@@ -911,14 +934,14 @@ fn init_logging(
                     log_level,
                 )),
         )
-        .with(
+        .with(file_appender.map(|writer| {
             tracing_subscriber::fmt::layer()
                 .with_ansi(false)
-                .with_writer(file_appender)
+                .with_writer(writer)
                 .with_filter(tracing_subscriber::filter::LevelFilter::from_level(
                     log_level,
-                )),
-        )
+                ))
+        }))
         .with(
             capture_handle
                 .as_ref()
@@ -942,7 +965,7 @@ fn init_logging(
         }
     }
 
-    Ok(capture_handle)
+    Ok((capture_handle, log_health))
 }
 
 /// Install a panic hook that uncloaks all windows and writes a crash report.
@@ -1320,6 +1343,23 @@ fn setup_window_hooks(
         }
     }
 
+    {
+        let (tx, rx) = std::sync::mpsc::channel();
+        if let Err(error) = leopardwm_platform_win32::set_suspend_resume_sender(tx) {
+            warn!("Failed to register suspend/resume sender: {}", error);
+        } else {
+            match spawn_forwarding_thread(
+                "suspend-resume-fwd",
+                rx,
+                event_tx.clone(),
+                DaemonEvent::SuspendResume,
+            ) {
+                Ok(handle) => thread_handles.push(handle),
+                Err(error) => warn!("{}", error),
+            }
+        }
+    }
+
     // Register power state sender for WM_POWERBROADCAST events
     // Forwards AC/battery and power saver state changes to the daemon event loop
     {
@@ -1420,13 +1460,16 @@ fn setup_gestures(
     config: &Config,
     event_tx: &mpsc::Sender<DaemonEvent>,
     thread_handles: &mut Vec<std::thread::JoinHandle<()>>,
-) -> Option<leopardwm_platform_win32::GestureHandle> {
-    if config.gestures.enabled {
+) -> (
+    Option<leopardwm_platform_win32::GestureHandle>,
+    leopardwm_ipc::NativeSwipeStatus,
+) {
+    let (handle, registration_error, raw_input_error) = if config.gestures.enabled {
         // Set scroll modifier before registering the hook
         leopardwm_platform_win32::set_scroll_modifier(&config.hotkeys.scroll_modifier);
 
-        match register_gestures() {
-            Ok((handle, gesture_receiver)) => {
+        match register_gestures_with_raw_input(config.gestures.raw_input) {
+            Ok((handle, gesture_receiver, raw_input_error)) => {
                 info!("Gesture detection enabled");
                 leopardwm_platform_win32::emit_gesture_registration("registered");
 
@@ -1441,7 +1484,7 @@ fn setup_gestures(
                     Err(e) => warn!("{}", e),
                 }
 
-                Some(handle)
+                (Some(handle), None, raw_input_error)
             }
             Err(e) => {
                 warn!(
@@ -1449,22 +1492,50 @@ fn setup_gestures(
                     e
                 );
                 leopardwm_platform_win32::emit_gesture_registration("failed");
-                None
+                (None, Some(e.to_string()), None)
             }
         }
     } else {
         info!("Gesture detection disabled by config (gestures.enabled = false)");
         leopardwm_platform_win32::emit_gesture_registration("disabled");
-        None
-    }
+        (None, None, None)
+    };
+    let status = crate::state::derive_native_swipe_status(
+        config.gestures.raw_input,
+        config.gestures.enabled,
+        registration_error.as_deref(),
+        raw_input_error.as_deref(),
+    );
+    (handle, status)
 }
 
 /// Initialize the system tray icon and bridge its events into the event loop.
-fn setup_tray(
+async fn setup_tray(
+    state: &Arc<Mutex<AppState>>,
     config: &Config,
     event_tx: &mpsc::Sender<DaemonEvent>,
     thread_handles: &mut Vec<std::thread::JoinHandle<()>>,
-) -> Option<tray::TrayManager> {
+) -> (Option<tray::TrayManager>, Arc<quit_fallback::QuitFallback>) {
+    let (quit_cancelled, quit_epoch) = {
+        let state = state.lock().await;
+        (
+            state.apply_worker_cancelled.clone(),
+            state.apply_epoch.clone(),
+        )
+    };
+    let quit_thread_id = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let quit_stop_thread_id = quit_thread_id.clone();
+    let quit_fallback = Arc::new(quit_fallback::QuitFallback::new(
+        quit_cancelled,
+        quit_epoch,
+        move || tray::post_quit(quit_stop_thread_id.load(std::sync::atomic::Ordering::SeqCst)),
+        |deadline| {
+            let ids = leopardwm_platform_win32::collect_all_top_level_window_ids();
+            leopardwm_platform_win32::emergency_restore_windows(&ids.window_ids, deadline);
+        },
+        |code| std::process::exit(code),
+        quit_fallback::QuitTiming::default(),
+    ));
     let (tray_sync_tx, tray_sync_rx) = std::sync::mpsc::channel();
 
     // Spawn task to forward tray events from sync channel to async channel
@@ -1479,7 +1550,12 @@ fn setup_tray(
     }
 
     let initial_toggles = quick_toggle_state(config);
-    match tray::TrayManager::new(tray_sync_tx, initial_toggles) {
+    let manager = match tray::TrayManager::new(
+        tray_sync_tx,
+        initial_toggles,
+        quit_fallback.clone(),
+        quit_thread_id,
+    ) {
         Ok(manager) => {
             info!("System tray icon initialized");
             Some(manager)
@@ -1488,7 +1564,8 @@ fn setup_tray(
             warn!("Failed to create system tray icon: {}. Tray disabled.", e);
             None
         }
-    }
+    };
+    (manager, quit_fallback)
 }
 
 /// Print the startup banner for immediate user feedback.
@@ -1645,7 +1722,7 @@ async fn handle_ipc_command(
                 mode.label()
             );
         }
-        run_shutdown_cleanup(ctx.state, mode).await;
+        run_shutdown_cleanup(ctx.state, mode, ctx.quit_fallback).await;
         return true;
     }
 
@@ -1995,7 +2072,7 @@ async fn handle_hotkey_event(
             hotkey_event.id,
             mode.label()
         );
-        run_shutdown_cleanup(ctx.state, mode).await;
+        run_shutdown_cleanup(ctx.state, mode, ctx.quit_fallback).await;
         return true;
     }
 
@@ -2089,7 +2166,7 @@ async fn handle_gesture_event(ctx: &mut EventLoopCtx<'_>, gesture_event: Gesture
                     gesture_event,
                     mode.label()
                 );
-                run_shutdown_cleanup(ctx.state, mode).await;
+                run_shutdown_cleanup(ctx.state, mode, ctx.quit_fallback).await;
                 return true;
             }
             {
@@ -3470,6 +3547,16 @@ fn abort_join_handle(handle: Option<tokio::task::JoinHandle<()>>) {
     }
 }
 
+fn abort_event_timers(ctx: &mut EventLoopCtx<'_>) {
+    abort_join_handle(ctx.snap_hint_timer_handle.take());
+    abort_join_handle(ctx.focus_follows_mouse_timer.take());
+    abort_join_handle(ctx.display_change_timer.take());
+    abort_join_handle(ctx.idle_layout_reapply_timer.take());
+    if let Some((_, handle)) = ctx.display_change_apply_retry_timer.take() {
+        handle.abort();
+    }
+}
+
 fn arm_idle_layout_reapply_timer(ctx: &mut EventLoopCtx<'_>) {
     if ctx.idle_layout_reapply_timer.is_some() {
         return;
@@ -3494,18 +3581,90 @@ async fn handle_idle_layout_reapply(ctx: &mut EventLoopCtx<'_>) {
     }
 }
 
+fn arm_display_change_apply_retry_timer(ctx: &mut EventLoopCtx<'_>, generation: u64) {
+    if ctx
+        .display_change_apply_retry_timer
+        .as_ref()
+        .is_some_and(|(timer_generation, _)| *timer_generation == generation)
+    {
+        return;
+    }
+    if let Some((_, handle)) = ctx.display_change_apply_retry_timer.take() {
+        handle.abort();
+    }
+    let tx = ctx.event_tx.clone();
+    let handle = tokio::spawn(async move {
+        tokio::time::sleep(crate::state::DISPLAY_CHANGE_APPLY_RETRY_DELAY).await;
+        let _ = tx
+            .send(DaemonEvent::DisplayChangeApplyRetry(generation))
+            .await;
+    });
+    *ctx.display_change_apply_retry_timer = Some((generation, handle));
+}
+
+async fn handle_display_change_apply_retry(ctx: &mut EventLoopCtx<'_>, generation: u64) {
+    let result = {
+        let mut state = ctx.state.lock().await;
+        if !state
+            .display_change_apply_retry
+            .as_ref()
+            .is_some_and(|retry| retry.generation == generation)
+        {
+            return;
+        }
+        if ctx
+            .display_change_apply_retry_timer
+            .as_ref()
+            .is_some_and(|(timer_generation, _)| *timer_generation == generation)
+        {
+            if let Some((_, handle)) = ctx.display_change_apply_retry_timer.take() {
+                handle.abort();
+            }
+        }
+        state.run_display_change_apply_retry(generation)
+    };
+    if let Err(error) = result {
+        warn!("Display-change layout retry failed: {}", error);
+    }
+}
+
 /// Finish each processed event before waiting for the next one.
 async fn finish_daemon_event(ctx: &mut EventLoopCtx<'_>) {
     sync_pending_layout_apply_timeout_ui(ctx.state, ctx.tray_manager, &*ctx.hotkey_state).await;
-    let should_arm_idle_reapply = {
+    let (should_arm_idle_reapply, display_retry_generation) = {
         let mut state = ctx.state.lock().await;
         let timer_needed = state.idle_layout_reapply_timer_needed();
+        let retry_generation = state
+            .display_change_apply_retry
+            .as_ref()
+            .map(|retry| retry.generation);
         state.publish_workspace_state_if_subscribed();
-        timer_needed
+        (timer_needed, retry_generation)
     };
     if should_arm_idle_reapply {
         arm_idle_layout_reapply_timer(ctx);
     }
+    if let Some(generation) = display_retry_generation {
+        arm_display_change_apply_retry_timer(ctx, generation);
+    } else if let Some((_, handle)) = ctx.display_change_apply_retry_timer.take() {
+        handle.abort();
+    }
+}
+
+async fn initialize_state(
+    config: Config,
+    monitors: Vec<MonitorInfo>,
+    log_health: daemon_log::LogHealth,
+) -> Arc<Mutex<AppState>> {
+    let mut app = AppState::new_with_config(config, monitors);
+    app.daemon_log = Some(log_health);
+    #[allow(clippy::arc_with_non_send_sync)]
+    let state = Arc::new(Mutex::new(app));
+    match leopardwm_platform_win32::focus_placeholder::FocusPlaceholder::new() {
+        Ok(placeholder) => state.lock().await.focus_placeholder = Some(placeholder),
+        Err(error) => warn!("Focus placeholder unavailable: {error}"),
+    }
+    state
 }
 
 #[tokio::main]
@@ -3524,7 +3683,7 @@ async fn main() -> Result<()> {
         std::process::exit(1);
     }
 
-    let (config, config_warnings, _gesture_capture) = bootstrap_config()?;
+    let (config, config_warnings, _gesture_capture, log_health) = bootstrap_config()?;
 
     // Install panic hook to uncloak all windows and write a crash report
     install_panic_hook();
@@ -3552,11 +3711,7 @@ async fn main() -> Result<()> {
     let monitors = detect_monitors();
 
     // Initialize state with config and monitors
-    #[allow(clippy::arc_with_non_send_sync)]
-    let state = Arc::new(Mutex::new(AppState::new_with_config(
-        config.clone(),
-        monitors,
-    )));
+    let state = initialize_state(config.clone(), monitors, log_health).await;
 
     // Enumerate existing windows
     info!("Enumerating windows...");
@@ -3601,7 +3756,8 @@ async fn main() -> Result<()> {
     let mut mouse_hook_handle = setup_mouse_hook(&config, &event_tx, &mut thread_handles);
 
     // Register gesture detection (if enabled)
-    let _gesture_handle = setup_gestures(&config, &event_tx, &mut thread_handles);
+    let (_gesture_handle, native_swipes) = setup_gestures(&config, &event_tx, &mut thread_handles);
+    state.lock().await.native_swipes = native_swipes;
 
     // Initialize overlay for snap hints and drag ghost preview.
     // Always created — snap_hints.enabled only gates resize-hint visibility,
@@ -3630,7 +3786,8 @@ async fn main() -> Result<()> {
     };
 
     // Initialize system tray icon
-    let tray_manager = setup_tray(&config, &event_tx, &mut thread_handles);
+    let (tray_manager, quit_fallback) =
+        setup_tray(&state, &config, &event_tx, &mut thread_handles).await;
 
     // Update checker — daily GitHub Releases poll, opt-out via behavior.check_for_updates.
     let update_check_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -3725,8 +3882,10 @@ async fn main() -> Result<()> {
     // transient work area.
     let mut display_change_timer: Option<tokio::task::JoinHandle<()>> = None;
     let mut idle_layout_reapply_timer: Option<tokio::task::JoinHandle<()>> = None;
+    let mut display_change_apply_retry_timer: Option<(u64, tokio::task::JoinHandle<()>)> = None;
 
     let mut ctx = EventLoopCtx {
+        quit_fallback: &quit_fallback,
         state: &state,
         event_tx: &event_tx,
         hotkey_state: &mut hotkey_state,
@@ -3741,6 +3900,7 @@ async fn main() -> Result<()> {
         focus_follows_mouse_timer: &mut focus_follows_mouse_timer,
         display_change_timer: &mut display_change_timer,
         idle_layout_reapply_timer: &mut idle_layout_reapply_timer,
+        display_change_apply_retry_timer: &mut display_change_apply_retry_timer,
         mouse_hook_handle: &mut mouse_hook_handle,
     };
 
@@ -3848,6 +4008,7 @@ async fn main() -> Result<()> {
             DaemonEvent::FocusFollowsMouse { window_id } => {
                 handle_focus_follows_mouse(&mut ctx, window_id).await;
             }
+            DaemonEvent::SuspendResume(event) => state.lock().await.handle_suspend_resume(event),
             DaemonEvent::PowerStateChanged {
                 on_battery_or_saver,
             } => {
@@ -3859,9 +4020,12 @@ async fn main() -> Result<()> {
                 handle_display_change_settled(&mut ctx).await;
             }
             DaemonEvent::IdleLayoutReapply => handle_idle_layout_reapply(&mut ctx).await,
+            DaemonEvent::DisplayChangeApplyRetry(generation) => {
+                handle_display_change_apply_retry(&mut ctx, generation).await
+            }
             DaemonEvent::Shutdown => {
                 info!("Shutdown signal received");
-                run_shutdown_cleanup(&state, ShutdownMode::Graceful).await;
+                run_shutdown_cleanup(&state, ShutdownMode::Graceful, &quit_fallback).await;
                 break;
             }
         }
@@ -3871,12 +4035,9 @@ async fn main() -> Result<()> {
 
     // Stop the update-checker worker so it doesn't hold up shutdown.
     update_check_cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+    abort_event_timers(&mut ctx);
     stop_animation_worker_and_run_recovery(animation_worker, &state, event_rx).await;
-
-    abort_join_handle(snap_hint_timer_handle);
-    abort_join_handle(focus_follows_mouse_timer);
-    abort_join_handle(display_change_timer);
-    abort_join_handle(idle_layout_reapply_timer);
+    quit_fallback.complete();
 
     // Join forwarding threads with timeout for graceful shutdown
     info!("Waiting for forwarding threads to exit...");

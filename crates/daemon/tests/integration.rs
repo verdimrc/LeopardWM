@@ -146,6 +146,8 @@ fn test_all_responses_roundtrip() {
             elevation_blocked_windows: vec![],
             daemon_integrity: None,
             elevation_blocked_records: Some(vec![]),
+            native_swipes: None,
+            daemon_log: None,
         },
     ];
 

@@ -121,6 +121,7 @@ impl Workspace {
             if let Some((col_idx, _)) = self.find_window_location(state.sentinel_window) {
                 if let Some(column) = self.columns.get_mut(col_idx) {
                     column.set_width(state.original_width);
+                    column.width_fraction_cache = state.width_fraction_cache;
                 }
             }
             return false;
@@ -133,11 +134,13 @@ impl Workspace {
                 Some(&wid) => wid,
                 None => return false,
             };
+            let width_fraction_cache = column.width_fraction_cache.clone();
             if let Some(column) = self.columns.get_mut(self.focused_column) {
                 column.set_width(vis_w);
             }
             self.maximized_column = Some(super::MaximizedColumnState {
                 original_width,
+                width_fraction_cache,
                 sentinel_window,
             });
             return true;
@@ -207,8 +210,8 @@ impl Workspace {
     }
 
     /// Rescale all column widths after viewport or gap values change.
-    /// Converts each column's current pixel width back to a fraction using the
-    /// old geometry, then recomputes the pixel width with the current geometry.
+    /// Reuses the previous rescale's fraction while width and geometry are unchanged;
+    /// otherwise derives it from the current pixel width and old geometry.
     /// Returns `true` when the effective geometry changed.
     pub fn rescale_column_widths(
         &mut self,
@@ -234,13 +237,25 @@ impl Workspace {
         self.cancel_animation();
 
         for col in &mut self.columns {
-            col.set_width(Self::rescaled_width(
-                col.width, old_gap_c, old_base, new_gap, new_base,
-            ));
+            let width = Self::rescaled_width(
+                col.width,
+                &mut col.width_fraction_cache,
+                old_gap_c,
+                old_base,
+                new_gap,
+                new_base,
+            );
+            col.set_width(width);
         }
         if let Some(state) = &mut self.maximized_column {
-            state.original_width =
-                Self::rescaled_width(state.original_width, old_gap_c, old_base, new_gap, new_base);
+            state.original_width = Self::rescaled_width(
+                state.original_width,
+                &mut state.width_fraction_cache,
+                old_gap_c,
+                old_base,
+                new_gap,
+                new_base,
+            );
         }
 
         let vis_w = self.visible_width(new_viewport_width);
@@ -254,11 +269,32 @@ impl Workspace {
         true
     }
 
-    fn rescaled_width(width: i32, old_gap: i32, old_base: i32, new_gap: i32, new_base: i32) -> i32 {
-        let fraction = width.saturating_add(old_gap) as f64 / old_base as f64;
-        (new_base as f64 * fraction - new_gap as f64)
+    fn rescaled_width(
+        width: i32,
+        cache: &mut Option<crate::column::WidthFractionCache>,
+        old_gap: i32,
+        old_base: i32,
+        new_gap: i32,
+        new_base: i32,
+    ) -> i32 {
+        let fraction = match cache.as_ref() {
+            Some(cached)
+                if cached.width == width && cached.base == old_base && cached.gap == old_gap =>
+            {
+                cached.fraction
+            }
+            _ => width.saturating_add(old_gap) as f64 / old_base as f64,
+        };
+        let width = (new_base as f64 * fraction - new_gap as f64)
             .round()
-            .clamp(MIN_COLUMN_WIDTH as f64, i32::MAX as f64) as i32
+            .clamp(MIN_COLUMN_WIDTH as f64, i32::MAX as f64) as i32;
+        *cache = Some(crate::column::WidthFractionCache {
+            fraction,
+            width,
+            base: new_base,
+            gap: new_gap,
+        });
+        width
     }
 
     // ========================================================================

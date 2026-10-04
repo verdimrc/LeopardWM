@@ -2,6 +2,59 @@ use super::*;
 use leopardwm_core_layout::{Rect, Workspace};
 use std::sync::atomic::Ordering;
 
+static REAL_WINDOW_STYLE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+// Run the test binary with the daemon's process DPI awareness, set before any test thread or
+// window exists, so placements and DWM frame measurements agree on scaled displays.
+#[used]
+#[link_section = ".CRT$XCU"]
+static TEST_PROCESS_DPI_AWARENESS: extern "C" fn() = {
+    extern "C" fn set_test_process_dpi_awareness() {
+        leopardwm_platform_win32::set_dpi_awareness();
+    }
+    set_test_process_dpi_awareness
+};
+
+#[test]
+fn test_threads_inherit_per_monitor_dpi_awareness() {
+    use windows::Win32::UI::HiDpi::{
+        AreDpiAwarenessContextsEqual, GetThreadDpiAwarenessContext,
+        DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+    };
+    assert!(unsafe {
+        AreDpiAwarenessContextsEqual(
+            GetThreadDpiAwarenessContext(),
+            DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+        )
+        .as_bool()
+    });
+}
+
+fn pump_window_style_worker_until_idle() {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        unsafe {
+            let mut message = MSG::default();
+            while PeekMessageW(&mut message, None, 0, 0, PM_REMOVE).as_bool() {
+                let _ = TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+        }
+        if leopardwm_platform_win32::wait_for_window_style_requests(
+            std::time::Duration::from_millis(10),
+        ) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "window style worker did not become idle"
+        );
+    }
+}
+
 fn test_config() -> Config {
     Config::default()
 }
@@ -728,7 +781,7 @@ fn test_width_feedback_preserves_requested_resolution_round_trip() {
         state.workspaces.get_mut(&monitor).unwrap()[0] = workspace;
 
         for (old_width, new_width, requested) in
-            [(5120, 2560, 627), (2560, 1920, 467), (1920, 5120, 1266)]
+            [(5120, 2560, 627), (2560, 1920, 467), (1920, 5120, 1267)]
         {
             if invalidate {
                 state.monitors.get_mut(&monitor).unwrap().rect.width = old_width;
@@ -1327,6 +1380,7 @@ fn test_outer_animation_pump_preserves_newer_frame_and_resumes_after_sync_supers
             actual_outer_rect: Some(newer[0].rect),
             failed: false,
             unreadable: false,
+            measurement_deferred: false,
         }],
         &[],
     );
@@ -1512,6 +1566,7 @@ fn test_interrupted_recovery_settles_ghosts_scroll_nudge_and_focus_after_retry()
                     actual_outer_rect: Some(landing.rect),
                     failed: false,
                     unreadable: false,
+                    measurement_deferred: false,
                 }],
             },
         },
@@ -1957,6 +2012,7 @@ fn test_drain_then_pending_fresh_ghost_recovers_without_exposing_stale_rects() {
             actual_outer_rect: Some(placement.rect),
             failed: false,
             unreadable: false,
+            measurement_deferred: false,
         })
         .collect();
     state.consume_physical_landings(request_id, invalidation_id, &landings, &[]);
@@ -2014,6 +2070,7 @@ fn test_drain_then_pending_fresh_ghost_recovers_without_exposing_stale_rects() {
                         actual_outer_rect: Some(source_rect),
                         failed: false,
                         unreadable: false,
+                        measurement_deferred: false,
                     },
                     leopardwm_platform_win32::PlacementLanding {
                         window_id: PEER,
@@ -2023,6 +2080,7 @@ fn test_drain_then_pending_fresh_ghost_recovers_without_exposing_stale_rects() {
                         actual_outer_rect: Some(peer_rect),
                         failed: false,
                         unreadable: false,
+                        measurement_deferred: false,
                     },
                 ],
             },
@@ -2115,6 +2173,7 @@ fn test_filtered_empty_apply_releases_only_safe_pending_ghost_sources() {
             actual_outer_rect: Some(safe_placement.rect),
             failed: false,
             unreadable: false,
+            measurement_deferred: false,
         }],
         &[],
     );
@@ -2260,6 +2319,7 @@ fn test_apply_layout_preserves_full_partial_native_width_without_parking_follow_
                     actual_outer_rect: Some(Rect::new(4320, 0, 1600, 1440)),
                     failed: false,
                     unreadable: false,
+                    measurement_deferred: false,
                 }],
             },
         },
@@ -2313,6 +2373,7 @@ fn test_primary_feedback_survives_ordinary_contained_landing() {
                     actual_outer_rect: Some(Rect::new(1920, 0, 400, 1040)),
                     failed: false,
                     unreadable: false,
+                    measurement_deferred: false,
                 }],
             },
         },
@@ -2363,6 +2424,7 @@ fn test_failed_landing_retries_before_releasing_pending_ghost() {
             actual_outer_rect: Some(dispatched[0].rect),
             failed: false,
             unreadable: false,
+            measurement_deferred: false,
         }],
         &[],
     );
@@ -2385,6 +2447,7 @@ fn test_failed_landing_retries_before_releasing_pending_ghost() {
                     actual_outer_rect: Some(placement.rect),
                     failed: false,
                     unreadable: false,
+                    measurement_deferred: false,
                 }],
             },
         },
@@ -2430,6 +2493,7 @@ fn test_landing_origin_drift() {
             actual_outer_rect: actual_visible_rect,
             failed,
             unreadable: false,
+            measurement_deferred: false,
         }
     };
 
@@ -2558,6 +2622,7 @@ fn test_animation_projection_runs_once_and_preserves_full_partial_geometry() {
             actual_outer_rect: Some(logical.rect),
             failed: false,
             unreadable: false,
+            measurement_deferred: false,
         }],
     };
     assert!(matches!(
@@ -3271,6 +3336,38 @@ fn test_maximized_target_drops_only_its_shared_crossfade_visual() {
 }
 
 #[test]
+fn test_minimized_tiled_window_maximize_is_observed_during_restore() {
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    let maximized_at = std::time::Instant::now() - std::time::Duration::from_secs(1);
+    state.workspaces.get_mut(&1).unwrap()[0]
+        .insert_window(100, Some(800))
+        .unwrap();
+    state.workspaces.get_mut(&1).unwrap()[0].mark_minimized(100);
+    state.window_last_maximized_at.insert(100, maximized_at);
+    state.injected_window_maximized.insert(100, true);
+
+    state.handle_window_event(WindowEvent::MovedOrResized(100));
+
+    assert!(state.window_last_maximized_at[&100] > maximized_at);
+}
+
+#[test]
+fn test_minimized_move_clears_maximize_timestamp() {
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    let maximized_at = std::time::Instant::now();
+    state.workspaces.get_mut(&1).unwrap()[0]
+        .insert_window(100, Some(800))
+        .unwrap();
+    state.workspaces.get_mut(&1).unwrap()[0].mark_minimized(100);
+    state.window_last_maximized_at.insert(100, maximized_at);
+    state.injected_window_maximized.insert(100, false);
+
+    state.handle_window_event(WindowEvent::MovedOrResized(100));
+
+    assert!(!state.window_last_maximized_at.contains_key(&100));
+}
+
+#[test]
 fn test_application_fullscreen_crossfade_aborts_only_owning_batch() {
     use crate::state::CrossfadeState;
 
@@ -3501,6 +3598,65 @@ fn test_hidden_still_visible_skips_departure_cleanup() {
         .get(&4)
         .is_some_and(|(sources, _)| sources.contains(&100)));
     assert!(state.window_managed_at.contains_key(&100));
+}
+
+struct ResizeTestWindow(windows::Win32::Foundation::HWND);
+
+impl ResizeTestWindow {
+    fn new(width: i32) -> Self {
+        use windows::core::w;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, WINDOW_STYLE, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
+        };
+
+        Self(unsafe {
+            CreateWindowExW(
+                WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+                w!("STATIC"),
+                w!(""),
+                WINDOW_STYLE(WS_POPUP.0),
+                100,
+                100,
+                width,
+                600,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+        })
+    }
+
+    fn id(&self) -> u64 {
+        self.0 .0 as u64
+    }
+}
+
+impl Drop for ResizeTestWindow {
+    fn drop(&mut self) {
+        use windows::Win32::UI::WindowsAndMessaging::DestroyWindow;
+        let _ = unsafe { DestroyWindow(self.0) };
+    }
+}
+
+fn resize_scroll_state(hwnd: u64, center_past_edges: bool) -> AppState {
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    state.reduce_motion = true;
+    state
+        .injected_window_info
+        .insert(100, make_test_window_info(100));
+    state
+        .injected_window_info
+        .insert(hwnd, make_test_window_info(hwnd));
+    let viewport_width = state.viewport_width_for(state.focused_monitor);
+    let workspace = state.focused_workspace_mut().unwrap();
+    workspace.set_reduce_motion(true);
+    workspace.set_center_past_edges(center_past_edges);
+    workspace.insert_window(100, Some(800)).unwrap();
+    workspace.insert_window(hwnd, Some(800)).unwrap();
+    workspace.set_focused_column_width_fraction(1.0, viewport_width);
+    state
 }
 
 fn seed_resize_session(state: &mut AppState, hwnd: u64) {
@@ -4771,6 +4927,97 @@ fn test_matching_move_size_end_completes_resize_and_ignores_mismatch() {
 }
 
 #[test]
+fn test_resize_narrowing_clamps_scroll_reveals_column_and_syncs_taskbar() {
+    // Protects scroll landing and taskbar visibility when reduce-motion applies
+    // a resize correction instantly; without the post-apply sync column 0's taskbar
+    // button stays hidden. Existing coverage lacks this real-HWND resize path.
+    let fixture = ResizeTestWindow::new(960);
+    let mut state = resize_scroll_state(fixture.id(), false);
+    let viewport_width = state.viewport_width_for(state.focused_monitor);
+    let workspace = state.focused_workspace_mut().unwrap();
+    let max_scroll = (workspace.total_width() - workspace.visible_width(viewport_width)).max(0);
+    workspace.set_scroll_offset(max_scroll as f64);
+    assert!(max_scroll > 0);
+
+    seed_resize_session(&mut state, fixture.id());
+    state.handle_window_event(WindowEvent::MoveSizeEnd(fixture.id()));
+
+    let workspace = state.focused_workspace().unwrap();
+    let landing_max = (workspace.total_width() - workspace.visible_width(viewport_width)).max(0);
+    assert_eq!(landing_max, 0, "narrowed workspace now fits the viewport");
+    assert_eq!(workspace.scroll_offset(), landing_max as f64);
+    let previous_column = state
+        .compute_window_layout_rect(100)
+        .expect("previous column placement");
+    assert!(previous_column.x >= 0 && previous_column.right() <= viewport_width);
+    assert!(state
+        .take_recorded_taskbar_commands()
+        .contains(&(100, true)));
+}
+
+#[test]
+fn test_resize_snap_preserves_valid_scroll_when_focused_column_stays_visible() {
+    // Protects a no-op landing when the post-snap focused column is already
+    // visible and scroll is in bounds; correction must not introduce movement.
+    // The production resize path with a real HWND is not covered elsewhere.
+    let fixture = ResizeTestWindow::new(960);
+    let mut state = resize_scroll_state(fixture.id(), false);
+    let viewport_width = state.viewport_width_for(state.focused_monitor);
+    let workspace = state.focused_workspace_mut().unwrap();
+    workspace.set_scroll_offset(0.0);
+    let before = workspace.scroll_offset();
+
+    seed_resize_session(&mut state, fixture.id());
+    state.handle_window_event(WindowEvent::MoveSizeEnd(fixture.id()));
+
+    assert_eq!(state.focused_workspace().unwrap().scroll_offset(), before);
+    let rect = state
+        .compute_window_layout_rect(fixture.id())
+        .expect("focused fixture placement");
+    assert!(rect.x >= 0 && rect.right() <= viewport_width);
+}
+
+#[test]
+fn test_resize_scroll_matches_set_width_command_for_edge_center_modes() {
+    // Protects resize parity with SetColumnWidth both with and without edge
+    // centering; a missing resize correction diverges from the keyboard owner.
+    // Existing command tests do not exercise this production resize boundary.
+    let fixture = ResizeTestWindow::new(960);
+    for center_past_edges in [false, true] {
+        let mut resized = resize_scroll_state(fixture.id(), center_past_edges);
+        let initial_scroll = 700.0;
+        resized
+            .focused_workspace_mut()
+            .unwrap()
+            .set_scroll_offset(initial_scroll);
+        seed_resize_session(&mut resized, fixture.id());
+        resized.handle_window_event(WindowEvent::MoveSizeEnd(fixture.id()));
+        let resize_target = resized.focused_workspace().unwrap().scroll_offset();
+
+        let mut keyboard = resize_scroll_state(fixture.id(), center_past_edges);
+        keyboard
+            .focused_workspace_mut()
+            .unwrap()
+            .set_scroll_offset(initial_scroll);
+        assert_eq!(
+            keyboard.handle_command(IpcCommand::SetColumnWidth { fraction: 0.5 }),
+            IpcResponse::Ok
+        );
+        let keyboard_target = keyboard.focused_workspace().unwrap().scroll_offset();
+
+        assert_eq!(
+            resize_target, keyboard_target,
+            "center_past_edges={center_past_edges}"
+        );
+        assert_eq!(
+            resized.focused_workspace().unwrap().columns()[1].width(),
+            keyboard.focused_workspace().unwrap().columns()[1].width(),
+            "center_past_edges={center_past_edges}"
+        );
+    }
+}
+
+#[test]
 fn test_stale_prune_cancels_matching_resize_and_leaves_peer() {
     let mut state = two_managed_windows();
     seed_resize_session(&mut state, 100);
@@ -5558,6 +5805,36 @@ fn test_last_window_replacement_does_not_follow_other_workspace() {
     assert_eq!(state.previous_focused_hwnd, None);
     assert_eq!(state.active_workspace_idx(mon), 0);
     assert_eq!(state.focused_monitor, mon);
+}
+
+#[test]
+fn test_minimized_restore_does_not_clear_destroyed_departure_guard() {
+    let mut state = last_window_cross_workspace_state();
+    let monitor = state.focused_monitor;
+    state.ensure_workspace_exists(monitor, 2);
+    state.workspaces.get_mut(&monitor).unwrap()[2]
+        .insert_window(300, Some(800))
+        .unwrap();
+
+    state.handle_window_event(WindowEvent::Destroyed(100));
+    let intent = state
+        .pending_last_window_departure
+        .expect("destroying the selected workspace's last window arms the guard");
+    assert_eq!(
+        intent.origin,
+        LastWindowDepartureOrigin::DirectDestroyedOrHidden
+    );
+    assert_eq!(intent.replacement_hwnd, Some(200));
+
+    state.workspaces.get_mut(&monitor).unwrap()[2].mark_minimized(300);
+    state.handle_window_event(WindowEvent::Restored(300));
+    assert_eq!(state.pending_last_window_departure, Some(intent));
+
+    state.last_prune_at = Some(std::time::Instant::now());
+    state.handle_window_event(WindowEvent::Focused(200, intent.armed_at_event_time_ms));
+
+    assert_eq!(state.active_workspace_idx(monitor), intent.workspace);
+    assert_eq!(state.previous_focused_hwnd, None);
 }
 
 #[test]
@@ -6588,11 +6865,655 @@ fn test_last_window_same_hwnd_focus_does_not_consume_stale_injection() {
     assert_eq!(state.pending_last_window_departure, None);
 }
 
+fn minimized_cross_workspace_state() -> AppState {
+    let mut state = last_window_cross_workspace_state();
+    let mon = state.focused_monitor;
+    state.workspaces.get_mut(&mon).unwrap()[0]
+        .insert_window(150, Some(800))
+        .unwrap();
+    state.workspaces.get_mut(&mon).unwrap()[0]
+        .focus_window(100)
+        .unwrap();
+    state.previous_focused_hwnd = Some(100);
+    state.injected_event_time_ms = Some(1_000);
+    state.injected_iconic_hwnds.insert(100);
+    state
+}
+
+#[test]
+fn test_taskbar_restored_focus_target_is_not_reconciled_minimized() {
+    let mut state = last_window_cross_workspace_state();
+    let monitor = state.focused_monitor;
+    state.workspaces.get_mut(&monitor).unwrap()[1].mark_minimized(200);
+    state.injected_iconic_hwnds.insert(200);
+
+    state.handle_window_event(WindowEvent::Restored(200));
+    assert!(!state.workspaces[&monitor][1].is_minimized(200));
+
+    state.last_prune_at = None;
+    state.handle_window_event(WindowEvent::Focused(200, 1_000));
+
+    assert!(!state.workspaces[&monitor][1].is_minimized(200));
+    assert_eq!(state.active_workspace_idx(monitor), 1);
+    assert_eq!(state.previous_focused_hwnd, Some(200));
+}
+
+#[test]
+fn test_restored_parked_window_focus_follows_after_tracked_minimize_reconcile() {
+    let mut state = minimized_cross_workspace_state();
+    let monitor = state.focused_monitor;
+    state.workspaces.get_mut(&monitor).unwrap()[1].mark_minimized(200);
+
+    state.handle_window_event(WindowEvent::Restored(200));
+    state.handle_window_event(WindowEvent::Focused(200, 1_000));
+
+    assert_eq!(state.active_workspace_idx(monitor), 1);
+    assert_eq!(state.previous_focused_hwnd, Some(200));
+    assert!(state.workspaces[&monitor][0].is_minimized(100));
+    assert_eq!(state.pending_last_window_departure, None);
+}
+
+#[test]
+fn test_restored_parked_window_stays_at_final_rect_during_workspace_follow() {
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    let monitor = state.focused_monitor;
+    state.reduce_motion = false;
+    state.last_prune_at = Some(std::time::Instant::now());
+    state.ensure_workspace_exists(monitor, 1);
+    state.workspaces.get_mut(&monitor).unwrap()[0]
+        .insert_window(100, Some(800))
+        .unwrap();
+    state.workspaces.get_mut(&monitor).unwrap()[1]
+        .insert_window(200, Some(800))
+        .unwrap();
+    state.workspaces.get_mut(&monitor).unwrap()[1]
+        .insert_window(300, Some(800))
+        .unwrap();
+    state.workspaces.get_mut(&monitor).unwrap()[1].mark_minimized(200);
+
+    state.handle_window_event(WindowEvent::Restored(200));
+    state.handle_window_event(WindowEvent::Focused(200, 1_000));
+
+    let viewport = state.layout_viewport(monitor);
+    let final_rects: std::collections::HashMap<_, _> = state.workspaces[&monitor][1]
+        .compute_placements_animated(viewport)
+        .into_iter()
+        .map(|placement| (placement.window_id, placement.rect))
+        .collect();
+    let transition = state.layout_transition.as_ref().unwrap();
+    assert_eq!(transition.start_rects.get(&200), final_rects.get(&200));
+    assert_eq!(
+        transition.start_rects[&300].y,
+        final_rects[&300].y + state.monitors[&monitor].work_area.height
+    );
+    assert!(!state.recently_restored_managed_windows.contains_key(&200));
+}
+
+#[test]
+fn test_unfocused_recent_restore_does_not_skip_workspace_slide() {
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    let monitor = state.focused_monitor;
+    state.reduce_motion = false;
+    state.last_prune_at = Some(std::time::Instant::now());
+    state.ensure_workspace_exists(monitor, 1);
+    state.workspaces.get_mut(&monitor).unwrap()[0]
+        .insert_window(100, Some(800))
+        .unwrap();
+    state.workspaces.get_mut(&monitor).unwrap()[1]
+        .insert_window(200, Some(800))
+        .unwrap();
+    state.workspaces.get_mut(&monitor).unwrap()[1]
+        .insert_window(300, Some(800))
+        .unwrap();
+    state.workspaces.get_mut(&monitor).unwrap()[1].mark_minimized(200);
+
+    state.handle_window_event(WindowEvent::Restored(200));
+    state.handle_window_event(WindowEvent::Focused(300, 1_000));
+
+    let viewport = state.layout_viewport(monitor);
+    let final_rects: std::collections::HashMap<_, _> = state.workspaces[&monitor][1]
+        .compute_placements_animated(viewport)
+        .into_iter()
+        .map(|placement| (placement.window_id, placement.rect))
+        .collect();
+    let transition = state.layout_transition.as_ref().unwrap();
+    assert_eq!(
+        transition.start_rects[&200].y,
+        final_rects[&200].y + state.monitors[&monitor].work_area.height
+    );
+}
+
+#[test]
+fn test_restore_activation_prune_does_not_reconcile_tracked_minimize_as_departure() {
+    let mut state = minimized_cross_workspace_state();
+    let monitor = state.focused_monitor;
+    state.workspaces.get_mut(&monitor).unwrap()[1].mark_minimized(200);
+
+    state.handle_window_event(WindowEvent::Restored(200));
+    state.last_prune_at = None;
+    state.handle_window_event(WindowEvent::Focused(200, 1_000));
+
+    assert_eq!(state.active_workspace_idx(monitor), 1);
+    assert_eq!(state.previous_focused_hwnd, Some(200));
+    assert_eq!(state.pending_last_window_departure, None);
+}
+
+#[test]
+fn test_restore_activation_direct_reconcile_does_not_sync_sibling_foreground() {
+    let mut state = minimized_cross_workspace_state();
+    let monitor = state.focused_monitor;
+    state.workspaces.get_mut(&monitor).unwrap()[1].mark_minimized(200);
+    state.last_prune_at = Some(std::time::Instant::now());
+
+    state.handle_window_event(WindowEvent::Restored(200));
+    let border_shows_before = state.border_show_count.load(Ordering::Relaxed);
+    state.handle_window_event(WindowEvent::Focused(200, 1_000));
+
+    assert_eq!(state.active_workspace_idx(monitor), 1);
+    assert_eq!(state.previous_focused_hwnd, Some(200));
+    assert_eq!(
+        state.border_show_count.load(Ordering::Relaxed) - border_shows_before,
+        1,
+        "restore reconciliation must not sync foreground to the tracked sibling"
+    );
+}
+
+#[test]
+fn test_focused_minimize_reconcile_uses_event_time_for_duplicate_handoff() {
+    let mut state = minimized_cross_workspace_state();
+    let monitor = state.focused_monitor;
+    state.last_prune_at = None;
+    state.injected_event_time_ms = Some(0);
+
+    state.handle_window_event(WindowEvent::Focused(200, 1_000));
+    state.handle_window_event(WindowEvent::Focused(200, 1_015));
+
+    assert_eq!(state.active_workspace_idx(monitor), 0);
+    assert_eq!(state.workspaces[&monitor][0].focused_window(), Some(150));
+    assert_eq!(state.previous_focused_hwnd, Some(150));
+    assert_eq!(
+        state
+            .pending_last_window_departure
+            .unwrap()
+            .replacement_hwnd,
+        Some(200)
+    );
+}
+
+#[test]
+fn test_restoring_different_window_preserves_bound_minimize_guard() {
+    let mut state = minimized_cross_workspace_state();
+    let monitor = state.focused_monitor;
+    state.workspaces.get_mut(&monitor).unwrap()[1]
+        .insert_window(300, Some(800))
+        .unwrap();
+
+    state.handle_window_event(WindowEvent::Minimized(100, 1_000));
+    state.handle_window_event(WindowEvent::Focused(200, 1_000));
+    let intent = state.pending_last_window_departure.unwrap();
+    assert_eq!(intent.replacement_hwnd, Some(200));
+
+    state.workspaces.get_mut(&monitor).unwrap()[1].mark_minimized(300);
+    state.handle_window_event(WindowEvent::Restored(300));
+
+    assert_eq!(state.pending_last_window_departure, Some(intent));
+}
+
+#[test]
+fn test_iconic_tracked_focus_on_other_monitor_does_not_sync_foreground() {
+    let mut state = AppState::new_with_config(test_config(), two_monitors());
+    state.reduce_motion = true;
+    state.last_prune_at = Some(std::time::Instant::now());
+    let selected_monitor = state.focused_monitor;
+    let other_monitor = if selected_monitor == 1 { 2 } else { 1 };
+    state.workspaces.get_mut(&other_monitor).unwrap()[0]
+        .insert_window(100, Some(800))
+        .unwrap();
+    state.workspaces.get_mut(&other_monitor).unwrap()[0]
+        .insert_window(150, Some(800))
+        .unwrap();
+    state.workspaces.get_mut(&other_monitor).unwrap()[0]
+        .focus_window(100)
+        .unwrap();
+    state.workspaces.get_mut(&selected_monitor).unwrap()[0]
+        .insert_window(200, Some(800))
+        .unwrap();
+    state.previous_focused_hwnd = Some(100);
+    state.injected_iconic_hwnds.insert(100);
+    let border_shows_before = state.border_show_count.load(Ordering::Relaxed);
+
+    state.handle_window_event(WindowEvent::Focused(200, 1_000));
+
+    assert_eq!(state.focused_monitor, selected_monitor);
+    assert!(state.workspaces[&other_monitor][0].is_minimized(100));
+    assert_eq!(state.previous_focused_hwnd, Some(200));
+    assert_eq!(
+        state.border_show_count.load(Ordering::Relaxed) - border_shows_before,
+        1,
+        "reconciling the off-selection minimized focus must not resync foreground"
+    );
+    assert_eq!(state.pending_last_window_departure, None);
+}
+
+#[test]
+fn test_recent_restore_does_not_override_real_minimize_handoff() {
+    let mut state = minimized_cross_workspace_state();
+    let monitor = state.focused_monitor;
+    state.workspaces.get_mut(&monitor).unwrap()[1].mark_minimized(200);
+
+    state.handle_window_event(WindowEvent::Restored(200));
+    state.handle_window_event(WindowEvent::Minimized(100, 1_000));
+    state.handle_window_event(WindowEvent::Focused(200, 1_000));
+
+    assert_eq!(state.active_workspace_idx(monitor), 0);
+    assert_eq!(state.previous_focused_hwnd, Some(150));
+    assert_eq!(
+        state
+            .pending_last_window_departure
+            .unwrap()
+            .replacement_hwnd,
+        Some(200)
+    );
+}
+
+#[test]
+fn test_minimized_target_focus_follows_while_restore_is_in_progress() {
+    let mut state = minimized_cross_workspace_state();
+    let monitor = state.focused_monitor;
+    state.workspaces.get_mut(&monitor).unwrap()[1].mark_minimized(200);
+
+    state.handle_window_event(WindowEvent::Focused(200, 1_000));
+
+    assert_eq!(state.active_workspace_idx(monitor), 1);
+    assert_eq!(state.previous_focused_hwnd, Some(200));
+    assert_eq!(state.pending_last_window_departure, None);
+}
+
+#[test]
+fn test_focus_before_latest_restore_event_keeps_each_recent_restore() {
+    let mut state = minimized_cross_workspace_state();
+    let monitor = state.focused_monitor;
+    state.workspaces.get_mut(&monitor).unwrap()[1]
+        .insert_window(300, Some(800))
+        .unwrap();
+    state.workspaces.get_mut(&monitor).unwrap()[1].mark_minimized(200);
+    state.workspaces.get_mut(&monitor).unwrap()[1].mark_minimized(300);
+
+    state.handle_window_event(WindowEvent::Restored(200));
+    state.handle_window_event(WindowEvent::Restored(300));
+    state.handle_window_event(WindowEvent::Focused(200, 1_000));
+
+    assert_eq!(state.active_workspace_idx(monitor), 1);
+    assert_eq!(state.previous_focused_hwnd, Some(200));
+    assert_eq!(state.pending_last_window_departure, None);
+}
+
+#[test]
+fn test_unselected_floating_minimize_reconcile_clears_tracked_focus_once() {
+    let mut state = minimized_cross_workspace_state();
+    let monitor = state.focused_monitor;
+    state.workspaces.get_mut(&monitor).unwrap()[0]
+        .remove_window(100)
+        .unwrap();
+    state.workspaces.get_mut(&monitor).unwrap()[1]
+        .add_floating(100, Rect::new(100, 100, 400, 300))
+        .unwrap();
+    state.previous_focused_hwnd = Some(100);
+    state.arm_pending_last_window_departure(
+        Some(200),
+        1_000,
+        LastWindowDepartureOrigin::DirectDestroyedOrHidden,
+    );
+
+    state.handle_window_event(WindowEvent::Focused(200, 1_000));
+
+    assert_eq!(state.previous_focused_hwnd, None);
+    let placements_after_reconcile = state
+        .injected_apply_placements_call_count
+        .load(Ordering::SeqCst);
+    state.handle_window_event(WindowEvent::Focused(200, 1_000));
+
+    assert_eq!(state.previous_focused_hwnd, None);
+    assert_eq!(
+        state
+            .injected_apply_placements_call_count
+            .load(Ordering::SeqCst),
+        placements_after_reconcile,
+        "a repeated focus event must not reconcile the tracked floating window again"
+    );
+}
+
+#[test]
+fn test_restoring_window_clears_minimized_departure_focus_guard() {
+    let mut state = minimized_cross_workspace_state();
+    let monitor = state.focused_monitor;
+
+    state.handle_window_event(WindowEvent::Minimized(100, 1000));
+    let intent = state
+        .pending_last_window_departure
+        .expect("minimizing the tracked window with a visible peer arms the guard");
+    assert_eq!(intent.origin, LastWindowDepartureOrigin::Minimized);
+    assert_eq!(intent.monitor, monitor);
+
+    state.workspaces.get_mut(&monitor).unwrap()[1].mark_minimized(200);
+    state.handle_window_event(WindowEvent::Restored(200));
+    assert_eq!(state.pending_last_window_departure, None);
+
+    state.handle_window_event(WindowEvent::Focused(200, intent.armed_at_event_time_ms));
+
+    assert_eq!(state.active_workspace_idx(monitor), 1);
+    assert_eq!(state.previous_focused_hwnd, Some(200));
+}
+
+#[test]
+fn test_iconic_tracked_focus_reconciles_before_parked_window_focus() {
+    let mut state = minimized_cross_workspace_state();
+    let mon = state.focused_monitor;
+
+    state.handle_window_event(WindowEvent::Focused(200, 999));
+
+    assert_eq!(state.active_workspace_idx(mon), 0);
+    assert_eq!(state.workspaces[&mon][0].focused_window(), Some(150));
+    assert_eq!(state.previous_focused_hwnd, Some(150));
+    assert!(state.workspaces[&mon][0].contains_window(100));
+    assert!(state.workspaces[&mon][0].is_minimized(100));
+
+    let pending = state.pending_last_window_departure;
+    state.handle_window_event(WindowEvent::Minimized(100, 1000));
+    assert!(state.workspaces[&mon][0].is_minimized(100));
+    assert_eq!(state.active_workspace_idx(mon), 0);
+    assert_eq!(state.workspaces[&mon][0].focused_window(), Some(150));
+    assert_eq!(state.previous_focused_hwnd, Some(150));
+    assert_eq!(state.pending_last_window_departure, pending);
+}
+
+#[test]
+fn test_minimize_suppresses_duplicate_parked_focus_during_handoff() {
+    let mut state = minimized_cross_workspace_state();
+    let mon = state.focused_monitor;
+
+    state.handle_window_event(WindowEvent::Minimized(100, 1_000));
+    let intent = state.pending_last_window_departure.unwrap();
+    assert_eq!(intent.replacement_hwnd, None);
+    assert_eq!(intent.armed_at_event_time_ms, 1_000);
+
+    state.handle_window_event(WindowEvent::Focused(200, 1_000));
+    state.handle_window_event(WindowEvent::Focused(200, 1_015));
+
+    assert_eq!(state.active_workspace_idx(mon), 0);
+    assert_eq!(state.workspaces[&mon][0].focused_window(), Some(150));
+    assert_eq!(state.previous_focused_hwnd, Some(150));
+    assert_eq!(
+        state
+            .pending_last_window_departure
+            .unwrap()
+            .replacement_hwnd,
+        Some(200)
+    );
+}
+
+#[test]
+fn test_minimize_suppresses_parked_focus_48ms_after_handoff() {
+    let mut state = minimized_cross_workspace_state();
+    let mon = state.focused_monitor;
+
+    state.handle_window_event(WindowEvent::Minimized(100, 1_000));
+    state.handle_window_event(WindowEvent::Focused(200, 1_048));
+
+    assert_eq!(state.active_workspace_idx(mon), 0);
+    assert_eq!(state.workspaces[&mon][0].focused_window(), Some(150));
+    assert_eq!(state.previous_focused_hwnd, Some(150));
+    assert_eq!(
+        state
+            .pending_last_window_departure
+            .unwrap()
+            .replacement_hwnd,
+        Some(200)
+    );
+}
+
+#[test]
+fn test_minimize_focus_after_handoff_window_follows() {
+    let mut state = minimized_cross_workspace_state();
+    let mon = state.focused_monitor;
+    state.injected_event_time_ms = Some(1_600);
+
+    state.handle_window_event(WindowEvent::Minimized(100, 1_000));
+    state.handle_window_event(WindowEvent::Focused(200, 1_600));
+
+    assert_eq!(state.active_workspace_idx(mon), 1);
+    assert_eq!(state.workspaces[&mon][1].focused_window(), Some(200));
+    assert_eq!(state.previous_focused_hwnd, Some(200));
+    assert_eq!(state.pending_last_window_departure, None);
+}
+
+#[test]
+fn test_prune_reconciles_iconic_unmarked_focused_window() {
+    let mut state = last_window_cross_workspace_state();
+    let mon = state.focused_monitor;
+    add_liveness_test_columns(&mut state);
+    state.last_prune_at = None;
+    state.injected_iconic_hwnds.insert(150);
+    state.workspaces.get_mut(&mon).unwrap()[0]
+        .focus_window(150)
+        .unwrap();
+    state.previous_focused_hwnd = Some(100);
+
+    state.handle_window_event(WindowEvent::Focused(160, 1_000));
+
+    assert!(state.workspaces[&mon][0].contains_window(150));
+    assert!(state.workspaces[&mon][0].is_minimized(150));
+    assert_eq!(state.active_workspace_idx(mon), 0);
+    assert_eq!(state.workspaces[&mon][0].focused_window(), Some(160));
+}
+
+#[test]
+fn test_prune_reconciles_inactive_iconic_without_changing_selected_focus() {
+    let mut state = AppState::new_with_config(test_config(), two_monitors());
+    state.workspaces.get_mut(&1).unwrap()[0]
+        .insert_window(100, Some(800))
+        .unwrap();
+    state.ensure_workspace_exists(1, 1);
+    state.workspaces.get_mut(&1).unwrap()[1]
+        .insert_window(300, Some(800))
+        .unwrap();
+    state.workspaces.get_mut(&2).unwrap()[0]
+        .insert_window(200, Some(800))
+        .unwrap();
+    state.focused_monitor = 1;
+    state.previous_focused_hwnd = Some(100);
+    state.injected_stale_hwnds.push(100);
+    state.injected_iconic_hwnds.insert(200);
+    state.injected_foreground_hwnd = Some(Some(300));
+
+    state.prune_stale_windows_with(None);
+
+    assert_eq!(state.focused_monitor, 1);
+    assert_eq!(state.active_workspace_idx(1), 0);
+    assert_eq!(state.previous_focused_hwnd, None);
+    assert!(state.workspaces[&2][0].is_minimized(200));
+    let intent = state.pending_last_window_departure.unwrap();
+    assert_eq!(intent.monitor, 1);
+    assert_eq!(intent.workspace, 0);
+    assert_eq!(intent.replacement_hwnd, Some(300));
+    assert_eq!(intent.origin, LastWindowDepartureOrigin::EventlessPrune);
+
+    state.handle_window_event(WindowEvent::Focused(300, intent.armed_at_event_time_ms));
+    assert_eq!(state.focused_monitor, 1);
+    assert_eq!(state.active_workspace_idx(1), 0);
+    assert_eq!(state.previous_focused_hwnd, None);
+    assert_eq!(state.pending_last_window_departure, Some(intent));
+}
+
+#[test]
+fn test_prune_batches_iconic_windows_before_minimizing_tracked_focus() {
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    let workspace = &mut state.workspaces.get_mut(&1).unwrap()[0];
+    workspace.insert_window(100, Some(800)).unwrap();
+    workspace.insert_window_in_column(150, 0).unwrap();
+    workspace.insert_window_in_column(160, 0).unwrap();
+    workspace.focus_window(100).unwrap();
+    state.previous_focused_hwnd = Some(100);
+    state.injected_iconic_hwnds.extend([100, 150]);
+
+    state.prune_stale_windows_with(None);
+
+    let workspace = &state.workspaces[&1][0];
+    assert!(workspace.is_minimized(100));
+    assert!(workspace.is_minimized(150));
+    assert_eq!(workspace.focused_window(), Some(160));
+    assert_eq!(state.previous_focused_hwnd, Some(160));
+}
+
+#[test]
+fn test_prune_batch_transition_suppresses_landing_focus_resync() {
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    state.reduce_motion = false;
+    state.workspaces.get_mut(&1).unwrap()[0]
+        .insert_window(100, Some(800))
+        .unwrap();
+    state.workspaces.get_mut(&1).unwrap()[0]
+        .insert_window(150, Some(800))
+        .unwrap();
+    state.previous_focused_hwnd = Some(100);
+    state.injected_iconic_hwnds.insert(150);
+
+    state.prune_stale_windows_with(None);
+
+    assert!(state.workspaces[&1][0].is_minimized(150));
+    assert!(state
+        .layout_transition
+        .as_ref()
+        .is_some_and(|transition| transition.suppress_landing_focus_resync));
+}
+
 fn last_window_liveness_state() -> AppState {
     let mut state = last_window_focus_prune_state();
     // Test AppState starts paused, which would skip the liveness check.
     state.paused = false;
     state
+}
+
+fn add_liveness_test_columns(state: &mut AppState) {
+    let mon = state.focused_monitor;
+    let workspace = &mut state.workspaces.get_mut(&mon).unwrap()[0];
+    for hwnd in [150, 160] {
+        workspace.insert_window(hwnd, Some(800)).unwrap();
+    }
+    workspace.set_all_column_widths(720);
+}
+
+#[test]
+fn test_iconic_unmarked_focus_is_reconciled_by_focus_prune_and_restored() {
+    let mut state = last_window_cross_workspace_state();
+    let mon = state.focused_monitor;
+    add_liveness_test_columns(&mut state);
+    state.last_prune_at = None;
+    state.injected_event_time_ms = Some(5_000);
+    state.injected_iconic_hwnds.insert(100);
+
+    let workspace = &state.workspaces[&mon][0];
+    assert!(workspace.contains_window(100));
+    assert!(!workspace.is_minimized(100));
+    assert!(workspace.contains_window(150));
+    assert_ne!(
+        workspace.find_window_location(100).unwrap().0,
+        workspace.find_window_location(150).unwrap().0
+    );
+    assert_eq!(state.find_window_workspace(200), Some((mon, 1)));
+    let column = workspace.find_window_location(100).unwrap().0;
+    let width = workspace.column(column).unwrap().width();
+
+    state.handle_window_event(WindowEvent::Focused(200, 1_000));
+
+    let workspace = &state.workspaces[&mon][0];
+    assert!(
+        workspace.contains_window(100),
+        "focus prune must retain the OS-iconic window"
+    );
+    assert!(workspace.is_minimized(100));
+    assert_eq!(state.find_window_workspace(100), Some((mon, 0)));
+    assert_eq!(workspace.find_window_location(100).unwrap().0, column);
+    assert_eq!(workspace.column(column).unwrap().width(), width);
+
+    state.handle_window_event(WindowEvent::Minimized(100, 1000));
+    assert!(state.workspaces[&mon][0].is_minimized(100));
+    state.handle_window_event(WindowEvent::Restored(100));
+
+    let workspace = &state.workspaces[&mon][0];
+    assert!(workspace.contains_window(100));
+    assert!(!workspace.is_minimized(100));
+    assert_eq!(state.find_window_workspace(100), Some((mon, 0)));
+    assert_eq!(workspace.find_window_location(100).unwrap().0, column);
+    assert_eq!(workspace.column(column).unwrap().width(), width);
+}
+
+#[test]
+fn test_iconic_unmarked_tracked_focus_does_not_trigger_liveness_prune() {
+    let mut state = last_window_liveness_state();
+    let mon = state.focused_monitor;
+    add_liveness_test_columns(&mut state);
+    state.injected_stale_hwnds.clear();
+    state.injected_iconic_hwnds.insert(100);
+
+    let workspace = &state.workspaces[&mon][0];
+    assert!(workspace.contains_window(100));
+    assert!(!workspace.is_minimized(100));
+    let column = workspace.find_window_location(100).unwrap().0;
+    let width = workspace.column(column).unwrap().width();
+
+    assert!(!state.check_tracked_focus_liveness());
+
+    let workspace = &state.workspaces[&mon][0];
+    assert!(workspace.contains_window(100));
+    assert!(!workspace.is_minimized(100));
+    assert_eq!(workspace.find_window_location(100).unwrap().0, column);
+    assert_eq!(workspace.column(column).unwrap().width(), width);
+    assert!(state.last_prune_at.is_none());
+}
+
+#[test]
+fn test_liveness_prune_removes_hidden_window_and_reconciles_iconic_windows() {
+    let mut state = last_window_liveness_state();
+    let mon = state.focused_monitor;
+    add_liveness_test_columns(&mut state);
+    state.injected_stale_hwnds = vec![100];
+    state.injected_iconic_hwnds.extend([150, 160]);
+
+    let workspace = &state.workspaces[&mon][0];
+    assert!(workspace.contains_window(100));
+    assert!(!workspace.is_minimized(100));
+    let iconic_columns: Vec<_> = [150, 160]
+        .into_iter()
+        .map(|hwnd| {
+            assert!(workspace.contains_window(hwnd));
+            let column = workspace.find_window_location(hwnd).unwrap().0;
+            (hwnd, column, workspace.column(column).unwrap().width())
+        })
+        .collect();
+
+    assert!(state.check_tracked_focus_liveness());
+    assert!(state.workspaces[&mon][1].contains_window(200));
+
+    let workspace = &state.workspaces[&mon][0];
+    assert!(
+        !workspace.contains_window(100),
+        "the hidden tracked window must be pruned"
+    );
+    for &(hwnd, column, width) in &iconic_columns {
+        assert!(workspace.contains_window(hwnd));
+        assert!(workspace.is_minimized(hwnd));
+        let current_column = workspace.find_window_location(hwnd).unwrap().0;
+        assert_eq!(current_column + 1, column);
+        assert_eq!(workspace.column(current_column).unwrap().width(), width);
+    }
+
+    for &(hwnd, _, _) in &iconic_columns {
+        state.handle_window_event(WindowEvent::Minimized(hwnd, 0));
+        let workspace = &state.workspaces[&mon][0];
+        assert!(workspace.contains_window(hwnd));
+        assert!(workspace.is_minimized(hwnd));
+    }
 }
 
 #[test]
@@ -9463,7 +10384,7 @@ fn test_minimize_reconciles_geometry_after_native_minimum_removal() {
     workspace.set_window_min_width(200, 842);
     workspace.set_scroll_offset(339.0);
     assert_eq!(state.tiled_column_width(1, 0, 200), Some(467));
-    state.handle_window_event(WindowEvent::Minimized(200));
+    state.handle_window_event(WindowEvent::Minimized(200, 0));
     let workspace = state.focused_workspace_mut().unwrap();
     assert!(workspace.is_minimized(200));
     assert_eq!(workspace.columns()[1].width(), 467);
@@ -9562,7 +10483,7 @@ fn test_minimized_event_updates_focused_monitor_to_source_monitor() {
         .unwrap();
     state.focused_monitor = 1;
 
-    state.handle_window_event(WindowEvent::Minimized(200));
+    state.handle_window_event(WindowEvent::Minimized(200, 0));
     assert_eq!(state.focused_monitor, 2);
 }
 
@@ -10393,6 +11314,99 @@ fn test_focus_follows_mouse_floating_then_tiled_focuses_tiled() {
 }
 
 #[test]
+fn test_inactive_minimized_window_restore_waits_for_focus_event() {
+    const RESTORED: u64 = 100;
+    const ACTIVE: u64 = 200;
+    const OTHER_MONITOR: u64 = 300;
+    const RESTORE_PEER: u64 = 400;
+
+    let mut state = AppState::new_with_config(test_config(), two_monitors());
+    state.paused = false;
+    state.reduce_motion = false;
+    state.ensure_workspace_exists(1, 2);
+    state.workspaces.get_mut(&1).unwrap()[0]
+        .insert_window(ACTIVE, Some(800))
+        .unwrap();
+    state.workspaces.get_mut(&1).unwrap()[2]
+        .insert_window(RESTORED, Some(800))
+        .unwrap();
+    state.workspaces.get_mut(&1).unwrap()[2]
+        .insert_window(RESTORE_PEER, Some(800))
+        .unwrap();
+    state.workspaces.get_mut(&2).unwrap()[0]
+        .insert_window(OTHER_MONITOR, Some(800))
+        .unwrap();
+    state.active_workspace.insert(1, 2);
+    state.active_workspace.insert(2, 0);
+    state.focused_monitor = 2;
+    state.previous_focused_hwnd = Some(OTHER_MONITOR);
+    state.injected_window_maximized.insert(RESTORED, false);
+    state.apply_layout().unwrap();
+    join_pending_test_apply_workers(&mut state);
+    assert!(state.last_placed_layout_rects.contains_key(&RESTORED));
+    state.active_workspace.insert(1, 0);
+    state.workspaces.get_mut(&1).unwrap()[2].mark_minimized(RESTORED);
+    state.moved_or_resized_suppression.remove(&RESTORED);
+
+    let placement_calls_before_moves = state
+        .injected_apply_placements_call_count
+        .load(Ordering::SeqCst);
+    state
+        .last_placed_layout_rects
+        .insert(ACTIVE, Rect::new(-10_000, -10_000, 1, 1));
+    for _ in 0..3 {
+        state.handle_window_event(WindowEvent::MovedOrResized(RESTORED));
+    }
+    join_pending_test_apply_workers(&mut state);
+    assert!(
+        state.last_placed_layout_rects.contains_key(&RESTORED),
+        "move/resize events must not evict a minimized window's last placement"
+    );
+    assert_eq!(
+        state
+            .injected_apply_placements_call_count
+            .load(Ordering::SeqCst),
+        placement_calls_before_moves,
+        "move/resize events must not snap back a minimized window"
+    );
+    assert!(state.workspaces.get(&1).unwrap()[2].is_minimized(RESTORED));
+
+    state.handle_window_event(WindowEvent::Restored(RESTORED));
+    join_pending_test_apply_workers(&mut state);
+    assert!(!state.workspaces.get(&1).unwrap()[2].is_minimized(RESTORED));
+    assert_eq!(
+        state.workspaces.get(&1).unwrap()[2].focused_window(),
+        Some(RESTORED),
+        "restore should focus the window within its own workspace"
+    );
+    assert_eq!(state.active_workspace_idx(1), 0);
+    assert_eq!(state.focused_monitor, 2);
+    assert_eq!(state.previous_focused_hwnd, Some(OTHER_MONITOR));
+    assert!(
+        state.layout_transition.is_some(),
+        "restore should schedule the layout transition"
+    );
+
+    state.handle_window_event(WindowEvent::Focused(RESTORED, 1_000));
+    assert_eq!(state.active_workspace_idx(1), 2);
+    assert_eq!(state.focused_monitor, 1);
+    assert_eq!(state.previous_focused_hwnd, Some(RESTORED));
+    state.handle_window_event(WindowEvent::Focused(RESTORED, 1_001));
+    assert_eq!(state.active_workspace_idx(1), 2);
+    assert_eq!(state.focused_monitor, 1);
+
+    state.workspaces.get_mut(&1).unwrap()[2].mark_minimized(RESTORED);
+    state.workspaces.get_mut(&1).unwrap()[2]
+        .focus_window(RESTORE_PEER)
+        .unwrap();
+    state.focused_monitor = 2;
+    state.previous_focused_hwnd = Some(OTHER_MONITOR);
+    state.handle_window_event(WindowEvent::Restored(RESTORED));
+    assert_eq!(state.focused_monitor, 1);
+    assert_eq!(state.previous_focused_hwnd, Some(RESTORED));
+}
+
+#[test]
 fn test_restored_floating_window_does_not_steal_tiled_focus() {
     let mut state = AppState::new_with_config(test_config(), test_monitors());
     let ws = state.focused_workspace_mut().unwrap();
@@ -10443,6 +11457,14 @@ fn join_pending_test_apply_workers(state: &mut AppState) {
             "timed-out test worker should exit before the test returns"
         );
     }
+}
+
+fn pending_display_change_retry_generation(state: &AppState) -> u64 {
+    state
+        .display_change_apply_retry
+        .as_ref()
+        .expect("a display-change retry should be pending")
+        .generation
 }
 
 #[test]
@@ -10835,6 +11857,126 @@ fn test_lookup_window_info_missing_returns_none() {
     // No injected info, and enumerate_windows won't find hwnd 99999
     let result = state.lookup_window_info(99999);
     assert!(result.is_none());
+}
+
+#[test]
+fn test_maximized_tiled_admission_restores_and_opens_full_width_column() {
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    let monitor = state.focused_monitor;
+    let viewport_width = state.viewport_width_for(monitor);
+    state
+        .injected_window_info
+        .insert(100, make_test_window_info(100));
+    let maximize_queries = std::cell::Cell::new(0);
+    let queue_calls = std::cell::Cell::new(0);
+
+    let outcome = state.try_admit_window_at_with_native_ops(
+        100,
+        crate::event_handler::AdmissionKind::Automatic,
+        None,
+        |_| {
+            maximize_queries.set(maximize_queries.get() + 1);
+            true
+        },
+        |_| {
+            queue_calls.set(queue_calls.get() + 1);
+            Ok(true)
+        },
+    );
+
+    assert_eq!(outcome, crate::event_handler::AdmitOutcome::Admitted);
+    let workspace = &state.workspaces[&monitor][state.active_workspace_idx(monitor)];
+    assert_eq!(
+        workspace.columns()[0].width(),
+        workspace.visible_width(viewport_width)
+    );
+    assert_eq!(
+        maximize_queries.get(),
+        1,
+        "sample native maximize before insertion"
+    );
+    assert_eq!(queue_calls.get(), 1);
+    assert!(state.window_last_maximized_at.contains_key(&100));
+    assert!(!state.last_placed_layout_rects.contains_key(&100));
+    state.paused = false;
+    state.layout_transition = None;
+    state.injected_apply_placements_behavior = Some(TestApplyPlacementsBehavior::SleepAndSucceed(
+        std::time::Duration::ZERO,
+    ));
+    state.handle_window_event(WindowEvent::MaximizedAdmissionRestored {
+        window_id: 100,
+        managed_lifetime_token: state.managed_lifetime_tokens[&100],
+        still_maximized: false,
+    });
+    assert!(!state.window_last_maximized_at.contains_key(&100));
+    assert!(!state.pending_maximized_admission_restores.contains(&100));
+    assert_eq!(
+        state.last_placed_layout_rects[&100].width,
+        state
+            .focused_workspace()
+            .unwrap()
+            .visible_width(viewport_width)
+    );
+    assert_eq!(
+        *state.injected_apply_placements_batches.lock().unwrap(),
+        vec![vec![100]]
+    );
+}
+
+#[test]
+fn test_failed_maximized_admission_restore_keeps_settling_grace() {
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    state
+        .injected_window_info
+        .insert(100, make_test_window_info(100));
+    let outcome = state.try_admit_window_at_with_native_ops(
+        100,
+        crate::event_handler::AdmissionKind::Automatic,
+        None,
+        |_| true,
+        |_| Ok(true),
+    );
+
+    assert_eq!(outcome, crate::event_handler::AdmitOutcome::Admitted);
+    assert!(state.pending_maximized_admission_restores.contains(&100));
+    assert!(state.window_last_maximized_at.contains_key(&100));
+    let before_result = std::time::Instant::now();
+    state.handle_window_event(WindowEvent::MaximizedAdmissionRestored {
+        window_id: 100,
+        managed_lifetime_token: state.managed_lifetime_tokens[&100],
+        still_maximized: true,
+    });
+    assert!(state.window_last_maximized_at[&100] >= before_result);
+    assert!(!state.pending_maximized_admission_restores.contains(&100));
+    assert!(!state.last_placed_layout_rects.contains_key(&100));
+}
+
+#[test]
+fn test_non_maximized_tiled_admission_keeps_normal_column_width() {
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    let monitor = state.focused_monitor;
+    let viewport_width = state.viewport_width_for(monitor);
+    state
+        .injected_window_info
+        .insert(100, make_test_window_info(100));
+    let queue_calls = std::cell::Cell::new(0);
+
+    let outcome = state.try_admit_window_at_with_native_ops(
+        100,
+        crate::event_handler::AdmissionKind::Automatic,
+        None,
+        |_| false,
+        |_| {
+            queue_calls.set(queue_calls.get() + 1);
+            Ok(true)
+        },
+    );
+
+    assert_eq!(outcome, crate::event_handler::AdmitOutcome::Admitted);
+    let workspace = &state.workspaces[&monitor][state.active_workspace_idx(monitor)];
+    assert_ne!(workspace.columns()[0].width(), viewport_width);
+    assert_eq!(queue_calls.get(), 0);
+    assert!(!state.window_last_maximized_at.contains_key(&100));
 }
 
 #[test]
@@ -11888,6 +13030,96 @@ fn test_workspace_switch_noop_preserves_and_new_destination_clears_intent() {
 }
 
 #[test]
+fn test_empty_workspace_switch_releases_departing_tiled_foreground() {
+    let mut state = two_managed_windows();
+    state.previous_focused_hwnd = Some(100);
+    state.injected_foreground_hwnd = Some(Some(100));
+
+    assert!(matches!(
+        state.handle_command(IpcCommand::SwitchWorkspace { index: 2 }),
+        IpcResponse::Ok
+    ));
+
+    assert_eq!(
+        state.foreground_release_requests,
+        vec![(100, Rect::new(0, 0, 1920, 1040))]
+    );
+    assert!(state.selected_workspace_is_genuinely_empty());
+}
+
+#[test]
+fn test_focusing_monitor_with_empty_selection_releases_its_parked_foreground() {
+    let mut state = AppState::new_with_config(test_config(), two_monitors());
+    state.ensure_workspace_exists(2, 1);
+    state.workspaces.get_mut(&2).unwrap()[1]
+        .insert_window(200, Some(800))
+        .unwrap();
+    state.injected_foreground_hwnd = Some(Some(200));
+
+    assert!(matches!(
+        state.handle_command(IpcCommand::FocusMonitorRight),
+        IpcResponse::Ok
+    ));
+
+    assert_eq!(state.focused_monitor, 2);
+    assert!(state.selected_workspace_is_genuinely_empty());
+    assert_eq!(
+        state.foreground_release_requests,
+        vec![(200, Rect::new(1920, 0, 1920, 1040))]
+    );
+}
+
+#[test]
+fn test_empty_workspace_switch_does_not_release_other_foreground() {
+    let mut floating = AppState::new_with_config(test_config(), test_monitors());
+    floating
+        .workspaces
+        .get_mut(&floating.focused_monitor)
+        .unwrap()[0]
+        .insert_window(100, Some(800))
+        .unwrap();
+    float_focused_window(&mut floating, 100);
+    floating.previous_focused_hwnd = Some(100);
+    floating.injected_foreground_hwnd = Some(Some(100));
+    floating.handle_command(IpcCommand::SwitchWorkspace { index: 2 });
+    assert!(floating.foreground_release_requests.is_empty());
+
+    let mut unmanaged = AppState::new_with_config(test_config(), test_monitors());
+    unmanaged
+        .workspaces
+        .get_mut(&unmanaged.focused_monitor)
+        .unwrap()[0]
+        .insert_window(100, Some(800))
+        .unwrap();
+    unmanaged.previous_focused_hwnd = Some(100);
+    unmanaged.injected_foreground_hwnd = Some(Some(999));
+    unmanaged.handle_command(IpcCommand::SwitchWorkspace { index: 2 });
+    assert!(unmanaged.foreground_release_requests.is_empty());
+
+    let mut visible_elsewhere = AppState::new_with_config(test_config(), two_monitors());
+    visible_elsewhere.workspaces.get_mut(&2).unwrap()[0]
+        .insert_window(200, Some(800))
+        .unwrap();
+    visible_elsewhere.injected_foreground_hwnd = Some(Some(200));
+    visible_elsewhere.handle_command(IpcCommand::SwitchWorkspace { index: 2 });
+    assert!(visible_elsewhere.foreground_release_requests.is_empty());
+}
+
+#[test]
+fn test_last_window_departure_releases_suppressed_parked_foreground() {
+    let mut state = last_window_cross_workspace_state();
+    state.handle_window_event(WindowEvent::Destroyed(100));
+
+    assert_eq!(state.active_workspace_idx(state.focused_monitor), 0);
+    assert_eq!(state.previous_focused_hwnd, None);
+    assert!(state.pending_last_window_departure.is_some());
+    assert_eq!(
+        state.foreground_release_requests,
+        vec![(200, Rect::new(0, 0, 1920, 1040))]
+    );
+}
+
+#[test]
 fn test_successful_workspace_switch_rearms_only_without_visible_destination_focus() {
     let mut state = switch_to_empty_workspace_with_pending_focus();
     let monitor = state.focused_monitor;
@@ -12052,6 +13284,54 @@ fn test_edge_wrap_focus_switches_workspace_only_when_enabled() {
         1,
         "FocusDown at the bottom edge switches to the next workspace when enabled"
     );
+}
+
+#[test]
+fn test_edge_wrap_focus_crosses_empty_workspaces() {
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    let mon = state.focused_monitor;
+
+    state.handle_command(IpcCommand::FocusDown);
+    assert_eq!(state.active_workspace_idx(mon), 0);
+
+    state.config.behavior.workspace_edge_wrap = true;
+    state.handle_command(IpcCommand::FocusDown);
+    assert_eq!(state.active_workspace_idx(mon), 1);
+    state.handle_command(IpcCommand::FocusDown);
+    assert_eq!(state.active_workspace_idx(mon), 2);
+    state.handle_command(IpcCommand::FocusUp);
+    assert_eq!(state.active_workspace_idx(mon), 1);
+    state.handle_command(IpcCommand::FocusUp);
+    assert_eq!(state.active_workspace_idx(mon), 0);
+    state.handle_command(IpcCommand::FocusUp);
+    assert_eq!(state.active_workspace_idx(mon), 8);
+}
+
+#[test]
+fn test_edge_wrap_focus_stays_in_column_before_bottom_edge() {
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    let mon = state.focused_monitor;
+    for id in [100, 200] {
+        state
+            .injected_window_info
+            .insert(id, make_test_window_info(id));
+    }
+    state.handle_window_event(WindowEvent::Created(100, 0));
+    let ws = &mut state.workspaces.get_mut(&mon).unwrap()[0];
+    ws.insert_window_in_column(200, 0).unwrap();
+    ws.focus_up();
+    assert_eq!(ws.focused_window(), Some(100));
+
+    state.config.behavior.workspace_edge_wrap = true;
+    state.handle_command(IpcCommand::FocusDown);
+    assert_eq!(state.active_workspace_idx(mon), 0);
+    assert_eq!(
+        state.focused_workspace().unwrap().focused_window(),
+        Some(200)
+    );
+
+    state.handle_command(IpcCommand::FocusDown);
+    assert_eq!(state.active_workspace_idx(mon), 1);
 }
 
 #[test]
@@ -12641,9 +13921,53 @@ fn test_check_already_running_with_isolated_pipe() {
 // =========================================================================
 
 #[test]
+fn native_swipe_status_derivation_covers_startup_outcomes() {
+    use crate::state::derive_native_swipe_status;
+    use leopardwm_ipc::NativeSwipeStatus;
+
+    assert_eq!(
+        derive_native_swipe_status(false, true, None, None),
+        NativeSwipeStatus::Off
+    );
+    assert_eq!(
+        derive_native_swipe_status(true, false, None, None),
+        NativeSwipeStatus::Inactive {
+            reason: "gesture detection is disabled (gestures.enabled = false)".to_string(),
+        }
+    );
+    assert_eq!(
+        derive_native_swipe_status(true, true, Some("hook registration failed"), None),
+        NativeSwipeStatus::Inactive {
+            reason: "hook registration failed".to_string(),
+        }
+    );
+    assert_eq!(
+        derive_native_swipe_status(true, true, None, Some("device not supported")),
+        NativeSwipeStatus::Inactive {
+            reason: "device not supported; wheel-based swipes remain active".to_string(),
+        }
+    );
+    assert_eq!(
+        derive_native_swipe_status(true, true, None, None),
+        NativeSwipeStatus::Active
+    );
+}
+
+#[test]
 fn test_cmd_health_check() {
     let mut state = AppState::new_with_config(test_config(), test_monitors());
     state.paused = false;
+    state.native_swipes = leopardwm_ipc::NativeSwipeStatus::Inactive {
+        reason: "device capability check failed; wheel-based swipes remain active".to_string(),
+    };
+    let blocked_path = std::env::temp_dir().join(format!(
+        "leopardwm-health-log-blocked-{}",
+        std::process::id()
+    ));
+    std::fs::write(&blocked_path, b"not a directory").unwrap();
+    let (_, log_health) = crate::daemon_log::open(&blocked_path, tracing::Level::INFO);
+    std::fs::remove_file(&blocked_path).unwrap();
+    state.daemon_log = Some(log_health);
     let resp = state.handle_command(IpcCommand::HealthCheck);
     match resp {
         IpcResponse::HealthInfo {
@@ -12654,6 +13978,8 @@ fn test_cmd_health_check() {
             daemon_integrity,
             elevation_blocked_windows,
             elevation_blocked_records,
+            native_swipes,
+            daemon_log,
             ..
         } => {
             assert!(healthy);
@@ -12666,6 +13992,10 @@ fn test_cmd_health_check() {
             );
             assert!(elevation_blocked_windows.is_empty());
             assert_eq!(elevation_blocked_records, Some(Vec::new()));
+            assert_eq!(native_swipes, Some(state.native_swipes.clone()));
+            assert!(
+                matches!(daemon_log, Some(leopardwm_ipc::DaemonLogStatus::OpenFailed { path, error }) if path == blocked_path.join("leopardwm-daemon.log").display().to_string() && !error.is_empty())
+            );
         }
         other => panic!("Expected HealthInfo, got {:?}", other),
     }
@@ -12879,6 +14209,312 @@ fn test_reconcile_monitors_new_monitor_gets_scaled_gaps() {
 // =============================================================================
 // Snap layout suppression tests
 // =============================================================================
+
+#[test]
+fn test_snap_style_requests_do_not_wait_for_non_pumping_window() {
+    let _serial = REAL_WINDOW_STYLE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::{Duration, Instant};
+    use windows::core::w;
+    use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+    use windows::Win32::System::Threading::GetCurrentThreadId;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
+        GetWindowLongW, PostThreadMessageW, RegisterClassW, TranslateMessage, CS_HREDRAW,
+        CS_VREDRAW, GWL_STYLE, MSG, WM_APP, WM_STYLECHANGED, WNDCLASSW, WS_CAPTION,
+        WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_OVERLAPPED,
+        WS_SYSMENU, WS_THICKFRAME,
+    };
+
+    const BLOCK_OWNER: u32 = WM_APP + 41;
+    const QUIT_OWNER: u32 = WM_APP + 42;
+    const BLOCK: Duration = Duration::from_millis(2500);
+    static STYLE_CHANGES: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe extern "system" fn fixture_wndproc(
+        hwnd: HWND,
+        message: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        if message == WM_STYLECHANGED && wparam.0 as i32 == GWL_STYLE.0 {
+            STYLE_CHANGES.fetch_add(1, Ordering::SeqCst);
+        }
+        unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+    }
+
+    struct Fixture {
+        thread_id: u32,
+        windows: [u64; 2],
+        join: Option<thread::JoinHandle<()>>,
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            assert!(
+                leopardwm_platform_win32::wait_for_window_style_requests(Duration::from_secs(5)),
+                "window style requests must drain before fixture windows are destroyed"
+            );
+            unsafe {
+                let _ = PostThreadMessageW(self.thread_id, QUIT_OWNER, WPARAM(0), LPARAM(0));
+            }
+            if let Some(join) = self.join.take() {
+                let _ = join.join();
+            }
+        }
+    }
+
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (blocked_tx, blocked_rx) = mpsc::channel();
+    let join = thread::spawn(move || unsafe {
+        let thread_id = GetCurrentThreadId();
+        let class = WNDCLASSW {
+            style: CS_HREDRAW | CS_VREDRAW,
+            lpfnWndProc: Some(fixture_wndproc),
+            hInstance: windows::Win32::System::LibraryLoader::GetModuleHandleW(None)
+                .unwrap()
+                .into(),
+            lpszClassName: w!("LeopardWMStyleRequestFixture"),
+            ..Default::default()
+        };
+        RegisterClassW(&class);
+        let create = || {
+            CreateWindowExW(
+                WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+                w!("LeopardWMStyleRequestFixture"),
+                None,
+                WS_OVERLAPPED
+                    | WS_CAPTION
+                    | WS_SYSMENU
+                    | WS_THICKFRAME
+                    | WS_MINIMIZEBOX
+                    | WS_MAXIMIZEBOX,
+                0,
+                0,
+                200,
+                100,
+                None,
+                None,
+                Some(class.hInstance),
+                None,
+            )
+            .unwrap()
+        };
+        let windows = [create(), create()];
+        ready_tx
+            .send((
+                thread_id,
+                [windows[0].0 as usize as u64, windows[1].0 as usize as u64],
+            ))
+            .unwrap();
+        thread::sleep(BLOCK);
+        let mut message = MSG::default();
+        loop {
+            let result = GetMessageW(&mut message, None, 0, 0).0;
+            if result <= 0 || message.message == QUIT_OWNER {
+                break;
+            }
+            if message.message == BLOCK_OWNER {
+                blocked_tx.send(()).unwrap();
+                thread::sleep(BLOCK);
+                continue;
+            }
+            let _ = TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+        for hwnd in windows {
+            let _ = DestroyWindow(hwnd);
+        }
+    });
+    let (thread_id, windows) = ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let fixture = Fixture {
+        thread_id,
+        windows,
+        join: Some(join),
+    };
+    STYLE_CHANGES.store(0, Ordering::SeqCst);
+
+    let mut config = test_config();
+    config.behavior.disable_snap_layouts = true;
+    let mut state = AppState::new_with_config(config, test_monitors());
+    state.paused = false;
+    let start = Instant::now();
+    state.disable_snap_for_window(fixture.windows[0]);
+    let admission_elapsed = start.elapsed();
+    let was_tracked = state.snap_disabled_hwnds.contains(&fixture.windows[0]);
+    state.disable_snap_for_window(fixture.windows[0]);
+    state.disable_snap_for_window(fixture.windows[1]);
+    let wait_timed_out =
+        !leopardwm_platform_win32::wait_for_window_style_requests(Duration::from_millis(50));
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline
+        && windows.iter().any(|hwnd| unsafe { GetWindowLongW(HWND(*hwnd as *mut _), GWL_STYLE) } & WS_MAXIMIZEBOX.0 as i32 != 0)
+    {
+        thread::sleep(Duration::from_millis(10));
+    }
+    let completed_after_pump =
+        leopardwm_platform_win32::wait_for_window_style_requests(Duration::from_secs(5));
+    let removed_once = completed_after_pump && STYLE_CHANGES.load(Ordering::SeqCst) == 2;
+
+    unsafe {
+        let _ = PostThreadMessageW(fixture.thread_id, BLOCK_OWNER, WPARAM(0), LPARAM(0));
+    }
+    blocked_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    state.disable_snap_for_window(fixture.windows[1]);
+    let release_start = Instant::now();
+    state.restore_snap_for_window(fixture.windows[0]);
+    let release_elapsed = release_start.elapsed();
+    let pause_start = Instant::now();
+    state.restore_snap_for_all_windows();
+    let pause_elapsed = pause_start.elapsed();
+    state.disable_snap_for_window(fixture.windows[0]);
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline
+        && windows.iter().any(|hwnd| unsafe {
+            let style = GetWindowLongW(HWND(*hwnd as *mut _), GWL_STYLE);
+            if *hwnd == fixture.windows[0] {
+                style & WS_MAXIMIZEBOX.0 as i32 != 0
+            } else {
+                style & WS_MAXIMIZEBOX.0 as i32 == 0
+            }
+        })
+    {
+        thread::sleep(Duration::from_millis(10));
+    }
+    let completed_after_restore =
+        leopardwm_platform_win32::wait_for_window_style_requests(Duration::from_secs(5));
+    let tracked_after_readmission = state.snap_disabled_hwnds.contains(&fixture.windows[0]);
+    let re_suppressed = unsafe {
+        GetWindowLongW(HWND(fixture.windows[0] as *mut _), GWL_STYLE) & WS_MAXIMIZEBOX.0 as i32 == 0
+    };
+    let second_restored = unsafe {
+        GetWindowLongW(HWND(fixture.windows[1] as *mut _), GWL_STYLE) & WS_MAXIMIZEBOX.0 as i32 != 0
+    };
+    let change_count = if completed_after_restore {
+        STYLE_CHANGES.load(Ordering::SeqCst)
+    } else {
+        usize::MAX
+    };
+    leopardwm_platform_win32::restore_maximizebox_panic_recovery();
+    let recovery_restored_tracked_window = unsafe {
+        GetWindowLongW(HWND(fixture.windows[0] as *mut _), GWL_STYLE) & WS_MAXIMIZEBOX.0 as i32 != 0
+    };
+
+    let target = unsafe {
+        CreateWindowExW(
+            WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+            w!("STATIC"),
+            None,
+            WS_OVERLAPPED
+                | WS_CAPTION
+                | WS_SYSMENU
+                | WS_THICKFRAME
+                | WS_MINIMIZEBOX
+                | WS_MAXIMIZEBOX,
+            0,
+            0,
+            200,
+            100,
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+    .unwrap();
+    let target_id = target.0 as usize as u64;
+    assert!(leopardwm_platform_win32::remove_maximizebox(fixture.windows[0]).unwrap());
+    assert!(leopardwm_platform_win32::wait_for_window_style_requests(
+        Duration::from_secs(5)
+    ));
+    unsafe {
+        let _ = PostThreadMessageW(fixture.thread_id, BLOCK_OWNER, WPARAM(0), LPARAM(0));
+    }
+    blocked_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert!(leopardwm_platform_win32::restore_maximizebox(fixture.windows[0]).unwrap());
+    let restore_is_blocked =
+        !leopardwm_platform_win32::wait_for_window_style_requests(Duration::from_millis(50));
+    let remove_was_queued = leopardwm_platform_win32::remove_maximizebox(target_id).unwrap();
+    leopardwm_platform_win32::restore_maximizebox_panic_recovery();
+    let target_still_has_maximizebox =
+        unsafe { GetWindowLongW(target, GWL_STYLE) & WS_MAXIMIZEBOX.0 as i32 != 0 };
+    pump_window_style_worker_until_idle();
+    let target_kept_maximizebox_after_drain =
+        unsafe { GetWindowLongW(target, GWL_STYLE) & WS_MAXIMIZEBOX.0 as i32 != 0 };
+    let _ = unsafe { DestroyWindow(target) };
+    drop(fixture);
+
+    assert!(
+        admission_elapsed < Duration::from_millis(750),
+        "admission blocked for {admission_elapsed:?}"
+    );
+    assert!(was_tracked, "queued suppression must be tracked");
+    assert!(
+        wait_timed_out,
+        "the bounded wait should time out while the owner is blocked"
+    );
+    assert!(
+        completed_after_pump,
+        "the bounded wait should finish after the owner pumps"
+    );
+    assert!(
+        removed_once,
+        "suppression should produce exactly one style change"
+    );
+    assert!(
+        release_elapsed < Duration::from_millis(750),
+        "release blocked for {release_elapsed:?}"
+    );
+    assert!(
+        pause_elapsed < Duration::from_millis(750),
+        "pause restore blocked for {pause_elapsed:?}"
+    );
+    assert!(
+        tracked_after_readmission,
+        "readmission during a pending restore must track the window"
+    );
+    assert!(
+        completed_after_restore,
+        "all queued restore/re-remove work must finish"
+    );
+    assert!(
+        re_suppressed,
+        "readmitted window must remain snap-suppressed"
+    );
+    assert!(
+        second_restored,
+        "pause restore must re-enable the other window"
+    );
+    assert_eq!(
+        change_count, 5,
+        "initial suppression plus restore/re-suppression and the peer restore"
+    );
+    assert!(
+        recovery_restored_tracked_window,
+        "panic recovery must find and restore the platform-tracked window"
+    );
+    assert!(
+        restore_is_blocked,
+        "the earlier restore must hold the worker"
+    );
+    assert!(
+        remove_was_queued,
+        "the target remove must queue behind the restore"
+    );
+    assert!(
+        target_still_has_maximizebox,
+        "panic recovery must restore the target before its queued remove runs"
+    );
+    assert!(
+        target_kept_maximizebox_after_drain,
+        "a queued remove must be skipped after panic recovery drains tracking"
+    );
+}
 
 #[test]
 fn test_snap_disable_on_tile() {
@@ -15203,6 +16839,302 @@ fn test_failed_resume_does_not_park_or_sync_taskbar() {
 }
 
 #[test]
+fn test_display_change_retry_pauses_when_original_worker_is_still_running() {
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    state.injected_display_monitors = Some(test_monitors());
+    state.paused = false;
+    state.layout_apply_timeout = Duration::from_millis(10);
+    state.workspaces.get_mut(&1).unwrap()[0]
+        .insert_window(100, Some(800))
+        .unwrap();
+    state
+        .injected_window_info
+        .insert(100, make_test_window_info(100));
+    state.injected_apply_placements_behavior = Some(TestApplyPlacementsBehavior::SleepAndSucceed(
+        Duration::from_millis(250),
+    ));
+
+    state.handle_window_event(WindowEvent::DisplayChange);
+    assert!(state.display_change_apply_retry.is_some());
+    let generation = pending_display_change_retry_generation(&state);
+    let apply_epoch = state.apply_epoch.load(Ordering::SeqCst);
+
+    state
+        .run_display_change_apply_retry(generation.wrapping_add(1))
+        .expect("a stale retry generation should be ignored");
+    assert!(!state.paused);
+    assert!(!state.applying_layout);
+    assert_eq!(state.apply_epoch.load(Ordering::SeqCst), apply_epoch);
+    assert_eq!(pending_display_change_retry_generation(&state), generation);
+
+    state
+        .run_display_change_apply_retry(generation)
+        .expect_err("a still-running original worker should make the matching retry time out");
+    let paused = state.paused;
+    let retry_pending = state.display_change_apply_retry.is_some();
+    let report = state.take_layout_apply_timeout_report();
+    join_pending_test_apply_workers(&mut state);
+
+    assert!(paused, "the blocked retry should pause tiling");
+    assert!(!retry_pending);
+    let report = report.expect("the blocked retry should create a timeout report");
+    assert_eq!(report.timeout, Duration::from_millis(10));
+    assert_eq!(report.candidates.len(), 1);
+    assert_eq!(report.candidates[0].hwnd, 100);
+}
+
+#[test]
+fn test_display_change_timeout_schedules_retry_without_pausing() {
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    state.injected_display_monitors = Some(test_monitors());
+    state.paused = false;
+    state.layout_apply_timeout = Duration::from_millis(10);
+    state.injected_apply_placements_behavior = Some(TestApplyPlacementsBehavior::SleepAndSucceed(
+        Duration::from_millis(40),
+    ));
+
+    state.handle_window_event(WindowEvent::DisplayChange);
+
+    assert!(
+        !state.paused,
+        "display-change timeout should not pause tiling"
+    );
+    assert!(
+        state.pending_layout_apply_timeout_report.is_none(),
+        "display-change timeout should not create a timeout report"
+    );
+    assert!(
+        state.display_change_apply_retry.is_some(),
+        "display-change timeout should schedule its one retry"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while !state.pending_apply_workers[0].is_finished() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "deferred worker should finish"
+        );
+        std::thread::yield_now();
+    }
+    state.injected_apply_placements_behavior =
+        Some(TestApplyPlacementsBehavior::SleepAndSucceed(Duration::ZERO));
+    state
+        .apply_layout()
+        .expect("a later placement should reap the deferred worker and succeed");
+    assert!(state.pending_apply_workers.is_empty());
+    assert_eq!(
+        state.late_worker_recovery_count.load(Ordering::SeqCst),
+        0,
+        "a deferred display-change worker must not recover before its retry"
+    );
+    assert_eq!(
+        state
+            .late_apply_worker_reap_recovery_count
+            .load(Ordering::SeqCst),
+        0,
+        "reaping the deferred worker must not request late-worker recovery"
+    );
+}
+
+#[test]
+fn test_manual_resume_releases_deferred_worker_recovery_when_apply_is_blocked() {
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    state.injected_display_monitors = Some(test_monitors());
+    state.paused = false;
+    state.layout_apply_timeout = Duration::from_millis(10);
+    state.injected_apply_placements_behavior = Some(TestApplyPlacementsBehavior::SleepAndSucceed(
+        Duration::from_millis(250),
+    ));
+
+    state.handle_window_event(WindowEvent::DisplayChange);
+    assert!(state.display_change_apply_retry.is_some());
+    assert_eq!(state.suppressed_late_recovery_workers.len(), 1);
+
+    state
+        .toggle_pause("test pause")
+        .expect("manual pause should succeed");
+    state
+        .toggle_pause("test resume")
+        .expect_err("resume must not overlap the still-running apply worker");
+
+    assert!(
+        state.paused,
+        "failed resume should restore the paused state"
+    );
+    assert!(state.display_change_apply_retry.is_none());
+    assert!(state.suppressed_late_recovery_workers.is_empty());
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while !state.pending_apply_workers[0].is_finished() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "deferred worker should finish"
+        );
+        std::thread::yield_now();
+    }
+    assert_eq!(
+        state.late_worker_recovery_count.load(Ordering::SeqCst),
+        1,
+        "a deferred worker must recover late if manual resume drops its retry"
+    );
+    join_pending_test_apply_workers(&mut state);
+}
+
+#[test]
+fn test_shutdown_reenables_deferred_worker_late_recovery() {
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    state.injected_display_monitors = Some(test_monitors());
+    state.paused = false;
+    state.layout_apply_timeout = Duration::from_millis(10);
+    state.injected_apply_placements_behavior = Some(TestApplyPlacementsBehavior::SleepAndSucceed(
+        Duration::from_millis(250),
+    ));
+
+    state.handle_window_event(WindowEvent::DisplayChange);
+    assert!(state.display_change_apply_retry.is_some());
+    assert_eq!(state.suppressed_late_recovery_workers.len(), 1);
+    assert!(!state.pending_apply_workers[0].is_finished());
+
+    let workers = state.begin_shutdown_or_revert();
+    for worker in workers {
+        worker
+            .join()
+            .expect("shutdown should join the deferred worker");
+    }
+
+    assert_eq!(
+        state.late_worker_recovery_count.load(Ordering::SeqCst),
+        1,
+        "a deferred worker finishing after shutdown begins must recover visibility"
+    );
+}
+
+#[test]
+fn test_successful_apply_clears_pending_display_change_retry() {
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    state.injected_display_monitors = Some(test_monitors());
+    state.paused = false;
+    state.layout_apply_timeout = Duration::from_millis(10);
+    state.workspaces.get_mut(&1).unwrap()[0]
+        .insert_window(100, Some(800))
+        .unwrap();
+    state
+        .injected_window_info
+        .insert(100, make_test_window_info(100));
+    state.injected_apply_placements_behavior = Some(TestApplyPlacementsBehavior::SleepAndSucceed(
+        Duration::from_millis(40),
+    ));
+
+    state.handle_window_event(WindowEvent::DisplayChange);
+    assert!(state.display_change_apply_retry.is_some());
+    std::thread::sleep(Duration::from_millis(50));
+    state.injected_apply_placements_behavior = Some(TestApplyPlacementsBehavior::SleepAndSucceed(
+        Duration::from_millis(1),
+    ));
+
+    state
+        .apply_layout()
+        .expect("the later apply should succeed");
+
+    assert!(state.display_change_apply_retry.is_none());
+    assert!(!state.display_change_apply_retry_used);
+    join_pending_test_apply_workers(&mut state);
+}
+
+#[test]
+fn test_display_change_apply_retry_timeout_uses_normal_pause_path() {
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    state.injected_display_monitors = Some(test_monitors());
+    state.paused = false;
+    state.layout_apply_timeout = Duration::from_millis(10);
+    state.injected_apply_placements_behavior = Some(TestApplyPlacementsBehavior::SleepAndSucceed(
+        Duration::from_millis(40),
+    ));
+
+    state.handle_window_event(WindowEvent::DisplayChange);
+    assert!(state.display_change_apply_retry.is_some());
+    std::thread::sleep(Duration::from_millis(50));
+
+    state
+        .run_display_change_apply_retry(pending_display_change_retry_generation(&state))
+        .expect_err("the retry placement should also time out");
+
+    assert!(state.paused, "a second timeout should pause tiling");
+    assert!(state.display_change_apply_retry.is_none());
+    let report = state
+        .take_layout_apply_timeout_report()
+        .expect("the retry timeout should create the normal timeout report");
+    assert_eq!(report.timeout, Duration::from_millis(10));
+    join_pending_test_apply_workers(&mut state);
+}
+
+#[test]
+fn test_display_change_apply_retry_success_resets_allowance() {
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    state.injected_display_monitors = Some(test_monitors());
+    state.paused = false;
+    state.layout_apply_timeout = Duration::from_millis(10);
+    state.injected_apply_placements_behavior = Some(TestApplyPlacementsBehavior::SleepAndSucceed(
+        Duration::from_millis(40),
+    ));
+
+    state.handle_window_event(WindowEvent::DisplayChange);
+    assert!(state.display_change_apply_retry.is_some());
+    std::thread::sleep(Duration::from_millis(50));
+    state.injected_apply_placements_behavior = Some(TestApplyPlacementsBehavior::SleepAndSucceed(
+        Duration::from_millis(1),
+    ));
+
+    state
+        .run_display_change_apply_retry(pending_display_change_retry_generation(&state))
+        .expect("the retry placement should succeed");
+
+    assert!(!state.paused);
+    assert!(state.display_change_apply_retry.is_none());
+    assert!(!state.display_change_apply_retry_used);
+
+    state.injected_apply_placements_behavior = Some(TestApplyPlacementsBehavior::SleepAndSucceed(
+        Duration::from_millis(40),
+    ));
+    state.handle_window_event(WindowEvent::DisplayChange);
+    assert!(!state.paused);
+    assert!(state.display_change_apply_retry.is_some());
+    assert!(state.display_change_apply_retry_used);
+    assert!(state.pending_layout_apply_timeout_report.is_none());
+    join_pending_test_apply_workers(&mut state);
+}
+
+#[test]
+fn test_display_change_apply_retry_while_paused_does_not_apply() {
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    state.injected_display_monitors = Some(test_monitors());
+    state.paused = false;
+    state.layout_apply_timeout = Duration::from_millis(10);
+    state.injected_apply_placements_behavior = Some(TestApplyPlacementsBehavior::SleepAndSucceed(
+        Duration::from_millis(40),
+    ));
+
+    state.handle_window_event(WindowEvent::DisplayChange);
+    assert!(state.display_change_apply_retry.is_some());
+    state.paused = true;
+    let apply_epoch = state.apply_epoch.load(Ordering::SeqCst);
+
+    state
+        .run_display_change_apply_retry(pending_display_change_retry_generation(&state))
+        .expect("a paused retry should be ignored");
+
+    assert!(state.paused);
+    assert!(state.display_change_apply_retry.is_none());
+    assert_eq!(state.apply_epoch.load(Ordering::SeqCst), apply_epoch);
+    assert_eq!(
+        state
+            .paused_display_retry_recovery_count
+            .load(Ordering::SeqCst),
+        1,
+        "dropping a retry while paused must request visibility recovery"
+    );
+    join_pending_test_apply_workers(&mut state);
+}
+
+#[test]
 fn test_display_change_event_parks_inactive_windows_and_syncs_taskbar() {
     let active = ParkProbeWindow::new(false);
     let inactive_tiled = ParkProbeWindow::new(false);
@@ -15279,12 +17211,17 @@ fn test_paused_display_change_event_resyncs_without_moving_and_syncs_taskbar() {
 
 #[test]
 fn test_restore_structure_reapplies_snap_suppression() {
+    let _serial = REAL_WINDOW_STYLE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     use windows::core::w;
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DestroyWindow, GetWindowLongW, GWL_STYLE, WS_CAPTION, WS_EX_NOACTIVATE,
         WS_EX_TOOLWINDOW, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU, WS_THICKFRAME,
     };
+
+    let wait_for_style_requests = pump_window_style_worker_until_idle;
 
     struct TestWindow(HWND);
     impl TestWindow {
@@ -15323,6 +17260,7 @@ fn test_restore_structure_reapplies_snap_suppression() {
     impl Drop for TestWindow {
         fn drop(&mut self) {
             let _ = leopardwm_platform_win32::restore_maximizebox(self.id());
+            pump_window_style_worker_until_idle();
             let _ = unsafe { DestroyWindow(self.0) };
         }
     }
@@ -15385,6 +17323,7 @@ fn test_restore_structure_reapplies_snap_suppression() {
 
         for _ in 0..2 {
             let restored = state.restore_workspace_structure(&snapshot);
+            wait_for_style_requests();
             assert_eq!(restored, HashSet::from([(1, 0), (2, 1)]));
             assert_eq!(
                 windows.map(|window| window.style()),
@@ -15400,6 +17339,7 @@ fn test_restore_structure_reapplies_snap_suppression() {
         }
 
         state.restore_snap_for_all_windows();
+        wait_for_style_requests();
         assert!(state.snap_disabled_hwnds.is_empty());
         assert_eq!(windows.map(|window| window.style()), original_styles);
     }
@@ -15812,3 +17752,12 @@ fn test_full_display_invalidation_clears_widths_and_heights() {
         assert_eq!(workspace.columns()[0].width(), 400);
     }
 }
+
+#[path = "maximized_admission_tests.rs"]
+mod maximized_admission_tests;
+
+#[path = "maximized_admission_regression.rs"]
+mod maximized_admission_regression;
+
+#[path = "display_change_regression.rs"]
+mod display_change_regression;

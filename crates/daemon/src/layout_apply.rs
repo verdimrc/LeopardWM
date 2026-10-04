@@ -56,6 +56,41 @@ fn bounded_timeout_diagnostic(value: String) -> Option<String> {
     Some(bounded)
 }
 
+fn collect_layout_apply_candidates(
+    window_ids: &[u64],
+    lookup_window_info: impl Fn(u64) -> Option<leopardwm_platform_win32::WindowInfo>,
+) -> Vec<LayoutApplyTimeoutCandidate> {
+    let mut executable_by_pid: HashMap<u32, Option<String>> = HashMap::new();
+
+    window_ids
+        .iter()
+        .map(|&hwnd| {
+            let Some(info) = lookup_window_info(hwnd) else {
+                return LayoutApplyTimeoutCandidate {
+                    hwnd,
+                    class_name: None,
+                    title: None,
+                    executable: None,
+                };
+            };
+            let executable = executable_by_pid
+                .entry(info.process_id)
+                .or_insert_with(|| {
+                    leopardwm_platform_win32::get_process_executable(info.process_id)
+                })
+                .clone()
+                .and_then(bounded_timeout_diagnostic);
+
+            LayoutApplyTimeoutCandidate {
+                hwnd,
+                class_name: bounded_timeout_diagnostic(info.class_name),
+                title: bounded_timeout_diagnostic(info.title),
+                executable,
+            }
+        })
+        .collect()
+}
+
 fn run_layout_apply_recovery_pass(window_ids: &[u64], context: &str) {
     #[cfg(not(test))]
     run_visibility_recovery_pass(window_ids, context);
@@ -205,7 +240,9 @@ impl AppState {
         let now = std::time::Instant::now();
         for hwnd in maximized {
             self.window_last_maximized_at.insert(*hwnd, now);
-            self.stop_ghosting_window_visuals(*hwnd);
+            if !self.pending_maximized_admission_restores.contains(hwnd) {
+                self.stop_ghosting_window_visuals(*hwnd);
+            }
         }
     }
 
@@ -270,13 +307,16 @@ impl AppState {
                 {
                     return true;
                 }
-                let settling = crate::event_handler::defer_snapback_while_settling(
-                    self.window_managed_at.get(&placement.window_id).copied(),
-                    self.window_last_maximized_at
-                        .get(&placement.window_id)
-                        .copied(),
-                    now,
-                );
+                let settling = self
+                    .pending_maximized_admission_restores
+                    .contains(&placement.window_id)
+                    || crate::event_handler::defer_snapback_while_settling(
+                        self.window_managed_at.get(&placement.window_id).copied(),
+                        self.window_last_maximized_at
+                            .get(&placement.window_id)
+                            .copied(),
+                        now,
+                    );
                 let maximized = maximized.contains(&placement.window_id);
                 if !should_dispatch_visible_tiled_placement(
                     maximized,
@@ -346,25 +386,47 @@ impl AppState {
     /// Join any finished timed-out apply workers so the pending list does not grow indefinitely.
     /// Returns the number of workers reaped in this pass.
     pub(crate) fn reap_finished_pending_apply_workers(&mut self) -> usize {
+        self.reap_finished_pending_apply_workers_inner().0
+    }
+
+    fn reap_finished_pending_apply_workers_inner(&mut self) -> (usize, bool) {
         if self.pending_apply_workers.is_empty() {
-            return 0;
+            return (0, false);
         }
         let mut still_running = Vec::with_capacity(self.pending_apply_workers.len());
         let mut reaped = 0usize;
+        let mut needs_recovery = false;
         for handle in self.pending_apply_workers.drain(..) {
             if handle.is_finished() {
+                let is_suppressed = self
+                    .suppressed_late_recovery_workers
+                    .remove(&handle.thread().id())
+                    .is_some();
                 let _ = handle.join();
                 reaped += 1;
+                needs_recovery |= !is_suppressed;
             } else {
                 still_running.push(handle);
             }
         }
         self.pending_apply_workers = still_running;
-        reaped
+        (reaped, needs_recovery)
+    }
+
+    fn reap_finished_pending_apply_workers_with_recovery(&mut self) {
+        let (_, needs_recovery) = self.reap_finished_pending_apply_workers_inner();
+        if needs_recovery {
+            let managed_window_ids = self.all_managed_window_ids();
+            run_layout_apply_recovery_pass(&managed_window_ids, "late-apply-worker");
+            #[cfg(test)]
+            self.late_apply_worker_reap_recovery_count
+                .fetch_add(1, Ordering::SeqCst);
+        }
     }
 
     /// Mark shutdown/revert in progress and take ownership of any timed-out apply workers.
     pub(crate) fn begin_shutdown_or_revert(&mut self) -> Vec<std::thread::JoinHandle<()>> {
+        self.resume_deferred_apply_worker_recovery();
         self.apply_worker_cancelled.store(true, Ordering::SeqCst);
         self.apply_epoch.fetch_add(1, Ordering::SeqCst);
         let pending_apply_workers = std::mem::take(&mut self.pending_apply_workers);
@@ -484,46 +546,54 @@ impl AppState {
         &self,
         window_ids: &[u64],
     ) -> Vec<LayoutApplyTimeoutCandidate> {
-        let mut executable_by_pid: HashMap<u32, Option<String>> = HashMap::new();
+        collect_layout_apply_candidates(window_ids, |hwnd| self.lookup_window_info(hwnd))
+    }
 
-        window_ids
-            .iter()
-            .map(|&hwnd| {
-                let Some(info) = self.lookup_window_info(hwnd) else {
-                    return LayoutApplyTimeoutCandidate {
-                        hwnd,
-                        class_name: None,
-                        title: None,
-                        executable: None,
-                    };
-                };
-                let executable = executable_by_pid
-                    .entry(info.process_id)
-                    .or_insert_with(|| {
-                        leopardwm_platform_win32::get_process_executable(info.process_id)
-                    })
-                    .clone()
-                    .and_then(bounded_timeout_diagnostic);
+    pub(crate) fn resume_deferred_apply_worker_recovery(&mut self) {
+        for suppress_late_recovery in self.suppressed_late_recovery_workers.values() {
+            suppress_late_recovery.store(false, Ordering::SeqCst);
+        }
+        self.suppressed_late_recovery_workers.clear();
+    }
 
-                LayoutApplyTimeoutCandidate {
-                    hwnd,
-                    class_name: bounded_timeout_diagnostic(info.class_name),
-                    title: bounded_timeout_diagnostic(info.title),
-                    executable,
-                }
-            })
-            .collect()
+    fn pause_after_layout_apply_timeout(
+        &mut self,
+        timeout: std::time::Duration,
+        candidate_window_ids: &[u64],
+    ) -> anyhow::Error {
+        self.display_change_apply_retry = None;
+        self.paused = true;
+        self.resume_deferred_apply_worker_recovery();
+        let msg = layout_apply_timeout_message(timeout);
+        let report = LayoutApplyTimeoutReport {
+            timeout,
+            candidates: self.collect_layout_apply_timeout_candidates(candidate_window_ids),
+        };
+        warn!(
+            "{} Timed-out placement batch contained {} candidate window(s); batch membership does not prove which window blocked placement.",
+            msg,
+            report.candidates.len()
+        );
+        for candidate in &report.candidates {
+            warn!(
+                "Timed-out placement batch candidate (not a proven blocker): hwnd={:#x} class={:?} title={:?} executable={:?}",
+                candidate.hwnd,
+                candidate.class_name,
+                candidate.title,
+                candidate.executable
+            );
+        }
+        self.pending_layout_apply_timeout_report = Some(report);
+        let managed_window_ids = self.all_managed_window_ids();
+        run_layout_apply_recovery_pass(&managed_window_ids, "apply-timeout");
+        anyhow!(msg)
     }
 
     /// Recalculate layout and apply placements for all monitors.
     /// Uses animated offsets if any workspace has an active animation.
     /// No-op when tiling is paused.
     pub(crate) fn apply_layout(&mut self) -> Result<LayoutApplyOutcome> {
-        let reaped_workers = self.reap_finished_pending_apply_workers();
-        if reaped_workers > 0 {
-            let managed_window_ids = self.all_managed_window_ids();
-            run_layout_apply_recovery_pass(&managed_window_ids, "late-apply-worker");
-        }
+        self.reap_finished_pending_apply_workers_with_recovery();
 
         if self.paused {
             return Ok(LayoutApplyOutcome::Completed);
@@ -636,6 +706,8 @@ impl AppState {
             && !bypass_fast_path
         {
             self.applying_layout = false;
+            self.display_change_apply_retry_used = false;
+            self.display_change_apply_retry = None;
             self.request_save_if_changed();
             return Ok(LayoutApplyOutcome::Completed);
         }
@@ -658,6 +730,8 @@ impl AppState {
             );
             self.abandon_physical_request(physical_request_id, physical_invalidation_id);
             self.applying_layout = false;
+            self.display_change_apply_retry_used = false;
+            self.display_change_apply_retry = None;
             self.finalize_layout_success();
             return Ok(LayoutApplyOutcome::Completed);
         }
@@ -674,17 +748,18 @@ impl AppState {
         );
 
         let timeout = self.layout_apply_timeout;
-        let (rx, worker_handle) = match self.spawn_apply_worker(dispatched_placements) {
-            Ok(worker) => worker,
-            Err(error) => {
-                self.abandon_physical_request(physical_request_id, physical_invalidation_id);
-                self.applying_layout = false;
-                if preserve_recovery_post_animation_nudge {
-                    self.post_animation_nudge_pending = true;
+        let (rx, worker_handle, suppress_late_recovery) =
+            match self.spawn_apply_worker(dispatched_placements) {
+                Ok(worker) => worker,
+                Err(error) => {
+                    self.abandon_physical_request(physical_request_id, physical_invalidation_id);
+                    self.applying_layout = false;
+                    if preserve_recovery_post_animation_nudge {
+                        self.post_animation_nudge_pending = true;
+                    }
+                    return Err(error);
                 }
-                return Err(error);
-            }
-        };
+            };
 
         let mut deferred_by_recovery_barrier = false;
         let result = match rx.recv_timeout(timeout) {
@@ -768,36 +843,54 @@ impl AppState {
                 }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                let defer_to_display_retry =
+                    self.display_change_apply_in_progress && !self.display_change_apply_retry_used;
+                if defer_to_display_retry {
+                    // Publish suppression before invalidating the epoch so the worker cannot
+                    // observe this timeout's cancellation without also observing this policy.
+                    suppress_late_recovery.store(true, Ordering::SeqCst);
+                    self.suppressed_late_recovery_workers
+                        .insert(worker_handle.thread().id(), suppress_late_recovery.clone());
+                }
                 self.abandon_physical_request(physical_request_id, physical_invalidation_id);
-                self.paused = true;
                 // Invalidate this apply epoch so late-starting workers bail before placement calls.
                 self.apply_epoch.fetch_add(1, Ordering::SeqCst);
                 self.pending_apply_workers.push(worker_handle);
                 self.moved_or_resized_suppression.clear();
-                let msg = layout_apply_timeout_message(timeout);
-                let report = LayoutApplyTimeoutReport {
-                    timeout,
-                    candidates: self
-                        .collect_layout_apply_timeout_candidates(&timeout_candidate_ids),
-                };
-                warn!(
-                    "{} Timed-out placement batch contained {} candidate window(s); batch membership does not prove which window blocked placement.",
-                    msg,
-                    report.candidates.len()
-                );
-                for candidate in &report.candidates {
-                    warn!(
-                        "Timed-out placement batch candidate (not a proven blocker): hwnd={:#x} class={:?} title={:?} executable={:?}",
-                        candidate.hwnd,
-                        candidate.class_name,
-                        candidate.title,
-                        candidate.executable
+                if defer_to_display_retry {
+                    self.display_change_apply_retry_used = true;
+                    self.display_change_apply_retry_generation =
+                        self.display_change_apply_retry_generation.wrapping_add(1);
+                    self.display_change_apply_retry = Some(DisplayChangeApplyRetry {
+                        generation: self.display_change_apply_retry_generation,
+                        timeout,
+                        candidate_window_ids: timeout_candidate_ids.clone(),
+                    });
+                    let candidates =
+                        self.collect_layout_apply_timeout_candidates(&timeout_candidate_ids);
+                    let msg = format!(
+                        "Layout application timed out after {} ms during display reconciliation; retrying once in {} s before pausing tiling",
+                        timeout.as_millis(),
+                        crate::state::DISPLAY_CHANGE_APPLY_RETRY_DELAY.as_secs()
                     );
+                    warn!(
+                        "{} Timed-out placement batch contained {} candidate window(s); batch membership does not prove which window blocked placement.",
+                        msg,
+                        candidates.len()
+                    );
+                    for candidate in &candidates {
+                        warn!(
+                            "Timed-out placement batch candidate (not a proven blocker): hwnd={:#x} class={:?} title={:?} executable={:?}",
+                            candidate.hwnd,
+                            candidate.class_name,
+                            candidate.title,
+                            candidate.executable
+                        );
+                    }
+                    Err(anyhow!(msg))
+                } else {
+                    Err(self.pause_after_layout_apply_timeout(timeout, &timeout_candidate_ids))
                 }
-                self.pending_layout_apply_timeout_report = Some(report);
-                let managed_window_ids = self.all_managed_window_ids();
-                run_layout_apply_recovery_pass(&managed_window_ids, "apply-timeout");
-                Err(anyhow!(msg))
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 let _ = worker_handle.join();
@@ -813,6 +906,11 @@ impl AppState {
             self.post_animation_nudge_pending = true;
         }
 
+        if result.is_ok() && !deferred_by_recovery_barrier {
+            self.display_change_apply_retry_used = false;
+            self.display_change_apply_retry = None;
+        }
+
         // Reposition border to track the focused window after layout changes.
         if result.is_ok() && !deferred_by_recovery_barrier {
             self.finalize_layout_success();
@@ -823,6 +921,45 @@ impl AppState {
         } else {
             result.map(|()| LayoutApplyOutcome::Completed)
         }
+    }
+
+    pub(crate) fn run_display_change_apply_retry(&mut self, generation: u64) -> Result<()> {
+        if !self
+            .display_change_apply_retry
+            .as_ref()
+            .is_some_and(|retry| retry.generation == generation)
+        {
+            return Ok(());
+        }
+        let retry = self
+            .display_change_apply_retry
+            .take()
+            .expect("matching retry generation was checked above");
+        if self.paused {
+            self.resume_deferred_apply_worker_recovery();
+            let managed_window_ids = self.all_managed_window_ids();
+            run_layout_apply_recovery_pass(
+                &managed_window_ids,
+                "display-change-retry-dropped-while-paused",
+            );
+            #[cfg(test)]
+            self.paused_display_retry_recovery_count
+                .fetch_add(1, Ordering::SeqCst);
+            return Ok(());
+        }
+        self.reap_finished_pending_apply_workers_with_recovery();
+        if !self.pending_apply_workers.is_empty() {
+            return Err(
+                self.pause_after_layout_apply_timeout(retry.timeout, &retry.candidate_window_ids)
+            );
+        }
+        // Force timed-out placements past the unchanged-layout fast path.
+        self.last_placed_layout_rects.clear();
+        self.display_change_apply_in_progress = true;
+        let result = self.apply_layout();
+        self.display_change_apply_in_progress = false;
+        result?;
+        Ok(())
     }
 
     /// Collect animated placements for every monitor's active workspace, with debug logging.
@@ -935,8 +1072,10 @@ impl AppState {
     ) -> Result<(
         std::sync::mpsc::Receiver<ApplyWorkerMsg>,
         std::thread::JoinHandle<()>,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
     )> {
         let platform_config = self.platform_config.clone();
+        let display_change_apply = self.display_change_apply_in_progress;
         let apply_worker_cancelled = self.apply_worker_cancelled.clone();
         let apply_epoch_ref = self.apply_epoch.clone();
         let apply_epoch = apply_epoch_ref.fetch_add(1, Ordering::SeqCst) + 1;
@@ -957,6 +1096,8 @@ impl AppState {
         #[cfg(test)]
         let late_worker_recovery_count = self.late_worker_recovery_count.clone();
 
+        let suppress_late_recovery = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let suppress_late_recovery_worker = suppress_late_recovery.clone();
         let (tx, rx) = std::sync::mpsc::channel::<ApplyWorkerMsg>();
         let spawn_result = std::thread::Builder::new()
             .name("leopardwm-apply-layout".to_string())
@@ -1054,12 +1195,14 @@ impl AppState {
                             }
                         };
                     if should_cancel() {
-                        run_layout_apply_recovery_pass(
-                            &apply_window_ids,
-                            "apply-cancelled-late-worker",
-                        );
-                        #[cfg(test)]
-                        late_worker_recovery_count.fetch_add(1, Ordering::SeqCst);
+                        if !suppress_late_recovery_worker.load(Ordering::SeqCst) {
+                            run_layout_apply_recovery_pass(
+                                &apply_window_ids,
+                                "apply-cancelled-late-worker",
+                            );
+                            #[cfg(test)]
+                            late_worker_recovery_count.fetch_add(1, Ordering::SeqCst);
+                        }
                         let _ = tx.send((Ok(()), Vec::new(), Vec::new(), Vec::new(), Vec::new()));
                         return;
                     }
@@ -1083,19 +1226,47 @@ impl AppState {
                     height_violations,
                     maximized_skipped_window_ids,
                     landings,
-                ) = match leopardwm_platform_win32::apply_placements(
-                    &all_placements,
-                    &platform_config,
-                    None,
-                    post_animation_nudge,
-                ) {
-                    Ok(r) => (
-                        Ok(()),
-                        r.width_violations,
-                        r.height_violations,
-                        r.maximized_skipped_window_ids,
-                        r.landings,
-                    ),
+                ) = match if display_change_apply {
+                    leopardwm_platform_win32::apply_display_change_placements(
+                        &all_placements,
+                        &platform_config,
+                        post_animation_nudge,
+                    )
+                } else {
+                    leopardwm_platform_win32::apply_placements(
+                        &all_placements,
+                        &platform_config,
+                        None,
+                        post_animation_nudge,
+                    )
+                    .map(|result| (result, std::collections::HashSet::new()))
+                } {
+                    Ok((r, unresponsive_window_ids)) => {
+                        if !unresponsive_window_ids.is_empty() {
+                            let candidates = collect_layout_apply_candidates(
+                                &unresponsive_window_ids.iter().copied().collect::<Vec<_>>(),
+                                leopardwm_platform_win32::get_window_info,
+                            );
+                            let windows: Vec<_> = candidates
+                                .iter()
+                                .map(|candidate| format!(
+                                    "hwnd={:#x} class={:?} title={:?} executable={:?}",
+                                    candidate.hwnd, candidate.class_name, candidate.title, candidate.executable
+                                ))
+                                .collect();
+                            warn!(
+                                "Display-change placement queued asynchronously for unresponsive windows: {}",
+                                windows.join("; ")
+                            );
+                        }
+                        (
+                            Ok(()),
+                            r.width_violations,
+                            r.height_violations,
+                            r.maximized_skipped_window_ids,
+                            r.landings,
+                        )
+                    },
                     Err(e) => (
                         Err(anyhow!(e.to_string())),
                         Vec::new(),
@@ -1105,12 +1276,14 @@ impl AppState {
                     ),
                 };
                 if should_cancel() {
-                    run_layout_apply_recovery_pass(
-                        &apply_window_ids,
-                        "apply-cancelled-late-worker",
-                    );
-                    #[cfg(test)]
-                    late_worker_recovery_count.fetch_add(1, Ordering::SeqCst);
+                    if !suppress_late_recovery_worker.load(Ordering::SeqCst) {
+                        run_layout_apply_recovery_pass(
+                            &apply_window_ids,
+                            "apply-cancelled-late-worker",
+                        );
+                        #[cfg(test)]
+                        late_worker_recovery_count.fetch_add(1, Ordering::SeqCst);
+                    }
                     let _ = tx.send((Ok(()), Vec::new(), Vec::new(), Vec::new(), Vec::new()));
                     return;
                 }
@@ -1124,7 +1297,7 @@ impl AppState {
             });
 
         match spawn_result {
-            Ok(handle) => Ok((rx, handle)),
+            Ok(handle) => Ok((rx, handle, suppress_late_recovery)),
             Err(e) => {
                 self.applying_layout = false;
                 Err(anyhow!("Failed to spawn layout worker thread: {}", e))

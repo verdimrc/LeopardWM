@@ -5,7 +5,7 @@ use crate::state::{
     AppState, ApplicationFullscreenState, DragHintAction, DragState, ElevationBlockedRecord,
     HiddenColumnWidth, LastWindowDepartureOrigin, PendingLastWindowDeparture, RecentlyHiddenEntry,
     EDIT_CONFIG_PULL_TTL, FALLBACK_VIEWPORT_HEIGHT, FALLBACK_VIEWPORT_WIDTH, RECENTLY_HIDDEN_TTL,
-    TRANSIENT_WINDOW_THRESHOLD,
+    RECENTLY_RESTORED_MANAGED_WINDOW_TTL, TRANSIENT_WINDOW_THRESHOLD,
 };
 use crate::ui_sync::DepartureCause;
 use leopardwm_core_layout::{Rect, Workspace};
@@ -15,6 +15,8 @@ use leopardwm_platform_win32::{
     find_monitor_for_rect, get_process_executable, is_shift_key_pressed, MonitorInfo, WindowEvent,
 };
 use tracing::{debug, info, warn};
+
+pub(crate) const MINIMIZE_HANDOFF_WINDOW_MS: u32 = 500; // Windows timestamps post-minimize focus handoff events after the minimize.
 
 /// How long after a window is first managed to treat it as still settling its
 /// initial geometry.
@@ -49,6 +51,42 @@ pub(crate) fn defer_snapback_while_settling(
     let recently_maximized = last_maximized_at
         .is_some_and(|t| now.saturating_duration_since(t) < SNAPBACK_MAXIMIZE_GRACE);
     settling && recently_maximized
+}
+
+fn insert_admitted_tile(
+    workspace: &mut Workspace,
+    hwnd: u64,
+    width: Option<i32>,
+    rule_slot: Option<usize>,
+    in_column: bool,
+    take_focus: bool,
+    recreated_slot: Option<&crate::recreated_window_slot::RecreatedWindowSlot>,
+) -> bool {
+    if let Some(slot) = recreated_slot {
+        slot.insert(workspace, hwnd, take_focus).is_ok()
+    } else if let Some(slot) = rule_slot {
+        if take_focus {
+            workspace.insert_window_at_column(hwnd, width, slot).is_ok()
+        } else {
+            workspace
+                .insert_window_at_column_no_focus(hwnd, width, slot)
+                .is_ok()
+        }
+    } else if in_column {
+        let col = workspace.focused_column_index();
+        let row = workspace.focused_window_index_in_column() + 1;
+        let ok = workspace.insert_window_in_column_at(hwnd, col, row).is_ok();
+        if ok && take_focus {
+            if let Err(e) = workspace.focus_window(hwnd) {
+                warn!("Focusing new in-column window {} failed: {:?}", hwnd, e);
+            }
+        }
+        ok
+    } else if take_focus {
+        workspace.insert_window(hwnd, width).is_ok()
+    } else {
+        workspace.insert_window_no_focus(hwnd, width).is_ok()
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -344,6 +382,7 @@ pub(crate) enum AdmitOutcome {
     GatedIgnored,
     TransientSuppressed,
     NoWindowInfo,
+    TopmostPopup,
     #[cfg_attr(test, allow(dead_code))]
     ShellCloaked,
     ElevationBlocked,
@@ -356,18 +395,40 @@ pub(crate) enum AdmitOutcome {
 impl AppState {
     /// Handle a window lifecycle event.
     pub(crate) fn handle_window_event(&mut self, event: WindowEvent) {
+        if let Some(hwnd) = match &event {
+            WindowEvent::Created(hwnd, _)
+            | WindowEvent::Destroyed(hwnd)
+            | WindowEvent::Hidden(hwnd, _)
+            | WindowEvent::Focused(hwnd, _)
+            | WindowEvent::Minimized(hwnd, _)
+            | WindowEvent::Restored(hwnd)
+            | WindowEvent::MovedOrResized(hwnd)
+            | WindowEvent::MoveSizeStart(hwnd)
+            | WindowEvent::MoveSizeEnd(hwnd)
+            | WindowEvent::TitleChanged(hwnd)
+            | WindowEvent::MaximizedAdmissionRestored {
+                window_id: hwnd, ..
+            } => Some(*hwnd),
+            _ => None,
+        } {
+            if leopardwm_platform_win32::focus_placeholder::is_focus_placeholder(hwnd) {
+                return;
+            }
+        }
+
         // Get window_id from event for validation (DisplayChange and MouseEnterWindow have no validation needed)
         let window_id = match &event {
             WindowEvent::Created(id, _)
             | WindowEvent::Destroyed(id)
             | WindowEvent::Hidden(id, _)
             | WindowEvent::Focused(id, _)
-            | WindowEvent::Minimized(id)
+            | WindowEvent::Minimized(id, _)
             | WindowEvent::Restored(id)
             | WindowEvent::MovedOrResized(id)
             | WindowEvent::MoveSizeStart(id)
             | WindowEvent::MoveSizeEnd(id)
-            | WindowEvent::TitleChanged(id) => Some(*id),
+            | WindowEvent::TitleChanged(id)
+            | WindowEvent::MaximizedAdmissionRestored { window_id: id, .. } => Some(*id),
             WindowEvent::DisplayChange
             | WindowEvent::WorkAreaChanged
             | WindowEvent::MouseEnterWindow(_)
@@ -400,8 +461,21 @@ impl AppState {
             WindowEvent::Focused(hwnd, event_time_ms) => {
                 self.on_window_focused(hwnd, event_time_ms)
             }
-            WindowEvent::Minimized(hwnd) => self.on_window_minimized(hwnd),
+            WindowEvent::Minimized(hwnd, os_event_time_ms) => {
+                self.on_window_minimized_from_event(hwnd, os_event_time_ms)
+            }
             WindowEvent::Restored(hwnd) => self.on_window_restored(hwnd),
+            WindowEvent::MaximizedAdmissionRestored {
+                window_id,
+                managed_lifetime_token,
+                still_maximized,
+            } => {
+                self.on_maximized_admission_restored(
+                    window_id,
+                    managed_lifetime_token,
+                    still_maximized,
+                );
+            }
             WindowEvent::MoveSizeStart(hwnd) => self.on_move_size_start(hwnd),
             WindowEvent::MoveSizeEnd(hwnd) => self.on_move_size_end(hwnd),
             WindowEvent::MovedOrResized(hwnd) => self.on_window_moved_or_resized(hwnd),
@@ -437,6 +511,56 @@ impl AppState {
         }
     }
 
+    fn queue_maximized_admission_restore(
+        &mut self,
+        hwnd: u64,
+        now: std::time::Instant,
+        queue: &mut impl FnMut(u64) -> Result<bool, leopardwm_platform_win32::Win32Error>,
+        is_maximized: &mut impl FnMut(u64) -> bool,
+    ) {
+        match queue(hwnd) {
+            Ok(true) => {
+                self.pending_maximized_admission_restores.insert(hwnd);
+                self.window_last_maximized_at.insert(hwnd, now);
+            }
+            Ok(false) => {
+                if is_maximized(hwnd) {
+                    self.window_last_maximized_at.insert(hwnd, now);
+                }
+            }
+            Err(error) => {
+                debug!(
+                    "Could not queue maximized admission restore for {}: {:?}",
+                    hwnd, error
+                );
+                if is_maximized(hwnd) {
+                    self.window_last_maximized_at.insert(hwnd, now);
+                }
+            }
+        }
+    }
+
+    fn on_maximized_admission_restored(&mut self, hwnd: u64, token: u64, still_maximized: bool) {
+        if !self.is_managed_member(hwnd) || self.managed_lifetime_tokens.get(&hwnd) != Some(&token)
+        {
+            return;
+        }
+        self.pending_maximized_admission_restores.remove(&hwnd);
+        if still_maximized {
+            self.window_last_maximized_at
+                .insert(hwnd, std::time::Instant::now());
+        } else {
+            self.window_last_maximized_at.remove(&hwnd);
+            self.last_placed_layout_rects.remove(&hwnd);
+            if let Err(error) = self.apply_layout() {
+                warn!(
+                    "Failed to apply layout after maximized admission restore: {}",
+                    error
+                );
+            }
+        }
+    }
+
     /// Handle a window-created event: rules, monitor/workspace placement, insertion.
     /// Take the column width remembered for a hidden window that is now
     /// reappearing, if it hasn't expired and still names this lifetime.
@@ -449,6 +573,54 @@ impl AppState {
             Some(entry.width)
         } else {
             None
+        }
+    }
+
+    /// Pick the monitor for a newly admitted window. A window an app recreates
+    /// after resume returns to the slot its predecessor held (the slot is
+    /// returned so the caller can restore its workspace and column). Otherwise
+    /// `monitor_for_new_window` decides.
+    fn new_window_monitor(
+        &mut self,
+        win_info: &leopardwm_platform_win32::WindowInfo,
+        kind: AdmissionKind,
+        action: config::WindowAction,
+        rule_sticky: bool,
+        tile_on_os_monitor: bool,
+    ) -> (
+        Option<crate::recreated_window_slot::RecreatedWindowSlot>,
+        leopardwm_platform_win32::MonitorId,
+    ) {
+        let recreated_slot = self.take_recreated_window_slot(win_info, kind, action, rule_sticky);
+        let monitor_id = recreated_slot
+            .as_ref()
+            .map(|slot| slot.monitor)
+            .unwrap_or_else(|| self.monitor_for_new_window(&win_info.rect, tile_on_os_monitor));
+        (recreated_slot, monitor_id)
+    }
+
+    /// Initial column width in px for a newly admitted window: a width
+    /// remembered from before the window was hidden takes precedence (so a
+    /// reshown window keeps its size), else the matched rule's `column_width`
+    /// resolved for this monitor. An explicit readmit always uses the rule.
+    fn admission_column_width_px(
+        &mut self,
+        hwnd: u64,
+        kind: AdmissionKind,
+        rule_column_width: Option<&config::CompiledColumnWidth>,
+        monitor_id: leopardwm_platform_win32::MonitorId,
+        viewport_width: i32,
+    ) -> Option<i32> {
+        let display_idx = self.display_index_for(monitor_id);
+        let rule_px = || {
+            rule_column_width
+                .and_then(|cw| cw.resolve(display_idx))
+                .map(|f| ((f * f64::from(viewport_width)).round() as i32).max(100))
+        };
+        if kind == AdmissionKind::ExplicitReadmit {
+            rule_px()
+        } else {
+            self.take_remembered_column_width(hwnd).or_else(rule_px)
         }
     }
 
@@ -658,11 +830,34 @@ impl AppState {
         kind: AdmissionKind,
         admitted_at_event_ms: Option<u32>,
     ) -> AdmitOutcome {
+        self.try_admit_window_at_with_native_ops(
+            hwnd,
+            kind,
+            admitted_at_event_ms,
+            leopardwm_platform_win32::is_window_maximized,
+            leopardwm_platform_win32::queue_maximized_window_restore,
+        )
+    }
+
+    pub(crate) fn try_admit_window_at_with_native_ops(
+        &mut self,
+        hwnd: u64,
+        kind: AdmissionKind,
+        admitted_at_event_ms: Option<u32>,
+        is_maximized: impl FnMut(u64) -> bool,
+        queue_maximized_restore: impl FnMut(u64) -> Result<bool, leopardwm_platform_win32::Win32Error>,
+    ) -> AdmitOutcome {
         // Depart before the body. Its own duplicate check then sees a non-member
         // and does not sample foreground a second time. Reconcile only a real
         // replaced departure: an ordinary Created must not touch tracked focus.
         let replaced = self.depart_replaced_managed_lifetime(hwnd);
-        let outcome = self.admit_window_after_replaced_departure(hwnd, kind, admitted_at_event_ms);
+        let outcome = self.admit_window_after_replaced_departure(
+            hwnd,
+            kind,
+            admitted_at_event_ms,
+            is_maximized,
+            queue_maximized_restore,
+        );
         if replaced {
             self.reconcile_replaced_lifetime_admission(hwnd);
         }
@@ -674,6 +869,11 @@ impl AppState {
         hwnd: u64,
         kind: AdmissionKind,
         admitted_at_event_ms: Option<u32>,
+        mut is_maximized: impl FnMut(u64) -> bool,
+        mut queue_maximized_restore: impl FnMut(
+            u64,
+        )
+            -> Result<bool, leopardwm_platform_win32::Win32Error>,
     ) -> AdmitOutcome {
         // Recycle departs before suppression and the ignore gate. A cloak Hidden
         // can mark this HWND transient, and that entry must not reject the replacement.
@@ -704,6 +904,10 @@ impl AppState {
         };
         // Clear any pending retry — window is now ready.
         self.pending_create_retry.remove(&hwnd);
+        if leopardwm_platform_win32::is_excluded_topmost_popup_hwnd(hwnd) {
+            debug!("Ignoring topmost notification popup {}", hwnd);
+            return AdmitOutcome::TopmostPopup;
+        }
         {
             // Skip shell-cloaked windows (suspended UWP frames, windows
             // on other virtual desktops). These are valid HWNDs with
@@ -797,19 +1001,14 @@ impl AppState {
                 return AdmitOutcome::DialogLike;
             }
 
-            // New windows open on the monitor under the mouse cursor at the
-            // moment they're created — this matches how launchers (e.g.
-            // PowerToys Run) themselves decide which monitor to appear on,
-            // so a window spawned from one lands where the user is actually
-            // pointing rather than wherever `focused_monitor` last landed
-            // via a (possibly stale or spuriously reset) focus event. Falls
-            // back to `focused_monitor` if the cursor can't be located or
-            // doesn't resolve to a known monitor.
             // A per-app rule's open_on_workspace can still redirect it below.
-            // `tile_on_os_monitor = true` overrides this: the window's own
-            // rect (as reported by Windows at creation) picks the monitor.
-            let monitor_id =
-                self.monitor_for_new_window(&win_info.rect, rule_tile_on_os_monitor);
+            let (recreated_slot, monitor_id) = self.new_window_monitor(
+                &win_info,
+                kind,
+                action,
+                rule_sticky,
+                rule_tile_on_os_monitor,
+            );
 
             // Get floating rect before borrowing workspace mutably
             let floating_rect = if action == config::WindowAction::Float {
@@ -833,7 +1032,9 @@ impl AppState {
             // A sticky window shows on every workspace, so it always opens on the
             // active one; an open_on_workspace would only hide it until a switch.
             // Explicit readmit always uses the active workspace of the native monitor.
-            let target_idx = if rule_sticky || kind == AdmissionKind::ExplicitReadmit {
+            let target_idx = if let Some(slot) = &recreated_slot {
+                slot.workspace
+            } else if rule_sticky || kind == AdmissionKind::ExplicitReadmit {
                 active_idx
             } else {
                 rule_workspace.unwrap_or(active_idx)
@@ -853,28 +1054,22 @@ impl AppState {
                 None
             };
 
-            // Per-app initial column width (viewport fraction -> px). A width
-            // remembered from before this window was hidden takes precedence,
-            // so a reshown window keeps its size instead of resetting.
-            let display_idx = self.display_index_for(monitor_id);
-            let fraction_to_px =
-                |f: f64| -> i32 { ((f * f64::from(viewport_width)).round() as i32).max(100) };
-            let rule_width_px = if kind == AdmissionKind::ExplicitReadmit {
-                rule_column_width
-                    .as_ref()
-                    .and_then(|cw| cw.resolve(display_idx))
-                    .map(fraction_to_px)
+            let rule_width_px = self.admission_column_width_px(
+                hwnd,
+                kind,
+                rule_column_width.as_ref(),
+                monitor_id,
+                viewport_width,
+            );
+            let take_workspace_focus = if recreated_slot.is_some() {
+                self.config.behavior.focus_new_windows && !opens_in_background
             } else {
-                self.take_remembered_column_width(hwnd).or_else(|| {
-                    rule_column_width
-                        .as_ref()
-                        .and_then(|cw| cw.resolve(display_idx))
-                        .map(fraction_to_px)
-                })
+                kind == AdmissionKind::ExplicitReadmit
+                    || self.config.behavior.focus_new_windows
+                    || opens_in_background
             };
-            let take_workspace_focus = kind == AdmissionKind::ExplicitReadmit
-                || self.config.behavior.focus_new_windows
-                || opens_in_background;
+            let native_maximized_at_admission =
+                action == config::WindowAction::Tile && is_maximized(hwnd);
 
             if let Some(workspace) = self
                 .workspaces
@@ -918,47 +1113,23 @@ impl AppState {
                             .unwrap_or(self.config.behavior.new_window_placement);
                         let in_column = effective_placement == config::NewWindowPlacement::InColumn
                             && workspace.column_count() > 0;
-                        let ok = if let Some(slot) = rule_slot {
-                            // A slot rule opens the window as its own column at
-                            // that slot, overriding in-column stacking.
-                            if take_workspace_focus {
-                                workspace
-                                    .insert_window_at_column(hwnd, rule_width_px, slot)
-                                    .is_ok()
-                            } else {
-                                workspace
-                                    .insert_window_at_column_no_focus(hwnd, rule_width_px, slot)
-                                    .is_ok()
-                            }
-                        } else if in_column {
-                            // Stack into the focused column, directly
-                            // below the focused window (matches
-                            // hyprscroller's column mode rather than
-                            // appending at the bottom of the stack).
-                            let col = workspace.focused_column_index();
-                            let row = workspace.focused_window_index_in_column() + 1;
-                            let ok = workspace.insert_window_in_column_at(hwnd, col, row).is_ok();
-                            if ok && take_workspace_focus {
-                                if let Err(e) = workspace.focus_window(hwnd) {
-                                    warn!("Focusing new in-column window {} failed: {:?}", hwnd, e);
-                                }
-                            }
-                            ok
-                        } else if take_workspace_focus {
-                            // A background open still takes the target
-                            // workspace's local focus (so it's focused
-                            // when that workspace is activated); OS
-                            // focus is never touched for it.
-                            workspace.insert_window(hwnd, rule_width_px).is_ok()
-                        } else {
-                            workspace
-                                .insert_window_no_focus(hwnd, rule_width_px)
-                                .is_ok()
-                        };
+                        let ok = insert_admitted_tile(
+                            workspace,
+                            hwnd,
+                            rule_width_px,
+                            rule_slot,
+                            in_column,
+                            take_workspace_focus,
+                            recreated_slot.as_ref(),
+                        );
                         // Per-app open_maximized: only when the new
                         // window's column is the focused one (always
                         // true for the focused new-column path).
-                        if ok && rule_maximized && workspace.focused_window() == Some(hwnd) {
+                        if ok
+                            && recreated_slot.is_none()
+                            && (rule_maximized || native_maximized_at_admission)
+                            && workspace.focused_window() == Some(hwnd)
+                        {
                             workspace.maximize_focused_column(viewport_width);
                         }
                         ok
@@ -969,13 +1140,6 @@ impl AppState {
                 if added {
                     let now = std::time::Instant::now();
                     self.window_managed_at.insert(hwnd, now);
-                    // Seed maximize intent if it opened maximized, so a window
-                    // born maximized is protected from the settling snap-back
-                    // even if its first event is a transient restore (before any
-                    // maximized location event is observed).
-                    if leopardwm_platform_win32::is_window_maximized(hwnd) {
-                        self.window_last_maximized_at.insert(hwnd, now);
-                    }
                     info!(
                         "Window created: {} ({}) - added to monitor {} workspace {} as {:?}",
                         win_info.title,
@@ -1005,6 +1169,21 @@ impl AppState {
                         workspace.ensure_focused_visible_animated(viewport_width);
                     }
                     self.record_managed_lifetime(hwnd, admitted_at_event_ms);
+                    if native_maximized_at_admission {
+                        self.queue_maximized_admission_restore(
+                            hwnd,
+                            now,
+                            &mut queue_maximized_restore,
+                            &mut is_maximized,
+                        );
+                    }
+                    self.record_managed_window_identity(&win_info);
+                    if recreated_slot.is_some() {
+                        if opens_in_background {
+                            self.arm_background_rejoin_activation(hwnd, admitted_at_event_ms);
+                        }
+                        info!("Window {} rejoined its pre-sleep column or tab on monitor {} workspace {}", hwnd, monitor_id, target_idx + 1);
+                    }
                     if opens_in_background {
                         // Target workspace is not active: hide the window and
                         // remove its taskbar button until that workspace is
@@ -1254,6 +1433,11 @@ impl AppState {
         // Cloaking a stashed scratchpad can emit Hidden while it is still the
         // same window. A shown scratchpad is an ordinary floating member, and
         // a real Destroyed still drops the record.
+        let recreated_donation = if is_hidden_event && cause == DepartureCause::Event {
+            self.prepare_recreated_window_slot(hwnd)
+        } else {
+            None
+        };
         let stashed_scratchpad_hidden = is_hidden_event
             && crate::managed_lifetime::is_stashed_scratchpad(self.scratchpad, hwnd);
         let recorded_lifetime = if stashed_scratchpad_hidden {
@@ -1374,6 +1558,10 @@ impl AppState {
                     workspace.ensure_focused_visible_animated(viewport_width);
                 }
             }
+        }
+
+        if was_tiled {
+            self.donate_recreated_window_slot(recreated_donation);
         }
 
         if let Some(snapshot) = snapshot {
@@ -1614,6 +1802,7 @@ impl AppState {
         &mut self,
         monitor_id: leopardwm_platform_win32::MonitorId,
         ws_idx: usize,
+        restore_focus_target: Option<u64>,
     ) {
         const MOVE_FOCUS_LOCK_MS: u128 = 500;
         match self.move_to_monitor_target {
@@ -1734,17 +1923,25 @@ impl AppState {
 
         let mut start_rects = std::collections::HashMap::new();
         let mut exit_rects = std::collections::HashMap::new();
+        self.prune_recently_restored_managed_windows();
+        let restore_focus_target = restore_focus_target.filter(|hwnd| {
+            self.recently_restored_managed_windows.contains_key(hwnd)
+                && new_placements.iter().any(|(wid, _)| wid == hwnd)
+        });
 
         for (wid, rect) in &new_placements {
+            let start_y = if Some(*wid) == restore_focus_target {
+                rect.y
+            } else {
+                rect.y + y_offset
+            };
             start_rects.insert(
                 *wid,
-                leopardwm_core_layout::Rect::new(
-                    rect.x,
-                    rect.y + y_offset,
-                    rect.width,
-                    rect.height,
-                ),
+                leopardwm_core_layout::Rect::new(rect.x, start_y, rect.width, rect.height),
             );
+        }
+        if let Some(hwnd) = restore_focus_target {
+            self.recently_restored_managed_windows.remove(&hwnd);
         }
         for (wid, rect) in &old_placements {
             start_rects.insert(*wid, *rect);
@@ -1782,7 +1979,7 @@ impl AppState {
         let Some((monitor_id, ws_idx)) = self.find_window_workspace(hwnd) else {
             return false;
         };
-        self.follow_workspace_without_stealing_focus(monitor_id, ws_idx);
+        self.follow_workspace_without_stealing_focus(monitor_id, ws_idx, None);
         if let Some(ref mut transition) = self.layout_transition {
             transition.suppress_landing_focus_resync = true;
         }
@@ -1844,11 +2041,64 @@ impl AppState {
             .is_none_or(workspace_is_genuinely_empty)
     }
 
+    pub(crate) fn release_parked_foreground_for_empty_selection(&mut self) {
+        if self.selected_workspace_is_genuinely_empty() {
+            self.release_parked_foreground();
+        }
+    }
+
+    pub(crate) fn release_parked_foreground(&mut self) {
+        #[cfg(test)]
+        let foreground = self.injected_foreground_hwnd.flatten();
+        #[cfg(not(test))]
+        let foreground = leopardwm_platform_win32::get_foreground_window();
+        let Some(hwnd) = foreground else {
+            debug!("Skipping parked-foreground release because there is no OS foreground window");
+            return;
+        };
+        let Some((monitor, workspace_idx)) = self.find_window_workspace(hwnd) else {
+            return;
+        };
+        if self.active_workspace_idx(monitor) == workspace_idx
+            || self
+                .workspaces
+                .get(&monitor)
+                .and_then(|workspaces| workspaces.get(workspace_idx))
+                .is_some_and(|workspace| workspace.is_floating(hwnd))
+        {
+            return;
+        }
+
+        let work_area = self
+            .monitors
+            .get(&self.focused_monitor)
+            .map(|monitor| monitor.work_area);
+        #[cfg(test)]
+        if let Some(work_area) = work_area {
+            self.foreground_release_requests.push((hwnd, work_area));
+        }
+        #[cfg(not(test))]
+        if let (Some(placeholder), Some(work_area)) = (self.focus_placeholder.as_ref(), work_area) {
+            match placeholder.release_foreground(hwnd, work_area) {
+                Ok(true) => {}
+                Ok(false) => debug!(
+                    "Windows did not release parked foreground window {} to the focus placeholder",
+                    hwnd
+                ),
+                Err(error) => debug!(
+                    "Could not release parked foreground window {}: {:?}",
+                    hwnd, error
+                ),
+            }
+        }
+    }
+
     /// Clear logical focus after the selected workspace becomes empty.
     ///
-    /// Does not call `sync_foreground_window` or steal native focus. Reconciles
+    /// Releases parked managed foreground, then clears logical focus. Reconciles
     /// tab strips directly because a layout transition defers `apply_layout`.
     pub(crate) fn clear_logical_focus_for_empty_selection(&mut self) {
+        self.release_parked_foreground_for_empty_selection();
         self.previous_focused_hwnd = None;
         self.hide_border();
         self.update_tab_strip();
@@ -1910,37 +2160,95 @@ impl AppState {
         let Some(intent) = self.pending_last_window_departure else {
             return false;
         };
-        if !intent.is_fresh()
-            || self.focused_monitor != intent.monitor
+        let handler_time_ms = self.event_time_now_ms();
+        let ms_since_last_input = leopardwm_platform_win32::ms_since_last_user_input();
+        let target_is_minimized = self
+            .workspaces
+            .get(&monitor_id)
+            .and_then(|workspaces| workspaces.get(ws_idx))
+            .is_some_and(|workspace| workspace.is_minimized(hwnd));
+        // Keep Windows' departure handoff from undoing selection: suppress exact replacements and
+        // bind eligible other-workspace handoffs; Minimized allows a 500 ms OS timestamp window.
+        let event_is_eligible = match intent.origin {
+            LastWindowDepartureOrigin::Minimized => event_time_is_no_later_than(
+                event_time_ms,
+                intent
+                    .armed_at_event_time_ms
+                    .wrapping_add(MINIMIZE_HANDOFF_WINDOW_MS),
+            ),
+            LastWindowDepartureOrigin::DirectDestroyedOrHidden
+            | LastWindowDepartureOrigin::EventlessPrune => {
+                event_time_is_no_later_than(event_time_ms, intent.armed_at_event_time_ms)
+            }
+        };
+        let outcome = if !intent.is_fresh() {
+            self.pending_last_window_departure = None;
+            "stale_ttl"
+        } else if self.focused_monitor != intent.monitor
             || self.active_workspace_idx(intent.monitor) != intent.workspace
         {
             self.pending_last_window_departure = None;
-            return false;
-        }
-        // Exact sampled replacement: no-later Focused is suppressed. Direct
-        // Destroyed/Hidden with no sample binds the first no-later managed HWND
-        // on another workspace of the same monitor. Same-workspace activations,
-        // newer ticks, a later different HWND, and eventless-prune None do not
-        // infer.
-        if !event_time_is_no_later_than(event_time_ms, intent.armed_at_event_time_ms) {
+            "monitor_or_workspace_changed"
+        } else if !event_is_eligible {
             self.pending_last_window_departure = None;
-            return false;
-        }
-        if Some(hwnd) == intent.replacement_hwnd {
-            return true;
-        }
-        if intent.replacement_hwnd.is_none()
-            && intent.origin == LastWindowDepartureOrigin::DirectDestroyedOrHidden
+            if intent.origin == LastWindowDepartureOrigin::Minimized {
+                "later_than_handoff_window"
+            } else {
+                "later_than_arm"
+            }
+        } else if intent.origin == LastWindowDepartureOrigin::Minimized && target_is_minimized {
+            if intent.replacement_hwnd.is_none() || intent.replacement_hwnd == Some(hwnd) {
+                self.pending_last_window_departure = None;
+            }
+            "target_still_minimized"
+        } else if Some(hwnd) == intent.replacement_hwnd {
+            "exact_replacement"
+        } else if intent.replacement_hwnd.is_none()
+            && matches!(
+                intent.origin,
+                LastWindowDepartureOrigin::DirectDestroyedOrHidden
+                    | LastWindowDepartureOrigin::Minimized
+            )
             && monitor_id == intent.monitor
             && ws_idx != intent.workspace
         {
             let mut pending = intent;
             pending.replacement_hwnd = Some(hwnd);
             self.pending_last_window_departure = Some(pending);
-            return true;
-        }
-        self.pending_last_window_departure = None;
-        false
+            "bound_inferred"
+        } else {
+            self.pending_last_window_departure = None;
+            "not_inferable"
+        };
+        let suppressed = matches!(outcome, "exact_replacement" | "bound_inferred");
+        debug!(
+            target: "leopardwm::event_handler",
+            hwnd,
+            event_time_ms,
+            handler_time_ms,
+            ms_since_last_input = ?ms_since_last_input,
+            intent_origin = ?intent.origin,
+            intent_monitor = ?intent.monitor,
+            intent_workspace = intent.workspace,
+            intent_replacement_hwnd = ?intent.replacement_hwnd,
+            intent_armed_at_event_time_ms = intent.armed_at_event_time_ms,
+            event_monitor = ?monitor_id,
+            event_workspace = ws_idx,
+            outcome,
+            suppressed,
+            "last-window departure focus guard consulted"
+        );
+        suppressed
+    }
+
+    fn prune_recently_restored_managed_windows(&mut self) {
+        self.recently_restored_managed_windows
+            .retain(|_, restored_at| restored_at.elapsed() < RECENTLY_RESTORED_MANAGED_WINDOW_TTL);
+    }
+
+    fn is_recently_restored_managed_window(&mut self, hwnd: u64) -> bool {
+        self.prune_recently_restored_managed_windows();
+        self.recently_restored_managed_windows.contains_key(&hwnd)
     }
 
     fn on_window_focused(&mut self, hwnd: u64, event_time_ms: u32) {
@@ -2002,6 +2310,16 @@ impl AppState {
             }
         }
 
+        let focused_restore_activation = self.is_recently_restored_managed_window(hwnd)
+            || self
+                .find_window_workspace(hwnd)
+                .and_then(|(monitor, workspace)| {
+                    self.workspaces
+                        .get(&monitor)
+                        .and_then(|workspaces| workspaces.get(workspace))
+                })
+                .is_some_and(|workspace| workspace.is_minimized(hwnd));
+
         // Reconcile: prune windows that vanished without events
         // (e.g., Electron close-to-tray apps).
         // Throttle to at most once per second to avoid per-event overhead.
@@ -2013,8 +2331,10 @@ impl AppState {
             let pre_count = self.all_managed_window_ids().len();
             let tracked = self.previous_focused_hwnd;
             let prune = self.prune_stale_windows_with(Some(crate::helpers::FocusedPruneContext {
+                focused_hwnd: hwnd,
                 tracked,
                 event_time_ms,
+                restore_activation: focused_restore_activation,
             }));
             let pruned = pre_count - self.all_managed_window_ids().len();
             match prune {
@@ -2034,6 +2354,40 @@ impl AppState {
                     }
                 }
                 crate::helpers::StalePruneLayout::Unchanged => {}
+            }
+        }
+
+        if let Some(tracked) = self.previous_focused_hwnd {
+            if let Some((monitor_id, ws_idx)) = self.find_window_workspace(tracked) {
+                let marked_minimized = self
+                    .workspaces
+                    .get(&monitor_id)
+                    .and_then(|workspaces| workspaces.get(ws_idx))
+                    .is_some_and(|workspace| workspace.is_minimized(tracked));
+                if !marked_minimized
+                    && self.stale_window_probe(tracked).0
+                        == leopardwm_platform_win32::WindowPresence::Minimized
+                {
+                    if (monitor_id, ws_idx)
+                        == (
+                            self.focused_monitor,
+                            self.active_workspace_idx(self.focused_monitor),
+                        )
+                    {
+                        if focused_restore_activation {
+                            self.reconcile_minimized_without_departure(tracked);
+                        } else {
+                            self.on_window_minimized_with_context(
+                                tracked,
+                                None,
+                                Some(event_time_ms),
+                                "focused_reconcile",
+                            );
+                        }
+                    } else {
+                        self.reconcile_minimized_without_departure(tracked);
+                    }
+                }
             }
         }
 
@@ -2073,10 +2427,13 @@ impl AppState {
                     }
                 }
             }
+            if self.suppress_background_rejoin_activation(hwnd, event_time_ms) {
+                return;
+            }
             // Exit desktop peek when a genuine focus change lands on the peeked
             // monitor for a DIFFERENT window. Placed AFTER the stale-layout guard
-            // so spurious EVENT_SYSTEM_FOREGROUND echoes from SetWindowPos callbacks
-            // are already dropped and never reach here. Focusing a window on any
+            // and the background-rejoin suppression so spurious focus events are
+            // already dropped and never reach here. Focusing a window on any
             // other monitor leaves peek intact — peek is monitor-local.
             let should_exit_peek = self
                 .desktop_peek
@@ -2085,6 +2442,9 @@ impl AppState {
             if should_exit_peek {
                 self.exit_desktop_peek();
             }
+            let recently_restored_focus = self
+                .is_recently_restored_managed_window(hwnd)
+                .then_some(hwnd);
             if self.should_suppress_last_window_departure_focus(
                 hwnd,
                 event_time_ms,
@@ -2093,7 +2453,11 @@ impl AppState {
             ) {
                 return;
             }
-            self.follow_workspace_without_stealing_focus(monitor_id, ws_idx);
+            self.follow_workspace_without_stealing_focus(
+                monitor_id,
+                ws_idx,
+                recently_restored_focus,
+            );
 
             let viewport_width = self.viewport_width_for(monitor_id);
 
@@ -2301,108 +2665,200 @@ impl AppState {
         self.broadcast_focused_window_if_changed(monitor_id, None);
     }
 
-    /// Handle a window-minimized event.
-    fn on_window_minimized(&mut self, hwnd: u64) {
-        self.maybe_exit_desktop_peek_for_window(hwnd);
-        if let Some((monitor_id, ws_idx)) = self.find_window_workspace(hwnd) {
-            let viewport_width = self.viewport_width_for(monitor_id);
-            let layout_viewport = self.layout_viewport(monitor_id);
-            let snapshot = self.snapshot_layout();
+    pub(crate) fn mark_minimized_and_reflow(&mut self, hwnd: u64) -> Option<bool> {
+        let (monitor_id, ws_idx) = self.find_window_workspace(hwnd)?;
+        let viewport_width = self.viewport_width_for(monitor_id);
+        let layout_viewport = self.layout_viewport(monitor_id);
+        let is_floating = self
+            .workspaces
+            .get(&monitor_id)
+            .and_then(|workspaces| workspaces.get(ws_idx))
+            .is_some_and(|workspace| workspace.is_floating(hwnd));
+        let workspace = self
+            .workspaces
+            .get_mut(&monitor_id)
+            .and_then(|workspaces| workspaces.get_mut(ws_idx))?;
+        let cleared_fullscreen = workspace.clear_fullscreen_if_window(hwnd);
+        // mark_minimized only handles tiled windows; floating windows are not
+        // in the minimized set, so both paths count as a handled minimize.
+        if !(workspace.mark_minimized(hwnd) || cleared_fullscreen || is_floating) {
+            return None;
+        }
+        if is_floating && self.previous_focused_hwnd == Some(hwnd) {
+            self.previous_focused_hwnd = None;
+        }
 
-            // If the minimized window is a floating window tracked as
-            // previous_focused_hwnd, clear it so sync_foreground_window
-            // doesn't try to re-focus a minimized floating window.
-            let is_floating = self
-                .workspaces
-                .get(&monitor_id)
-                .and_then(|v| v.get(ws_idx))
-                .is_some_and(|ws| ws.is_floating(hwnd));
-            if is_floating && self.previous_focused_hwnd == Some(hwnd) {
-                self.previous_focused_hwnd = None;
+        let col_loc = workspace.find_window_location(hwnd);
+        let col_info = col_loc.map(|(ci, _)| {
+            let col = &workspace.columns()[ci];
+            let visible = col
+                .windows()
+                .iter()
+                .filter(|w| !workspace.is_minimized(**w))
+                .count();
+            (ci, col.len(), visible)
+        });
+        info!(
+            "Window {} minimized (col={:?}, minimized_total={})",
+            hwnd,
+            col_info,
+            workspace.minimized_count()
+        );
+
+        if workspace.focused_window() == Some(hwnd) {
+            workspace.focus_down();
+            if workspace.focused_window() == Some(hwnd) {
+                workspace.focus_up();
             }
-
-            if let Some(workspace) = self
-                .workspaces
-                .get_mut(&monitor_id)
-                .and_then(|v| v.get_mut(ws_idx))
-            {
-                let cleared_fullscreen = workspace.clear_fullscreen_if_window(hwnd);
-                // mark_minimized only handles tiled windows; floating windows
-                // are not in the minimized set. Handle both paths.
-                if workspace.mark_minimized(hwnd) || cleared_fullscreen || is_floating {
-                    let col_loc = workspace.find_window_location(hwnd);
-                    let col_info = col_loc.map(|(ci, _)| {
-                        let col = &workspace.columns()[ci];
-                        let visible = col
-                            .windows()
-                            .iter()
-                            .filter(|w| !workspace.is_minimized(**w))
-                            .count();
-                        (ci, col.len(), visible)
-                    });
-                    info!(
-                        "Window {} minimized (col={:?}, minimized_total={})",
-                        hwnd,
-                        col_info,
-                        workspace.minimized_count()
-                    );
-
-                    // If the minimized window was the focused window, move focus
-                    if workspace.focused_window() == Some(hwnd) {
-                        // Try to focus another window in the same column
-                        workspace.focus_down();
-                        if workspace.focused_window() == Some(hwnd) {
-                            workspace.focus_up();
-                        }
-                        // If still focused on minimized (only window in column), try next column
-                        if workspace.focused_window() == Some(hwnd) {
-                            workspace.focus_right();
-                            if workspace.focused_window() == Some(hwnd) {
-                                workspace.focus_left();
-                            }
-                        }
-                    }
-                    workspace.ensure_focused_visible_animated(viewport_width);
-
-                    // Log expected post-minimize placements for debugging
-                    {
-                        let post_placements = workspace.compute_placements(layout_viewport);
-                        for p in &post_placements {
-                            info!(
-                                "  post-minimize placement: hwnd={} rect=({},{} {}x{})",
-                                p.window_id, p.rect.x, p.rect.y, p.rect.width, p.rect.height,
-                            );
-                        }
-                    }
-
-                    self.start_layout_transition(snapshot);
-                    if let Err(e) = self.apply_layout() {
-                        warn!("Failed to apply layout after minimize: {}", e);
-                    }
-                    // Keep monitor focus aligned before foreground sync so we don't
-                    // accidentally steer foreground to a stale monitor.
-                    self.focused_monitor = monitor_id;
-                    self.sync_foreground_window();
+            if workspace.focused_window() == Some(hwnd) {
+                workspace.focus_right();
+                if workspace.focused_window() == Some(hwnd) {
+                    workspace.focus_left();
                 }
             }
-        } else {
-            debug!("Window {} minimized (unmanaged)", hwnd);
         }
+        workspace.ensure_focused_visible_animated(viewport_width);
+
+        for placement in workspace.compute_placements(layout_viewport) {
+            info!(
+                "  post-minimize placement: hwnd={} rect=({},{} {}x{})",
+                placement.window_id,
+                placement.rect.x,
+                placement.rect.y,
+                placement.rect.width,
+                placement.rect.height,
+            );
+        }
+        Some(workspace.focused_visible_window().is_some())
+    }
+
+    pub(crate) fn reconcile_minimized_without_departure(&mut self, hwnd: u64) {
+        let snapshot = self.snapshot_layout();
+        if self.mark_minimized_and_reflow(hwnd).is_some() {
+            if self.start_layout_transition(snapshot) {
+                if let Some(transition) = self.layout_transition.as_mut() {
+                    transition.suppress_landing_focus_resync = true;
+                }
+            }
+            if let Err(e) = self.apply_layout() {
+                warn!(
+                    "Failed to apply layout after minimize reconciliation: {}",
+                    e
+                );
+            }
+        }
+    }
+
+    fn on_window_minimized_from_event(&mut self, hwnd: u64, os_event_time_ms: u32) {
+        self.on_window_minimized_with_context(hwnd, None, Some(os_event_time_ms), "event");
+    }
+
+    pub(crate) fn on_window_minimized_with_snapshot(
+        &mut self,
+        hwnd: u64,
+        layout_snapshot: Option<std::collections::HashMap<u64, leopardwm_core_layout::Rect>>,
+    ) {
+        self.on_window_minimized_with_snapshot_at(hwnd, layout_snapshot, None);
+    }
+
+    pub(crate) fn on_window_minimized_with_snapshot_at(
+        &mut self,
+        hwnd: u64,
+        layout_snapshot: Option<std::collections::HashMap<u64, leopardwm_core_layout::Rect>>,
+        event_time_ms: Option<u32>,
+    ) {
+        self.on_window_minimized_with_context(
+            hwnd,
+            layout_snapshot,
+            event_time_ms,
+            "prune_reconcile",
+        );
+    }
+
+    fn on_window_minimized_with_context(
+        &mut self,
+        hwnd: u64,
+        layout_snapshot: Option<std::collections::HashMap<u64, leopardwm_core_layout::Rect>>,
+        os_event_time_ms: Option<u32>,
+        source: &'static str,
+    ) -> bool {
+        // Any minimize exits desktop peek on that window's monitor — a reported
+        // minimize event and a missed minimize reconciled later alike.
+        self.maybe_exit_desktop_peek_for_window(hwnd);
+        let handler_time_ms = self.event_time_now_ms();
+        let ms_since_last_input = leopardwm_platform_win32::ms_since_last_user_input();
+        let was_tracked_focus = self.previous_focused_hwnd == Some(hwnd);
+        let mut was_selected_focus = false;
+        let mut has_focused_visible_window = false;
+        let mut armed = false;
+        let mut decision_reason = "not_managed";
+        if let Some((monitor_id, ws_idx)) = self.find_window_workspace(hwnd) {
+            was_selected_focus = was_tracked_focus
+                && self.focused_monitor == monitor_id
+                && self.active_workspace_idx(monitor_id) == ws_idx;
+            let snapshot = layout_snapshot.unwrap_or_else(|| self.snapshot_layout());
+            if let Some(has_visible_window) = self.mark_minimized_and_reflow(hwnd) {
+                has_focused_visible_window = has_visible_window;
+                self.start_layout_transition(snapshot);
+                if let Err(e) = self.apply_layout() {
+                    warn!("Failed to apply layout after minimize: {}", e);
+                }
+                self.focused_monitor = monitor_id;
+                if was_selected_focus && has_focused_visible_window {
+                    let armed_at_event_time_ms =
+                        os_event_time_ms.unwrap_or_else(|| self.event_time_now_ms());
+                    self.arm_pending_last_window_departure(
+                        None,
+                        armed_at_event_time_ms,
+                        LastWindowDepartureOrigin::Minimized,
+                    );
+                    armed = true;
+                    decision_reason = "armed";
+                } else if !was_tracked_focus {
+                    decision_reason = "not_tracked_focus";
+                } else if !was_selected_focus {
+                    decision_reason = "not_selected_focus";
+                } else {
+                    decision_reason = "no_focused_visible_window";
+                }
+                self.sync_foreground_window();
+            } else {
+                decision_reason = "minimize_not_applied";
+            }
+        }
+        debug!(
+            target: "leopardwm::event_handler",
+            hwnd,
+            source,
+            os_event_time_ms = ?os_event_time_ms,
+            handler_time_ms,
+            ms_since_last_input = ?ms_since_last_input,
+            was_tracked_focus,
+            was_selected_focus,
+            has_focused_visible_window,
+            armed,
+            reason = decision_reason,
+            "minimize departure guard decision"
+        );
+        armed
     }
 
     /// Handle a window-restored event.
     fn on_window_restored(&mut self, hwnd: u64) {
         if let Some((monitor_id, ws_idx)) = self.find_window_workspace(hwnd) {
             let viewport_width = self.viewport_width_for(monitor_id);
+            let is_active_workspace = self.active_workspace_idx(monitor_id) == ws_idx;
             let snapshot = self.snapshot_layout();
             let mut should_sync_foreground = false;
             let mut was_tiled_restore = false;
+            let mut did_restore = false;
             if let Some(workspace) = self
                 .workspaces
                 .get_mut(&monitor_id)
                 .and_then(|v| v.get_mut(ws_idx))
             {
                 if workspace.mark_restored(hwnd) {
+                    did_restore = true;
                     info!("Window {} restored from minimized", hwnd);
                     if workspace.is_floating(hwnd) {
                         // Keep floating restores from stealing focus back to tiled windows.
@@ -2414,10 +2870,37 @@ impl AppState {
                         warn!("Failed to focus restored window {}: {}", hwnd, e);
                     } else {
                         workspace.ensure_focused_visible_animated(viewport_width);
-                        should_sync_foreground = true;
+                        should_sync_foreground = is_active_workspace;
                         was_tiled_restore = true;
                     }
                 }
+            }
+            if did_restore {
+                let restored_at = std::time::Instant::now();
+                self.prune_recently_restored_managed_windows();
+                self.recently_restored_managed_windows
+                    .insert(hwnd, restored_at);
+            }
+            if did_restore
+                && self.pending_last_window_departure.is_some_and(|intent| {
+                    intent.monitor == monitor_id
+                        && intent.origin == LastWindowDepartureOrigin::Minimized
+                        && (intent.replacement_hwnd.is_none()
+                            || intent.replacement_hwnd == Some(hwnd))
+                })
+            {
+                let intent = self.pending_last_window_departure.unwrap();
+                self.pending_last_window_departure = None;
+                debug!(
+                    target: "leopardwm::event_handler",
+                    hwnd,
+                    intent_origin = ?intent.origin,
+                    intent_monitor = ?intent.monitor,
+                    intent_workspace = intent.workspace,
+                    intent_replacement_hwnd = ?intent.replacement_hwnd,
+                    intent_armed_at_event_time_ms = intent.armed_at_event_time_ms,
+                    "restored window cleared minimized departure guard"
+                );
             }
             if was_tiled_restore {
                 self.start_layout_transition(snapshot);
@@ -2879,11 +3362,16 @@ impl AppState {
                     hwnd,
                     queued_at.elapsed().as_millis()
                 );
-                self.on_window_created(hwnd, 0);
+                // A retry is not a Create event: record no guard time, so a
+                // later Hidden still departs (a fake time of 0 would make every
+                // Hidden look stale once the tick count passes 2^31).
+                self.admit_created_without_event_time(hwnd);
             }
             return;
         }
-
+        if self.pending_maximized_admission_restores.contains(&hwnd) {
+            return;
+        }
         // Placement feedback stays suppressed, except a direct maximize of a
         // managed tiled window needs its timestamp and target-only visual cleanup
         // immediately so the later restore is classified correctly.
@@ -2900,7 +3388,7 @@ impl AppState {
                         })
                 })
                 .unwrap_or(false);
-            let is_maximized = leopardwm_platform_win32::is_window_maximized(hwnd);
+            let is_maximized = self.native_window_is_maximized(hwnd);
             if should_observe_maximize_during_suppression(
                 self.applying_layout,
                 self.display_change_pending,
@@ -2918,7 +3406,7 @@ impl AppState {
             hwnd,
             chrome_rect,
             dwm_rect,
-            leopardwm_platform_win32::is_window_maximized(hwnd),
+            self.native_window_is_maximized(hwnd),
         );
         let prior = self.application_fullscreen.get(&hwnd).copied();
         let lifecycle = application_fullscreen_lifecycle(prior, session);
@@ -3048,18 +3536,26 @@ impl AppState {
                 .get(&monitor_id)
                 .and_then(|v| v.get(ws_idx))
                 .is_none_or(|ws| ws.is_floating(hwnd));
+            let is_minimized = self
+                .workspaces
+                .get(&monitor_id)
+                .and_then(|v| v.get(ws_idx))
+                .is_some_and(|ws| ws.is_minimized(hwnd));
 
             if is_floating {
                 if self.previous_focused_hwnd == Some(hwnd) {
                     self.show_border(hwnd);
                 }
-            } else if leopardwm_platform_win32::is_window_maximized(hwnd) {
+            } else if self.native_window_is_maximized(hwnd) {
                 // User maximized a tiled window — let it stay maximized. Record
                 // the maximize so a brief restore mid-burst is treated as
                 // settling rather than a snap-back trigger, and remove only
                 // this target's ghost/crossfade visual immediately.
                 self.observe_tiled_window_maximized(hwnd);
                 debug!("Tiled window {} maximized — allowing", hwnd);
+            } else if is_minimized {
+                self.window_last_maximized_at.remove(&hwnd);
+                debug!("Ignoring MovedOrResized for minimized window {}", hwnd);
             } else if defer_snapback_while_settling(
                 self.window_managed_at.get(&hwnd).copied(),
                 self.window_last_maximized_at.get(&hwnd).copied(),
@@ -3238,7 +3734,10 @@ impl AppState {
                 self.prepare_inactive_workspace_windows();
 
                 // Re-apply layout with updated monitor configuration
-                if let Err(e) = self.apply_layout() {
+                self.display_change_apply_in_progress = true;
+                let result = self.apply_layout();
+                self.display_change_apply_in_progress = false;
+                if let Err(e) = result {
                     warn!("Failed to apply layout after display change: {}", e);
                 }
                 self.sync_taskbar_buttons();
@@ -3394,6 +3893,8 @@ impl AppState {
                     );
                 }
 
+                ws.ensure_focused_visible_animated(viewport_width);
+
                 info!(
                     "Resize snap: window {} → width preset, new column width = {}",
                     hwnd,
@@ -3410,12 +3911,17 @@ impl AppState {
         self.last_placed_layout_rects.remove(&hwnd);
         if let Err(e) = self.apply_layout() {
             warn!("Failed to apply layout after resize snap: {}", e);
+        } else {
+            self.sync_taskbar_buttons();
         }
     }
 
     /// Apply focus to a window for focus-follows-mouse.
     /// Returns true if focus was applied, false if the window isn't managed.
     pub(crate) fn apply_focus_follows_mouse(&mut self, hwnd: u64) -> bool {
+        if leopardwm_platform_win32::focus_placeholder::is_focus_placeholder(hwnd) {
+            return false;
+        }
         if let Some((monitor_id, ws_idx)) = self.find_window_workspace(hwnd) {
             // Update focused monitor to match the window's monitor
             self.focused_monitor = monitor_id;

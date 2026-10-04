@@ -5,8 +5,8 @@ use crate::state::*;
 use anyhow::Result;
 use leopardwm_core_layout::{Rect, Workspace};
 #[cfg(not(test))]
-use leopardwm_platform_win32::{is_excluded_tool_window_hwnd, is_window_alive_and_visible};
-use leopardwm_platform_win32::{scale_px, MonitorId};
+use leopardwm_platform_win32::{is_excluded_tool_window_hwnd, window_presence};
+use leopardwm_platform_win32::{scale_px, MonitorId, WindowPresence};
 use tracing::{debug, info, warn};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -26,10 +26,15 @@ pub(crate) enum StalePruneLayout {
 /// pass `None` and keep execution-time foreground sampling.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct FocusedPruneContext {
+    /// HWND from the Focused event that reached this prune.
+    pub(crate) focused_hwnd: u64,
     /// `previous_focused_hwnd` captured before stale cleanup.
     pub(crate) tracked: Option<u64>,
     /// WinEvent time of the Focused event that reached this prune.
     pub(crate) event_time_ms: u32,
+    /// The focused HWND is a restore activation, so tracked-iconic reconciliation
+    /// must not infer an OS minimize/departure handoff from this Focused event.
+    pub(crate) restore_activation: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -374,10 +379,10 @@ impl AppState {
     ///
     /// Standalone entry used by Refresh and the tracked-focus liveness tick.
     /// Focus handling passes attribution context through
-    /// `prune_stale_windows_with`. Test builds do not query Win32: an empty
-    /// injected stale list is a no-op, and a non-empty list is consumed only
-    /// when this prune runs. Distinguishes no apply, successful apply, and
-    /// failed apply so callers do not treat a logged apply error as success.
+    /// `prune_stale_windows_with`. Test builds use injected presence states in
+    /// the same scan, consuming the injected stale list only when this prune
+    /// runs. Distinguishes no apply, successful apply, and failed apply so
+    /// callers do not treat a logged apply error as success.
     pub(crate) fn prune_stale_windows(&mut self) -> StalePruneLayout {
         self.prune_stale_windows_with(None)
     }
@@ -435,72 +440,155 @@ impl AppState {
         changed
     }
 
-    #[cfg(test)]
-    fn tracked_focus_is_gone_or_unmanageable(&self, tracked: u64, minimized: bool) -> bool {
-        !minimized && self.injected_stale_hwnds.contains(&tracked)
+    pub(crate) fn stale_window_probe(&self, hwnd: u64) -> (WindowPresence, bool) {
+        #[cfg(test)]
+        {
+            let presence = if self.injected_stale_hwnds.contains(&hwnd) {
+                WindowPresence::Hidden
+            } else if self.injected_iconic_hwnds.contains(&hwnd) {
+                WindowPresence::Minimized
+            } else {
+                WindowPresence::Visible
+            };
+            (presence, false)
+        }
+
+        #[cfg(not(test))]
+        {
+            let presence = window_presence(hwnd);
+            let excluded_tool_window =
+                presence == WindowPresence::Visible && is_excluded_tool_window_hwnd(hwnd);
+            (presence, excluded_tool_window)
+        }
     }
 
-    #[cfg(not(test))]
+    fn presence_is_stale(
+        presence: WindowPresence,
+        excluded_tool_window: bool,
+        marked_minimized: bool,
+    ) -> bool {
+        match presence {
+            WindowPresence::Gone | WindowPresence::Hidden => !marked_minimized,
+            WindowPresence::Minimized => false,
+            WindowPresence::Visible => excluded_tool_window,
+        }
+    }
+
+    fn window_is_stale(&self, hwnd: u64, marked_minimized: bool) -> bool {
+        let (presence, excluded_tool_window) = self.stale_window_probe(hwnd);
+        Self::presence_is_stale(presence, excluded_tool_window, marked_minimized)
+    }
+
     fn tracked_focus_is_gone_or_unmanageable(&self, tracked: u64, minimized: bool) -> bool {
-        let alive_visible = is_window_alive_and_visible(tracked);
-        let gone = !alive_visible && !minimized;
-        let unmanageable = alive_visible && is_excluded_tool_window_hwnd(tracked);
-        gone || unmanageable
+        self.window_is_stale(tracked, minimized)
     }
 
     pub(crate) fn prune_stale_windows_with(
         &mut self,
         focused_prune: Option<FocusedPruneContext>,
     ) -> StalePruneLayout {
+        let mut stale: Vec<u64> = Vec::new();
+        let mut unmarked_iconic = Vec::new();
+        let mut observed = std::collections::HashSet::new();
+        for ws_vec in self.workspaces.values() {
+            for workspace in ws_vec.iter() {
+                for &wid in &workspace.all_window_ids() {
+                    // Skip sentinel pseudo-HWNDs — they are not real Win32
+                    // windows and would always probe as gone.
+                    if wid == crate::state::DESKTOP_PEEK_HWND
+                        || wid == crate::state::DRAG_PLACEHOLDER_HWND
+                    {
+                        continue;
+                    }
+                    observed.insert(wid);
+                    let marked_minimized = workspace.is_minimized(wid);
+                    let (presence, excluded_tool_window) = self.stale_window_probe(wid);
+                    if !marked_minimized && presence == WindowPresence::Minimized {
+                        unmarked_iconic.push(wid);
+                    }
+                    if Self::presence_is_stale(presence, excluded_tool_window, marked_minimized) {
+                        stale.push(wid);
+                    }
+                }
+            }
+        }
+        if let Some(drag) = self.drag_state.as_ref() {
+            let hwnd = drag.hwnd;
+            if observed.insert(hwnd) {
+                let minimized = self
+                    .find_window_workspace(hwnd)
+                    .and_then(|(mid, idx)| self.workspaces.get(&mid)?.get(idx))
+                    .is_some_and(|ws| ws.is_minimized(hwnd));
+                let (presence, excluded_tool_window) = self.stale_window_probe(hwnd);
+                if !minimized && presence == WindowPresence::Minimized {
+                    unmarked_iconic.push(hwnd);
+                }
+                if Self::presence_is_stale(presence, excluded_tool_window, minimized) {
+                    stale.push(hwnd);
+                }
+            }
+        }
         #[cfg(test)]
-        {
-            let stale = std::mem::take(&mut self.injected_stale_hwnds);
-            if stale.is_empty() {
-                StalePruneLayout::Unchanged
-            } else {
-                self.finish_stale_window_prune(&stale, focused_prune)
+        self.injected_stale_hwnds.clear();
+        let result = self.finish_stale_window_prune(&stale, focused_prune);
+
+        let selected = (
+            self.focused_monitor,
+            self.active_workspace_idx(self.focused_monitor),
+        );
+        let tracked_selected = self
+            .previous_focused_hwnd
+            .filter(|hwnd| self.find_window_workspace(*hwnd) == Some(selected));
+        let focused_event_hwnd = focused_prune.map(|focus| focus.focused_hwnd);
+        let mut batch_snapshot = None;
+        let mut batch_changed = false;
+        for hwnd in unmarked_iconic.iter().copied() {
+            if Some(hwnd) == tracked_selected || Some(hwnd) == focused_event_hwnd {
+                continue;
+            }
+            if batch_snapshot.is_none() {
+                batch_snapshot = Some(self.snapshot_layout());
+            }
+            if self.stale_window_probe(hwnd).0 == WindowPresence::Minimized
+                && self.mark_minimized_and_reflow(hwnd).is_some()
+            {
+                batch_changed = true;
             }
         }
 
-        #[cfg(not(test))]
+        if let Some(hwnd) = tracked_selected
+            .filter(|hwnd| unmarked_iconic.contains(hwnd) && Some(*hwnd) != focused_event_hwnd)
         {
-            let mut stale: Vec<u64> = Vec::new();
-            for ws_vec in self.workspaces.values() {
-                for workspace in ws_vec.iter() {
-                    for &wid in &workspace.all_window_ids() {
-                        // Skip sentinel pseudo-HWNDs — they are not real Win32
-                        // windows and would always fail is_window_alive_and_visible.
-                        if wid == crate::state::DESKTOP_PEEK_HWND
-                            || wid == crate::state::DRAG_PLACEHOLDER_HWND
-                        {
-                            continue;
-                        }
-                        let alive_visible = is_window_alive_and_visible(wid);
-                        let gone = !alive_visible && !workspace.is_minimized(wid);
-                        let unmanageable = alive_visible && is_excluded_tool_window_hwnd(wid);
-                        if gone || unmanageable {
-                            stale.push(wid);
-                        }
-                    }
+            if self.stale_window_probe(hwnd).0 == WindowPresence::Minimized {
+                if focused_prune.is_some_and(|focus| focus.restore_activation) {
+                    self.reconcile_minimized_without_departure(hwnd);
+                } else if let Some(focus) = focused_prune {
+                    self.on_window_minimized_with_snapshot_at(
+                        hwnd,
+                        batch_snapshot,
+                        Some(focus.event_time_ms),
+                    );
+                } else {
+                    self.on_window_minimized_with_snapshot(hwnd, batch_snapshot);
                 }
+                return result;
             }
-            if let Some(drag) = self.drag_state.as_ref() {
-                let hwnd = drag.hwnd;
-                if !stale.contains(&hwnd) {
-                    let alive_visible = is_window_alive_and_visible(hwnd);
-                    let minimized = self
-                        .find_window_workspace(hwnd)
-                        .and_then(|(mid, idx)| self.workspaces.get(&mid)?.get(idx))
-                        .is_some_and(|ws| ws.is_minimized(hwnd));
-                    let gone = !alive_visible && !minimized;
-                    let unmanageable = alive_visible && is_excluded_tool_window_hwnd(hwnd);
-                    if gone || unmanageable {
-                        stale.push(hwnd);
-                    }
-                }
-            }
-            self.finish_stale_window_prune(&stale, focused_prune)
         }
+
+        if batch_changed {
+            if self.start_layout_transition(batch_snapshot.unwrap()) {
+                if let Some(transition) = self.layout_transition.as_mut() {
+                    transition.suppress_landing_focus_resync = true;
+                }
+            }
+            if let Err(e) = self.apply_layout() {
+                warn!(
+                    "Failed to apply layout after minimize reconciliation: {}",
+                    e
+                );
+            }
+        }
+        result
     }
 
     fn finish_stale_window_prune(
@@ -592,6 +680,7 @@ impl AppState {
         if self.window_managed_at.is_empty()
             && self.window_last_maximized_at.is_empty()
             && self.application_fullscreen.is_empty()
+            && self.recreated_window_slots.identities.is_empty()
             && self.managed_lifetime_tokens.is_empty()
             && self.managed_lifetime_admitted_at_event_ms.is_empty()
         {
@@ -618,6 +707,9 @@ impl AppState {
                 || crate::managed_lifetime::is_stashed_scratchpad(self.scratchpad, *hwnd)
         });
         self.managed_lifetime_admitted_at_event_ms
+            .retain(|hwnd, _| self.managed_lifetime_tokens.contains_key(hwnd));
+        self.recreated_window_slots
+            .identities
             .retain(|hwnd, _| self.managed_lifetime_tokens.contains_key(hwnd));
     }
 
@@ -883,6 +975,8 @@ impl AppState {
             // Hide any visible drag ghost overlay
             self.pending_drag_hint = Some(crate::state::DragHintAction::Hide);
         } else {
+            self.resume_deferred_apply_worker_recovery();
+            self.display_change_apply_retry = None;
             self.pending_layout_apply_timeout_report = None;
             if let Err(error) = self.resume_layout_after_unpause() {
                 self.paused = was_paused;

@@ -865,10 +865,15 @@ impl AppState {
     }
 
     /// Vertical focus (`focus_up`/`focus_down`). With `workspace_edge_wrap` on,
-    /// a press at the column's top/bottom edge switches to the adjacent
-    /// workspace instead of no-oping. `up` selects up vs down.
+    /// a press at the column's top/bottom edge or on an empty workspace
+    /// switches to the adjacent workspace. `up` selects up vs down.
     fn focus_vertical(&mut self, up: bool) -> IpcResponse {
-        if self.config.behavior.workspace_edge_wrap && self.focus_at_vertical_edge(up) {
+        let empty_workspace = self
+            .focused_workspace()
+            .is_some_and(|ws| ws.columns().is_empty());
+        if self.config.behavior.workspace_edge_wrap
+            && (empty_workspace || self.focus_at_vertical_edge(up))
+        {
             return self.handle_workspace_prev_next(if up {
                 IpcCommand::WorkspacePrev
             } else {
@@ -1722,6 +1727,11 @@ impl AppState {
             elevation_blocked_windows: legacy,
             daemon_integrity: leopardwm_platform_win32::current_process_integrity(),
             elevation_blocked_records: Some(records),
+            native_swipes: Some(self.native_swipes.clone()),
+            daemon_log: self
+                .daemon_log
+                .as_ref()
+                .map(crate::daemon_log::LogHealth::status),
         }
     }
 

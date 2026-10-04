@@ -670,6 +670,39 @@ impl<'de> Deserialize<'de> for ElevationBlockReason {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum DaemonLogStatus {
+    Writing {
+        path: String,
+    },
+    OpenFailed {
+        path: String,
+        error: String,
+    },
+    WriteFailed {
+        path: String,
+        error: String,
+    },
+    #[serde(other)]
+    Unknown,
+}
+
+/// Status of native three-finger swipe detection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum NativeSwipeStatus {
+    /// Native Raw Input is not enabled.
+    Off,
+    /// The Raw Input backend registered; this does not guarantee device support.
+    Active,
+    /// Native swipes were requested but could not be activated.
+    Inactive { reason: String },
+    /// The daemon reported a state this client does not recognize.
+    #[serde(other)]
+    Unknown,
+}
+
 /// Admission-time snapshot of a privilege-blocked window.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ElevationBlockedWindow {
@@ -815,6 +848,14 @@ pub enum IpcResponse {
         /// omitted the field; `Some` (including empty) is the current snapshot.
         #[serde(default)]
         elevation_blocked_records: Option<Vec<ElevationBlockedWindow>>,
+        /// Startup snapshot of native three-finger swipe status. `None` means
+        /// an older daemon did not report this field.
+        #[serde(default)]
+        native_swipes: Option<NativeSwipeStatus>,
+        /// File-log status, including the first observed write failure.
+        /// None means an older daemon did not report this field.
+        #[serde(default)]
+        daemon_log: Option<DaemonLogStatus>,
     },
     /// Forward-compatibility fallback for newer daemon responses unknown to this client.
     #[serde(other)]
@@ -1125,6 +1166,10 @@ mod tests {
                 elevation_blocked_windows: vec![],
                 daemon_integrity: None,
                 elevation_blocked_records: Some(vec![]),
+                native_swipes: None,
+                daemon_log: Some(DaemonLogStatus::Writing {
+                    path: "daemon.log".into(),
+                }),
             },
         ];
 
@@ -1579,11 +1624,15 @@ mod tests {
                 elevation_blocked_windows,
                 daemon_integrity,
                 elevation_blocked_records,
+                native_swipes,
+                daemon_log,
                 ..
             } => {
                 assert!(elevation_blocked_windows.is_empty());
                 assert_eq!(daemon_integrity, None);
                 assert_eq!(elevation_blocked_records, None);
+                assert_eq!(native_swipes, None);
+                assert_eq!(daemon_log, None);
             }
             other => panic!("expected HealthInfo, got {other:?}"),
         }
@@ -1605,6 +1654,10 @@ mod tests {
                 title: "Admin".to_string(),
                 reason: ElevationBlockReason::HigherIntegrity,
             }]),
+            native_swipes: None,
+            daemon_log: Some(DaemonLogStatus::Writing {
+                path: "daemon.log".into(),
+            }),
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["elevation_blocked_windows"][0][0], 16);
@@ -1623,6 +1676,53 @@ mod tests {
         assert_eq!(
             legacy.elevation_blocked_windows,
             vec![(0x10, "Admin".to_string())]
+        );
+    }
+
+    #[test]
+    fn native_swipe_status_round_trips_inactive_reason_and_unknown_state() {
+        let inactive = NativeSwipeStatus::Inactive {
+            reason: "device capability check failed".to_string(),
+        };
+        let json = serde_json::to_string(&inactive).unwrap();
+        assert_eq!(
+            serde_json::from_str::<NativeSwipeStatus>(&json).unwrap(),
+            inactive
+        );
+
+        let unknown: NativeSwipeStatus =
+            serde_json::from_str(r#"{"state":"future_state"}"#).unwrap();
+        assert_eq!(unknown, NativeSwipeStatus::Unknown);
+    }
+
+    #[test]
+    fn daemon_log_status_round_trips_failures_and_unknown_state() {
+        for (status, state) in [
+            (
+                DaemonLogStatus::OpenFailed {
+                    path: "daemon.log".into(),
+                    error: "access denied".into(),
+                },
+                "open_failed",
+            ),
+            (
+                DaemonLogStatus::WriteFailed {
+                    path: "daemon.log".into(),
+                    error: "disk full".into(),
+                },
+                "write_failed",
+            ),
+        ] {
+            let json = serde_json::to_value(&status).unwrap();
+            assert_eq!(json["state"], state);
+            assert_eq!(
+                serde_json::from_value::<DaemonLogStatus>(json).unwrap(),
+                status
+            );
+        }
+        assert_eq!(
+            serde_json::from_str::<DaemonLogStatus>(r#"{"state":"future_state"}"#).unwrap(),
+            DaemonLogStatus::Unknown
         );
     }
 

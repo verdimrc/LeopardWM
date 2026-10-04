@@ -4,9 +4,14 @@ use crate::daemon_cmds::find_daemon_binary;
 use crate::ipc_client::{probe_daemon_running, send_command};
 use anyhow::Result;
 use directories::ProjectDirs;
-use leopardwm_ipc::{ElevationBlockReason, ElevationBlockedWindow, IpcCommand, IpcResponse};
+use leopardwm_ipc::{
+    DaemonLogStatus, ElevationBlockReason, ElevationBlockedWindow, IpcCommand, IpcResponse,
+    NativeSwipeStatus,
+};
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 /// Result of a single diagnostic check.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -14,6 +19,161 @@ pub(crate) enum CheckResult {
     Pass(String),
     Warn(String),
     Fail(String),
+}
+
+pub(crate) fn native_swipes_check(status: Option<&NativeSwipeStatus>) -> CheckResult {
+    match status {
+        Some(NativeSwipeStatus::Off) => {
+            CheckResult::Pass("Native three-finger swipes: off (default)".to_string())
+        }
+        Some(NativeSwipeStatus::Active) => CheckResult::Pass(
+            "Native three-finger swipes: active (Raw Input registered)".to_string(),
+        ),
+        Some(NativeSwipeStatus::Inactive { reason }) => CheckResult::Warn(format!(
+            "Native three-finger swipes are enabled but inactive: {reason}"
+        )),
+        Some(NativeSwipeStatus::Unknown) => CheckResult::Warn(
+            "Native three-finger swipe status not recognized by this CLI".to_string(),
+        ),
+        None => CheckResult::Warn(
+            "Native three-finger swipe status unavailable (daemon did not report it; older daemon)"
+                .to_string(),
+        ),
+    }
+}
+
+pub(crate) fn daemon_log_path(
+    status: Option<&DaemonLogStatus>,
+    running: Option<bool>,
+    default: &Path,
+) -> (PathBuf, &'static str) {
+    match status {
+        Some(
+            DaemonLogStatus::Writing { path }
+            | DaemonLogStatus::OpenFailed { path, .. }
+            | DaemonLogStatus::WriteFailed { path, .. },
+        ) => (PathBuf::from(path), "reported by the running daemon"),
+        _ if running == Some(false) => (
+            default.to_path_buf(),
+            "default path because the daemon isn't running",
+        ),
+        _ if running.is_none() => (
+            default.to_path_buf(),
+            "default path because the daemon state could not be checked",
+        ),
+        _ => (
+            default.to_path_buf(),
+            "default path because the daemon didn't report one",
+        ),
+    }
+}
+
+/// The `behavior.log_level` in the config file and what it writes. A missing
+/// file, missing key, or unrecognized value means info, as in daemon startup.
+/// The daemon applies the level only at startup, so this is the configured
+/// level, not necessarily the running daemon's. A file that exists but cannot
+/// be read is unknown, because the daemon may be able to read it.
+pub(crate) fn configured_log_level(config: Option<(PathBuf, io::Result<String>)>) -> String {
+    const LEVELS: [(&str, &str); 5] = [
+        ("trace", "everything is written"),
+        ("debug", "debug, info, warnings and errors are written"),
+        ("info", "info, warnings and errors are written"),
+        ("warn", "only warnings and errors are written"),
+        ("error", "only errors are written"),
+    ];
+    let text = match config {
+        Some((path, Err(error))) => {
+            return format!("unknown (could not read {}: {error})", path.display());
+        }
+        Some((_, Ok(text))) => Some(text),
+        None => None,
+    };
+    let configured = text
+        .and_then(|text| text.parse::<toml::Table>().ok())
+        .and_then(|table| {
+            let level = table.get("behavior")?.get("log_level")?.as_str()?;
+            LEVELS
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(level))
+        });
+    match configured {
+        Some((name, writes)) => format!("{name} ({writes})"),
+        None => "info (default; no recognized behavior.log_level in the config file)".to_string(),
+    }
+}
+
+pub(crate) fn daemon_log_check(
+    status: Option<&DaemonLogStatus>,
+    modified: Option<SystemTime>,
+    now: SystemTime,
+    uptime_seconds: Option<u64>,
+    log_level: &str,
+) -> CheckResult {
+    match status {
+        Some(DaemonLogStatus::OpenFailed { path, error }) => {
+            let message = format!("Daemon log: cannot open {path}: {error}");
+            CheckResult::Fail(message)
+        }
+        Some(DaemonLogStatus::WriteFailed { path, error }) => {
+            let message = format!("Daemon log: cannot write {path}: {error}");
+            CheckResult::Fail(message)
+        }
+        Some(DaemonLogStatus::Writing { path }) => {
+            // Allow 60 seconds for logging before AppState.start_time and uptime rounding.
+            let start =
+                uptime_seconds.and_then(|uptime| now.checked_sub(Duration::from_secs(uptime)));
+            let stale = start
+                .zip(modified)
+                .and_then(|(start, modified)| start.duration_since(modified).ok())
+                .is_some_and(|age| age > Duration::from_secs(60));
+            if stale {
+                let message = format!(
+                    "Daemon log: {path}; the daemon has not written to it since it started"
+                );
+                CheckResult::Warn(message)
+            } else if modified.is_none() {
+                let message = format!("Daemon log: writing {path}; file modified time unavailable");
+                CheckResult::Warn(message)
+            } else {
+                CheckResult::Pass(format!(
+                    "Daemon log: writing {path}; configured log level: {log_level}"
+                ))
+            }
+        }
+        Some(DaemonLogStatus::Unknown) => {
+            CheckResult::Warn("Daemon log status not recognized by this CLI".into())
+        }
+        None => CheckResult::Warn(
+            concat!(
+                "Daemon log status unavailable (daemon not running, ",
+                "health unavailable, or older daemon)"
+            )
+            .into(),
+        ),
+    }
+}
+
+fn print_daemon_log_check(status: Option<&DaemonLogStatus>, uptime_seconds: Option<u64>) {
+    let (path, _) = daemon_log_path(
+        status,
+        Some(uptime_seconds.is_some()),
+        &leopardwm_ipc::log_dir().join("leopardwm-daemon.log"),
+    );
+    let modified = fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok();
+    let config = doctor_config_path().0.map(|path| {
+        let text = fs::read_to_string(&path);
+        (path, text)
+    });
+    daemon_log_check(
+        status,
+        modified,
+        SystemTime::now(),
+        uptime_seconds,
+        &configured_log_level(config),
+    )
+    .print();
 }
 
 impl CheckResult {
@@ -239,6 +399,7 @@ pub(crate) async fn handle_doctor() -> Result<()> {
 
     // A non-zero thumbnail balance at rest means a DWM thumbnail leaked.
     let mut printed_daemon_integrity = false;
+    let mut printed_daemon_log = false;
     let mut blocked_windows_result = None;
     if matches!(probe_daemon_running(), Ok(true)) {
         match send_command(IpcCommand::HealthCheck).await {
@@ -247,6 +408,9 @@ pub(crate) async fn handle_doctor() -> Result<()> {
                 elevation_blocked_windows,
                 daemon_integrity,
                 elevation_blocked_records,
+                native_swipes,
+                daemon_log,
+                uptime_seconds,
                 ..
             }) => {
                 if thumbnail_register_balance == 0 {
@@ -261,6 +425,9 @@ pub(crate) async fn handle_doctor() -> Result<()> {
                 }
                 .print();
 
+                native_swipes_check(native_swipes.as_ref()).print();
+                print_daemon_log_check(daemon_log.as_ref(), Some(uptime_seconds));
+                printed_daemon_log = true;
                 integrity_check("Daemon", daemon_integrity).print();
                 printed_daemon_integrity = true;
                 blocked_windows_result = Some(blocked_windows_check(
@@ -283,6 +450,9 @@ pub(crate) async fn handle_doctor() -> Result<()> {
             }
         }
     }
+    if !printed_daemon_log {
+        print_daemon_log_check(None, None);
+    }
     if !printed_daemon_integrity {
         integrity_check("Daemon", None).print();
     }
@@ -299,7 +469,7 @@ pub(crate) async fn handle_doctor() -> Result<()> {
 }
 
 /// Collect diagnostic logs into a text report for bug reports.
-pub(crate) fn handle_collect_logs() -> Result<()> {
+pub(crate) async fn handle_collect_logs() -> Result<()> {
     println!("LeopardWM Log Collection");
     println!("=======================\n");
 
@@ -324,14 +494,46 @@ pub(crate) fn handle_collect_logs() -> Result<()> {
     }
     println!();
 
+    println!("## Native Touchpad Swipes");
+    let probe = probe_daemon_running();
+    let running = probe.as_ref().ok().copied();
+    let mut log_status = None;
+    let mut log_uptime = None;
+    if running == Some(true) {
+        match send_command(IpcCommand::HealthCheck).await {
+            Ok(IpcResponse::HealthInfo {
+                native_swipes,
+                daemon_log,
+                uptime_seconds,
+                ..
+            }) => {
+                native_swipes_check(native_swipes.as_ref()).print();
+                log_status = daemon_log;
+                log_uptime = Some(uptime_seconds);
+            }
+            Ok(other) => println!("  (status unavailable: unexpected health response: {other:?})"),
+            Err(error) => println!("  (status unavailable: health query failed: {error})"),
+        }
+    } else {
+        if let Err(error) = probe {
+            println!("  (status unavailable: could not check daemon state: {error})");
+        } else {
+            println!("  (status unavailable because the daemon is not running)");
+        }
+    }
+    println!();
+
     let log_dir = leopardwm_ipc::log_dir();
+    let (log_path, source) = daemon_log_path(
+        log_status.as_ref(),
+        running,
+        &log_dir.join("leopardwm-daemon.log"),
+    );
+    println!("Daemon log file read: {} ({source})", log_path.display());
+    print_daemon_log_check(log_status.as_ref(), log_uptime);
     print!(
         "{}",
-        format_file_section(
-            "Daemon Log",
-            &log_dir.join("leopardwm-daemon.log"),
-            Some(100),
-        )
+        format_file_section("Daemon Log", &log_path, Some(100))
     );
     println!();
 

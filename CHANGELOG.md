@@ -2,6 +2,49 @@
 
 All notable changes to LeopardWM will be documented in this file.
 
+## 0.3.0
+
+### Fixes
+
+- **With `workspace_edge_wrap` on, vertical focus now leaves an empty workspace.** An empty workspace counts as a column edge, so `focus_up` and `focus_down` (including three-finger swipes mapped to them) move to the adjacent workspace instead of doing nothing. Moving windows up or down is unchanged. Contributed by @c3us-dev. (#133)
+
+### Internal
+
+- **Lockfile dependency updates:** thiserror 2.0.21.
+
+## 0.2.13
+
+### Fixes
+
+- **A window that opens maximized is now tiled even when Windows ignores the first non-activating restore.** When that restore leaves the window zoomed, LeopardWM retries it on the window's own thread and waits briefly for the result, instead of leaving the window maximized.
+- **Tiling no longer pauses after wake when an app stays unresponsive during a monitor or dock change.** Responsive windows are tiled immediately, while busy apps receive their queued placement once they respond. The daemon log names the windows deferred during display reconciliation. (#122)
+- **The daemon log and `lwm doctor` now show the log level.** The startup line in the daemon log names the level the daemon is filtering at, and `lwm doctor` reports the `log_level` set in `config.toml`, so a log that stays quiet at `"warn"` or `"error"` is easy to recognize. The daemon reads the level only at startup, so restart it after changing `log_level`. (#113)
+
+## 0.2.12
+
+### Features
+
+- **Precision Touchpads can opt in to experimental native three-finger swipes.** Off by default. Contributed by @c3us-dev. Opt in with `raw_input = true` under `[gestures]` in `config.toml` or the "Native three-finger swipes" toggle in Settings, then restart LeopardWM. Set Windows three- and four-finger touchpad gestures to Nothing, or Windows will consume the swipe. Wheel-based swipes remain active if Raw Input registration or the device capability check fails at startup. `lwm doctor` and `lwm collect-logs` show whether native swipes are active or why they are inactive. Compatibility varies by device. (#102)
+
+### Fixes
+
+- **Quit from the tray now exits and restores parked windows even when LeopardWM has stopped responding, after a few seconds.** (#128)
+- **An app that hides and recreates its window shortly after the PC wakes from sleep returns to its column or tab.** Restoration requires the same process and window class, within about two minutes of resume and 60 seconds of the hide, and never changes another workspace's focus. The daemon log now records suspend and resume. Modern Standby uses the documented suspend/resume notification registration but has not been verified on Modern Standby hardware.
+- **Installing the MSI over an existing copy now replaces the watchdog and CLI executables.** They now carry version information like the daemon.
+- **Daemon log failures are now visible in `lwm doctor` and `lwm collect-logs`.** Diagnostics show the daemon-reported log path and report when it cannot open or write the log, or has not written to it since it started; log collection identifies the file it reads. The daemon writes one startup line at every log level, so the stale-log check also holds with `log_level = "warn"` or `"error"`. The daemon keeps running if its log cannot be opened. (#113)
+- **Windows no longer jump back to an earlier animation position after landing when the app is busy.** Late animation moves stay ordered before the landing endpoint. (#127)
+- **Apps that reopen maximized are restored without activation instead of staying maximized over the layout.** Restoration runs off the event loop, so a busy app no longer freezes LeopardWM while it is restored. When the new window takes focus, its column fills the visible viewport; otherwise, it uses its usual width, including any per-app `column_width` setting.
+- **Dismissing Start or a launcher keeps the selected empty workspace.** New windows launched there open on that workspace instead of returning focus to a parked window on another workspace.
+- **Windows that are minimized by Windows are no longer dropped from the layout.** After a monitor disconnect or a normal minimize, they return in their own column, width, and workspace. Apps that hide to the tray are still removed.
+- **Tiling, hotkeys, and tray actions stay responsive when an app stops responding.** Snap-layout changes and maximized-window admission restores are applied once the app responds. Queued snap-layout changes no longer affect a replacement window that reuses a closed managed window's handle.
+- **Switching tabs no longer leaves the shown window a few pixels inside its tab strip and border.** When a window's frame insets were measured wrong just before it moved, the landing check re-measures them and places the window again.
+- **Minimizing a window no longer switches to a workspace where Windows activates a parked window.** Missed minimize events are also reconciled so minimized windows do not leave empty columns.
+- **Restoring a window from the taskbar that was minimized on another workspace no longer bounces back to the current workspace.** The window is not snapped away during its restore animation, and LeopardWM switches to its workspace once and keeps it focused; the restored window no longer drops and slides back in as its workspace appears.
+- **Column widths no longer drift when display resolution or scaling changes and then changes back.** Rescaling keeps the original width fraction through rounded intermediate sizes, including for columns split off with expel, while manual width changes become the new sizing basis.
+- **Narrowing a column no longer leaves the view scrolled past the end.** After dragging its border, the view scrolls like a keyboard width change so columns that now fit come back into view.
+- **Tiling no longer pauses when windows are slow to move after a monitor or dock change.** A first timeout during display reconciliation schedules one retry after the displays settle; its late worker no longer restores windows just before the retry re-tiles them. A retry timeout pauses tiling, while a retry dropped during manual pause restores visibility.
+- **Notion Calendar's meeting popup is no longer tiled.** Always-on-top windows with no title bar, no resizable border, and no taskbar-window style are left alone at startup and when they open; normal and always-on-top app windows are still tiled. (#74)
+
 ## 0.2.11
 
 ### Fixes

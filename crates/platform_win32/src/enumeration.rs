@@ -20,8 +20,8 @@ use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFOR
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetAncestor, GetClassNameW, GetWindow, GetWindowLongW, GetWindowRect,
     GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow,
-    IsWindowVisible, GA_ROOT, GWL_EXSTYLE, GWL_STYLE, GW_OWNER, WS_EX_APPWINDOW, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_THICKFRAME, WS_VISIBLE,
+    IsWindowVisible, GA_ROOT, GWL_EXSTYLE, GWL_STYLE, GW_OWNER, WS_CAPTION, WS_EX_APPWINDOW,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_THICKFRAME, WS_VISIBLE,
 };
 
 /// Whether a tool window (`WS_EX_TOOLWINDOW`) should be excluded from tiling.
@@ -38,6 +38,15 @@ pub(crate) fn is_excluded_tool_window(style: u32, ex_style: u32) -> bool {
     is_tool && (!is_app || !is_resizable)
 }
 
+/// Excludes always-on-top notification popups without app-window chrome.
+/// Chromium/Electron main windows keep `WS_THICKFRAME` or `WS_CAPTION`.
+pub(crate) fn is_excluded_topmost_popup(style: u32, ex_style: u32) -> bool {
+    ex_style & WS_EX_TOPMOST.0 != 0
+        && ex_style & WS_EX_APPWINDOW.0 == 0
+        && style & WS_CAPTION.0 == 0
+        && style & WS_THICKFRAME.0 == 0
+}
+
 /// Reads a live window's current styles to test [`is_excluded_tool_window`].
 /// Style-only, so it's safe to call on already-managed windows without
 /// false-positiving on transient title/cloak states.
@@ -46,6 +55,15 @@ pub fn is_excluded_tool_window_hwnd(hwnd: WindowId) -> bool {
     let style = unsafe { GetWindowLongW(hwnd, GWL_STYLE) as u32 };
     let ex_style = unsafe { GetWindowLongW(hwnd, GWL_EXSTYLE) as u32 };
     is_excluded_tool_window(style, ex_style)
+}
+
+/// Reads current styles for the admission-only topmost popup exclusion.
+/// Already-managed windows may acquire this shape without losing management.
+pub fn is_excluded_topmost_popup_hwnd(hwnd: WindowId) -> bool {
+    let hwnd = HWND(hwnd as *mut c_void);
+    let style = unsafe { GetWindowLongW(hwnd, GWL_STYLE) as u32 };
+    let ex_style = unsafe { GetWindowLongW(hwnd, GWL_EXSTYLE) as u32 };
+    is_excluded_topmost_popup(style, ex_style)
 }
 
 /// Checks built-in class exclusions without rejecting hidden or cloaked managed windows.
@@ -61,10 +79,11 @@ pub fn is_excluded_window_class_hwnd(hwnd: WindowId) -> bool {
 /// or windows with empty titles, making it suitable for handling window
 /// creation events where UWP apps may still be transitioning.
 ///
-/// Adding or reordering a check here requires the same edit in
-/// `platform_win32/src/inspect.rs` (`classify_live_create` only). The two
-/// admission chains intentionally diverge: live-create omits cloak, empty
-/// title, and skip-title relative to startup so transient popups can admit.
+/// Used for both admission and already-managed window lookups. The daemon
+/// applies the admission-only topmost popup exclusion after this read succeeds.
+/// Changes to these filters must be reflected in `inspect.rs`'s live-create
+/// diagnostics, which also model that daemon admission check. Live-create omits
+/// cloak, empty title, and skip-title relative to startup.
 pub fn get_window_info(hwnd_id: WindowId) -> Option<WindowInfo> {
     unsafe {
         let hwnd = HWND(hwnd_id as *mut c_void);
@@ -149,6 +168,7 @@ pub fn get_window_info(hwnd_id: WindowId) -> Option<WindowInfo> {
 /// Filters out:
 /// - Invisible windows
 /// - Tool windows, unless they are a resizable WS_EX_APPWINDOW
+/// - Topmost popups without caption, sizing frame, or WS_EX_APPWINDOW
 /// - Windows with empty titles
 /// - Cloaked windows
 /// - Windows with WS_EX_NOACTIVATE
@@ -414,6 +434,10 @@ unsafe extern "system" fn enum_windows_callback(hwnd: HWND, lparam: LPARAM) -> B
         if !owner.is_invalid() {
             return TRUE;
         }
+    }
+
+    if is_excluded_topmost_popup(style, ex_style) {
+        return TRUE;
     }
 
     // Skip cloaked windows (e.g., on other virtual desktops)
@@ -696,6 +720,7 @@ pub(crate) fn should_skip_window_by_class(class_name: &str) -> bool {
         // so it fails the "no minimize *and* no maximize" test.
         "Chrome_RenderWidgetHostHWND", // Internal Electron/Chrome render widget, not a real window
         "LeopardWMSettings",           // Our own settings window
+        "LeopardWMFocusPlaceholder",   // Invisible foreground target on empty workspaces
         "LeopardWMBorderFrame",        // Our own border overlay
         "LeopardWMThumbnailHost",      // Our own DWM thumbnail host
         "LeopardWMOverview",           // Our own overview overlay
@@ -736,13 +761,13 @@ pub fn get_process_executable(pid: u32) -> Option<String> {
     }
 }
 
-pub(crate) struct TopLevelWindowIdCollection {
-    pub(crate) window_ids: Vec<WindowId>,
-    pub(crate) error: Option<Win32Error>,
+pub struct TopLevelWindowIdCollection {
+    pub window_ids: Vec<WindowId>,
+    pub error: Option<Win32Error>,
 }
 
 /// Collect all top-level window IDs (used by emergency restore).
-pub(crate) fn collect_all_top_level_window_ids() -> TopLevelWindowIdCollection {
+pub fn collect_all_top_level_window_ids() -> TopLevelWindowIdCollection {
     collect_all_top_level_window_ids_with(|window_ids| unsafe {
         EnumWindows(
             Some(collect_all_window_ids_callback),
@@ -805,6 +830,39 @@ mod tests {
         // Not a tool window — never excluded here (resizable or not).
         assert!(!is_excluded_tool_window(thickframe, app));
         assert!(!is_excluded_tool_window(0, 0));
+    }
+
+    #[test]
+    fn topmost_popup_excludes_captured_notion_calendar_styles() {
+        assert!(is_excluded_topmost_popup(0x14020000, 0x00200008));
+        assert!(is_excluded_topmost_popup(0x04020000, 0x00200008));
+    }
+
+    #[test]
+    fn topmost_popup_preserves_app_window_shapes() {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_OVERLAPPEDWINDOW, WS_SYSMENU,
+        };
+
+        let frameless_resizable =
+            (WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU | WS_VISIBLE).0;
+        assert!(!is_excluded_topmost_popup(
+            frameless_resizable,
+            WS_EX_TOPMOST.0
+        ));
+        assert!(!is_excluded_topmost_popup(
+            (WS_OVERLAPPEDWINDOW | WS_VISIBLE).0,
+            WS_EX_TOPMOST.0
+        ));
+        assert!(!is_excluded_topmost_popup(
+            (WS_CAPTION | WS_SYSMENU | WS_VISIBLE).0,
+            WS_EX_TOPMOST.0
+        ));
+        assert!(!is_excluded_topmost_popup(
+            0x14020000,
+            0x00200008 | WS_EX_APPWINDOW.0
+        ));
+        assert!(!is_excluded_topmost_popup(0x14020000, 0x00200000));
     }
 
     #[test]
@@ -1020,12 +1078,13 @@ mod tests {
     }
 
     #[test]
-    fn test_skip_classes_does_not_contain_application_frame_window() {
+    fn test_skip_classes_preserve_uwp_and_exclude_focus_placeholder() {
         let skip = should_skip_window_by_class("ApplicationFrameWindow");
         assert!(
             !skip,
             "ApplicationFrameWindow should NOT be in skip list (UWP apps should be tiled)"
         );
+        assert!(should_skip_window_by_class("LeopardWMFocusPlaceholder"));
     }
 
     #[test]

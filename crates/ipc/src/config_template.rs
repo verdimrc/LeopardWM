@@ -118,6 +118,8 @@ focus_follows_mouse = false
 [hotkeys]
 {hotkeys}
 [gestures]
+# raw_input = false  # Opt in to native Precision Touchpad swipes; restart required.
+# Requires Windows three- and four-finger touchpad gestures set to Nothing.
 # Touchpad gesture support
 enabled = true
 swipe_left = "focus_left"

@@ -1530,8 +1530,24 @@ fn test_config_backup_and_restore_roundtrip() {
 }
 
 #[test]
-fn test_handle_collect_logs_does_not_panic() {
-    let result = handle_collect_logs();
+fn native_swipes_check_warns_with_reason_and_passes_when_off() {
+    use leopardwm_ipc::NativeSwipeStatus;
+
+    let inactive = native_swipes_check(Some(&NativeSwipeStatus::Inactive {
+        reason: "device capability check failed".to_string(),
+    }));
+    assert!(
+        matches!(inactive, CheckResult::Warn(message) if message.contains("device capability check failed"))
+    );
+    assert_eq!(
+        native_swipes_check(Some(&NativeSwipeStatus::Off)),
+        CheckResult::Pass("Native three-finger swipes: off (default)".to_string())
+    );
+}
+
+#[tokio::test]
+async fn test_handle_collect_logs_does_not_panic() {
+    let result = handle_collect_logs().await;
     assert!(result.is_ok());
 }
 
@@ -1636,4 +1652,155 @@ fn test_all_profile_configs_are_valid_toml() {
             result.err()
         );
     }
+}
+
+#[test]
+fn daemon_log_check_reports_failures_staleness_and_unavailable_status() {
+    use leopardwm_ipc::DaemonLogStatus;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let now = UNIX_EPOCH + Duration::from_secs(1000);
+    let level = "warn (only warnings and errors are written)";
+    let writing = DaemonLogStatus::Writing {
+        path: "reported.log".into(),
+    };
+    for (age_before_start, warn) in [(0, false), (60, false), (61, true)] {
+        let modified = now - Duration::from_secs(100 + age_before_start);
+        let result = daemon_log_check(Some(&writing), Some(modified), now, Some(100), level);
+        if warn {
+            assert!(
+                matches!(result, CheckResult::Warn(message) if message.contains("has not written") && message.contains("reported.log"))
+            );
+        } else {
+            assert_eq!(
+                result,
+                CheckResult::Pass(
+                    "Daemon log: writing reported.log; configured log level: warn (only warnings and errors are written)"
+                        .into()
+                )
+            );
+        }
+    }
+    for status in [
+        DaemonLogStatus::OpenFailed {
+            path: "reported.log".into(),
+            error: "access denied".into(),
+        },
+        DaemonLogStatus::WriteFailed {
+            path: "reported.log".into(),
+            error: "disk full".into(),
+        },
+    ] {
+        let result = daemon_log_check(
+            Some(&status),
+            Some(SystemTime::UNIX_EPOCH),
+            now,
+            Some(100),
+            level,
+        );
+        let expected = match status {
+            DaemonLogStatus::OpenFailed { .. } => "cannot open reported.log: access denied",
+            _ => "cannot write reported.log: disk full",
+        };
+        assert!(matches!(result, CheckResult::Fail(message) if message.contains(expected)));
+    }
+    for status in [None, Some(&DaemonLogStatus::Unknown)] {
+        assert!(matches!(
+            daemon_log_check(status, None, now, None, level),
+            CheckResult::Warn(_)
+        ));
+    }
+    assert!(
+        matches!(daemon_log_check(Some(&writing), None, now, Some(100), level), CheckResult::Warn(message) if message.contains("modified time unavailable"))
+    );
+}
+
+#[test]
+fn configured_log_level_reports_the_daemon_startup_level() {
+    let default = "info (default; no recognized behavior.log_level in the config file)";
+    let read = |text: &str| {
+        Some((
+            PathBuf::from("config.toml"),
+            Ok::<_, std::io::Error>(text.to_string()),
+        ))
+    };
+    for (config, expected) in [
+        (
+            read("[behavior]\nlog_level = \"warn\"\n"),
+            "warn (only warnings and errors are written)",
+        ),
+        (
+            read("[behavior]\nlog_level = \"ERROR\"\n"),
+            "error (only errors are written)",
+        ),
+        (
+            read("[behavior]\nlog_level = \"info\"\n"),
+            "info (info, warnings and errors are written)",
+        ),
+        (None, default),
+        (read("[behavior]\nfocus_follows_mouse = true\n"), default),
+        (read("[behavior]\nlog_level = \"verbose\"\n"), default),
+        (read("[behavior]\nlog_level = 3\n"), default),
+        (read("log_level = \"warn\"\n"), default),
+        (read("[behavior\nlog_level = \"warn\"\n"), default),
+        (
+            Some((
+                PathBuf::from("config.toml"),
+                Err(std::io::Error::other("access denied")),
+            )),
+            "unknown (could not read config.toml: access denied)",
+        ),
+    ] {
+        let case = format!("{config:?}");
+        assert_eq!(configured_log_level(config), expected, "{case}");
+    }
+}
+
+#[test]
+fn daemon_log_path_uses_reported_paths_and_explains_fallbacks() {
+    use leopardwm_ipc::DaemonLogStatus;
+    let default = PathBuf::from("default.log");
+    for status in [
+        DaemonLogStatus::Writing {
+            path: "reported.log".into(),
+        },
+        DaemonLogStatus::OpenFailed {
+            path: "reported.log".into(),
+            error: "denied".into(),
+        },
+        DaemonLogStatus::WriteFailed {
+            path: "reported.log".into(),
+            error: "full".into(),
+        },
+    ] {
+        assert_eq!(
+            daemon_log_path(Some(&status), Some(true), &default),
+            (
+                PathBuf::from("reported.log"),
+                "reported by the running daemon"
+            )
+        );
+    }
+    assert_eq!(
+        daemon_log_path(None, Some(false), &default),
+        (
+            default.clone(),
+            "default path because the daemon isn't running"
+        )
+    );
+    for status in [None, Some(&DaemonLogStatus::Unknown)] {
+        assert_eq!(
+            daemon_log_path(status, Some(true), &default),
+            (
+                default.clone(),
+                "default path because the daemon didn't report one"
+            )
+        );
+    }
+    assert_eq!(
+        daemon_log_path(None, None, &default),
+        (
+            default,
+            "default path because the daemon state could not be checked"
+        )
+    );
 }
