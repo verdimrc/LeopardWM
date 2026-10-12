@@ -134,6 +134,10 @@ pub struct LayoutConfig {
     #[serde(default)]
     pub centering_mode: CenteringModeConfig,
 
+    /// Center the only active tiled column when it fits inside the viewport.
+    #[serde(default)]
+    pub center_single_column: bool,
+
     /// Whether center-column can scroll past content edges.
     /// When true, the first/last column will be truly centered with empty space.
     /// When false (default), scroll is clamped to content boundaries.
@@ -212,6 +216,7 @@ impl Default for LayoutConfig {
             outer_gap_bottom: default_outer_gap(),
             centering_mode: CenteringModeConfig::default(),
             center_past_edges: false,
+            center_single_column: false,
             width_presets: default_width_presets(),
             default_width_preset: default_width_preset(),
             default_width_preset_monitor_overrides: std::collections::BTreeMap::new(),
@@ -328,6 +333,7 @@ impl From<CenteringModeConfig> for CenteringMode {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppearanceConfig {
+    pub language: String,
     /// Whether to highlight the active window border (Windows 11+).
     #[serde(default = "default_true")]
     pub active_border: bool,
@@ -391,6 +397,7 @@ fn default_tab_strip_opacity() -> u8 {
 impl Default for AppearanceConfig {
     fn default() -> Self {
         Self {
+            language: "en".to_string(),
             active_border: true,
             active_border_color: default_active_border_color(),
             active_border_width: default_active_border_width(),
@@ -416,13 +423,24 @@ pub enum TabCloseAction {
     Untab,
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskbarButtons {
+    #[default]
+    HideOffscreen,
+    HideInactiveWorkspaces,
+    ShowAll,
+}
+
 /// Behavior-related configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, remote = "Self")]
 pub struct BehaviorConfig {
     /// Whether to focus new windows automatically.
     #[serde(default = "default_true")]
     pub focus_new_windows: bool,
+
+    pub new_window_monitor: NewWindowMonitor,
 
     /// Whether to track window focus changes from Windows.
     #[serde(default = "default_true")]
@@ -465,16 +483,19 @@ pub struct BehaviorConfig {
     #[serde(default = "default_true")]
     pub swap_chain_ghost_animation: bool,
 
+    #[serde(default)]
+    pub floating_above_tiled: bool,
+
     /// Where newly opened windows go: their own new column (default) or
     /// stacked into the focused column.
     #[serde(default)]
     pub new_window_placement: NewWindowPlacement,
 
-    /// Hide a window's taskbar button while it isn't visible in the current
-    /// view (on another workspace, or scrolled out of view). Floating and
-    /// minimized windows always keep their button.
-    #[serde(default = "default_true")]
-    pub hide_offscreen_taskbar_buttons: bool,
+    /// Taskbar button visibility policy. Inactive workspaces hide all buttons
+    /// unless ShowAll is selected. On the active workspace, HideOffscreen
+    /// keeps buttons for visible, floating, and minimized windows.
+    #[serde(default)]
+    pub taskbar_buttons: TaskbarButtons,
 
     /// Wrap vertical focus/move at a column's top or bottom edge into the
     /// adjacent workspace. When on, focus_up/focus_down at the edge switch to
@@ -510,6 +531,19 @@ pub struct BehaviorConfig {
     /// to silence the pop-up.
     #[serde(default = "default_true")]
     pub notify_elevation_blocked: bool,
+
+    #[serde(default = "default_false")]
+    pub skip_empty_workspaces: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NewWindowMonitor {
+    #[default]
+    Opening,
+    Focused,
+    /// The monitor under the mouse cursor, falling back to `Opening`.
+    Cursor,
 }
 
 /// Placement for newly opened tiled windows.
@@ -528,6 +562,7 @@ impl Default for BehaviorConfig {
     fn default() -> Self {
         Self {
             focus_new_windows: true,
+            new_window_monitor: NewWindowMonitor::default(),
             track_focus_changes: true,
             log_level: default_log_level(),
             focus_follows_mouse: false,
@@ -536,14 +571,49 @@ impl Default for BehaviorConfig {
             check_for_updates: true,
             tab_close_action: TabCloseAction::default(),
             swap_chain_ghost_animation: true,
+            floating_above_tiled: false,
             new_window_placement: NewWindowPlacement::default(),
-            hide_offscreen_taskbar_buttons: true,
+            taskbar_buttons: TaskbarButtons::default(),
             workspace_edge_wrap: false,
             mouse_follows_focus: false,
             fullscreen_follows_focus: true,
             notify_elevation_blocked: true,
             symmetric_modifiers: false,
+            skip_empty_workspaces: false,
         }
+    }
+}
+
+impl Serialize for BehaviorConfig {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        Self::serialize(self, serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for BehaviorConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let mut value = serde_json::Value::deserialize(deserializer)?;
+        if let Some(fields) = value.as_object_mut() {
+            if let Some(legacy) = fields.remove("hide_offscreen_taskbar_buttons") {
+                if !fields.contains_key("taskbar_buttons") {
+                    let enabled = legacy.as_bool().ok_or_else(|| {
+                        serde::de::Error::custom("hide_offscreen_taskbar_buttons must be a boolean")
+                    })?;
+                    fields.insert(
+                        "taskbar_buttons".into(),
+                        serde_json::Value::String(
+                            if enabled {
+                                "hide_offscreen"
+                            } else {
+                                "show_all"
+                            }
+                            .into(),
+                        ),
+                    );
+                }
+            }
+        }
+        Self::deserialize(value).map_err(serde::de::Error::custom)
     }
 }
 
@@ -687,6 +757,12 @@ pub struct WindowRule {
     #[serde(default)]
     pub match_executable: Option<String>,
 
+    /// Maximum outer window size in logical pixels at admission.
+    #[serde(default)]
+    pub match_max_width: Option<i32>,
+    #[serde(default)]
+    pub match_max_height: Option<i32>,
+
     /// Action to take when the rule matches.
     #[serde(default)]
     pub action: WindowAction,
@@ -728,11 +804,11 @@ pub struct WindowRule {
     #[serde(default)]
     pub sticky: bool,
 
-    /// Tile the window on whichever monitor Windows initially placed it,
-    /// instead of the monitor under the cursor. Useful for apps that manage
-    /// their own monitor placement and should land where they asked to open.
+    /// Override `behavior.new_window_monitor` for matching windows:
+    /// `"opening"`, `"focused"`, or `"cursor"`. E.g. `"opening"` lets an app
+    /// that manages its own monitor placement land where it asked to open.
     #[serde(default)]
-    pub tile_on_os_monitor: bool,
+    pub new_window_monitor: Option<NewWindowMonitor>,
 }
 
 /// Action to take for a matching window.
@@ -783,12 +859,20 @@ impl WindowRule {
     /// Note: Runtime code uses `CompiledWindowRule::matches()` for efficiency.
     /// This method is retained for tests and direct use.
     #[allow(dead_code)]
-    pub fn matches(&self, class_name: &str, title: &str, executable: &str) -> bool {
+    pub fn matches(
+        &self,
+        class_name: &str,
+        title: &str,
+        executable: &str,
+        size: Option<(i32, i32)>,
+    ) -> bool {
         let has_any_criteria = self.match_class.is_some()
             || self.match_title.is_some()
             || self.match_executable.is_some();
 
-        if !has_any_criteria {
+        if !has_any_criteria
+            || !matches_window_size(self.match_max_width, self.match_max_height, size)
+        {
             return false;
         }
 
@@ -829,17 +913,11 @@ impl WindowRule {
 
 /// Hotkey bindings configuration.
 ///
-/// Each key is a hotkey string (e.g., "Win+Alt+H") and each value is a command
-/// (e.g., "focus_left"). Supported commands:
-/// - focus_left, focus_right, focus_up, focus_down
-/// - move_column_left, move_column_right
-/// - focus_monitor_left, focus_monitor_right, focus_monitor_up, focus_monitor_down
-/// - move_to_monitor_left, move_to_monitor_right, move_to_monitor_up, move_to_monitor_down
-/// - resize_grow, resize_shrink (by 50px)
-/// - scroll_left, scroll_right (by 100px)
-/// - refresh, reload
-/// - panic_revert (emergency visibility restore + shutdown)
-/// - toggle_pause (pause/resume tiling)
+/// Each key is a hotkey string (e.g., "Ctrl+Alt+H") and each value is a command
+/// (e.g., "focus_left"). Available actions and labels come from
+/// `leopardwm_ipc::hotkeys::hotkey_catalog`.
+/// Unbound actions include focus_next/focus_prev (linear window navigation)
+/// and scroll_left/scroll_right (move the strip viewport by 100 px).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct HotkeyConfig {
@@ -875,9 +953,13 @@ impl Default for HotkeyConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GestureConfig {
-    /// Whether gesture support is enabled.
+    /// Whether gesture support is enabled. Takes effect on config reload.
     #[serde(default = "default_true")]
     pub enabled: bool,
+
+    /// Detect swipes delivered as injected wheel events by touchpad or mouse drivers.
+    #[serde(default = "default_true")]
+    pub wheel_swipes: bool,
 
     /// Use native Precision Touchpad Raw Input for three-finger swipes.
     /// Takes effect on daemon restart; the wheel hook remains the fallback.
@@ -968,6 +1050,7 @@ impl Default for GestureConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            wheel_swipes: true,
             raw_input: false,
             swipe_left: default_swipe_left(),
             swipe_right: default_swipe_right(),
@@ -1106,6 +1189,8 @@ pub struct CompiledWindowRule {
     pub title_regex: Option<regex::Regex>,
     /// Executable name to match (case-insensitive string comparison).
     pub match_executable: Option<String>,
+    pub match_max_width: Option<i32>,
+    pub match_max_height: Option<i32>,
     /// Action to take when the rule matches.
     pub action: WindowAction,
     /// Fixed width for floating windows (optional).
@@ -1125,18 +1210,44 @@ pub struct CompiledWindowRule {
     pub open_in_column: Option<usize>,
     /// Make the window sticky on open.
     pub sticky: bool,
-    /// Tile on the monitor Windows chose rather than the cursor's monitor.
-    pub tile_on_os_monitor: bool,
+    /// Per-rule override of `behavior.new_window_monitor`.
+    pub new_window_monitor: Option<NewWindowMonitor>,
+}
+
+fn matches_window_size(
+    max_width: Option<i32>,
+    max_height: Option<i32>,
+    size: Option<(i32, i32)>,
+) -> bool {
+    if max_width.is_none() && max_height.is_none() {
+        return true;
+    }
+    let Some((width, height)) = size else {
+        return false;
+    };
+    max_width.is_none_or(|max| width <= max) && max_height.is_none_or(|max| height <= max)
 }
 
 impl CompiledWindowRule {
+    pub(crate) fn has_size_condition(&self) -> bool {
+        self.match_max_width.is_some() || self.match_max_height.is_some()
+    }
+
     /// Check if this compiled rule matches a window.
-    pub fn matches(&self, class_name: &str, title: &str, executable: &str) -> bool {
+    pub fn matches(
+        &self,
+        class_name: &str,
+        title: &str,
+        executable: &str,
+        size: Option<(i32, i32)>,
+    ) -> bool {
         let has_any_criteria = self.class_regex.is_some()
             || self.title_regex.is_some()
             || self.match_executable.is_some();
 
-        if !has_any_criteria {
+        if !has_any_criteria
+            || !matches_window_size(self.match_max_width, self.match_max_height, size)
+        {
             return false;
         }
 
@@ -1230,6 +1341,24 @@ impl Config {
     /// Validate configuration values, clamping out-of-range fields and returning warnings.
     pub fn validate(&mut self) -> Vec<ConfigWarning> {
         let mut warnings = Vec::new();
+        if !crate::locale::is_supported(&self.appearance.language) {
+            warnings.push(ConfigWarning {
+                field: "appearance.language".to_string(),
+                message: format!(
+                    "Unsupported language '{}', using English",
+                    self.appearance.language
+                ),
+            });
+            self.appearance.language = "en".to_string();
+        }
+
+        if self.behavior.floating_above_tiled && !self.behavior.track_focus_changes {
+            warnings.push(ConfigWarning {
+                field: "behavior.floating_above_tiled".to_string(),
+                message: "floating_above_tiled has no effect without focus tracking; enable track_focus_changes"
+                    .to_string(),
+            });
+        }
 
         // animation durations clamped to a sane ceiling so a typo can't
         // make the WM feel frozen.
@@ -1585,10 +1714,27 @@ impl Config {
                 None => None,
             };
 
+            let positive_limit = |value: Option<i32>, field: &str| {
+                value.filter(|&n| {
+                    if n <= 0 {
+                        tracing::warn!(
+                            "Window rule {} = {} is invalid (must be positive); ignoring",
+                            field,
+                            n
+                        );
+                    }
+                    n > 0
+                })
+            };
+            let match_max_width = positive_limit(rule.match_max_width, "match_max_width");
+            let match_max_height = positive_limit(rule.match_max_height, "match_max_height");
+
             compiled.push(CompiledWindowRule {
                 class_regex,
                 title_regex,
                 match_executable: rule.match_executable.clone(),
+                match_max_width,
+                match_max_height,
                 action: rule.action,
                 width: rule.width,
                 height: rule.height,
@@ -1598,7 +1744,7 @@ impl Config {
                 column_width,
                 open_in_column,
                 sticky: rule.sticky,
-                tile_on_os_monitor: rule.tile_on_os_monitor,
+                new_window_monitor: rule.new_window_monitor,
             });
         }
 
@@ -1608,6 +1754,8 @@ impl Config {
                 class_regex: None,
                 title_regex: None,
                 match_executable: Some(exe.to_string()),
+                match_max_width: None,
+                match_max_height: None,
                 action: WindowAction::Ignore,
                 width: None,
                 height: None,
@@ -1617,7 +1765,7 @@ impl Config {
                 column_width: None,
                 open_in_column: None,
                 sticky: false,
-                tile_on_os_monitor: false,
+                new_window_monitor: None,
             });
         }
 
@@ -1770,6 +1918,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn language_default_round_trip_and_validation() {
+        let mut config = Config::default();
+        assert_eq!(config.appearance.language, "en");
+        let legacy: Config = toml::from_str("[appearance]\nactive_border = false").unwrap();
+        assert_eq!(legacy.appearance.language, "en");
+        let languages: serde_json::Value =
+            serde_json::from_str(&crate::locale::languages_json()).unwrap();
+        for language in languages.as_array().unwrap() {
+            let identifier = language["identifier"].as_str().unwrap();
+            config.appearance.language = identifier.into();
+            let serialized = toml::to_string(&config).unwrap();
+            let mut loaded: Config = toml::from_str(&serialized).unwrap();
+            assert_eq!(loaded.appearance.language, identifier);
+            assert!(
+                loaded.validate().is_empty(),
+                "{identifier}.toml: config rejected bundled identifier"
+            );
+        }
+        let mut loaded = Config::default();
+        for unsupported in ["__unsupported__", "en ", ""] {
+            loaded.appearance.language = unsupported.into();
+            let warnings = loaded.validate();
+            assert_eq!(loaded.appearance.language, "en");
+            assert_eq!(
+                warnings
+                    .iter()
+                    .filter(|warning| warning.field == "appearance.language")
+                    .count(),
+                1
+            );
+            assert!(loaded.validate().is_empty());
+        }
+    }
+
+    #[test]
     fn test_default_config() {
         let config = Config::default();
         assert_eq!(config.layout.gap, 10);
@@ -1878,6 +2061,19 @@ mod tests {
             config.bindings.get("Win+Ctrl+Escape"),
             Some(&"panic_revert".to_string())
         );
+    }
+
+    #[test]
+    fn test_parse_wrap_cycle_commands() {
+        use leopardwm_ipc::IpcCommand;
+        for (name, expected) in [
+            ("cycle_width", IpcCommand::CycleWidth),
+            ("CYCLE-WIDTH", IpcCommand::CycleWidth),
+            ("cycle_height", IpcCommand::CycleHeight),
+            ("CYCLE-HEIGHT", IpcCommand::CycleHeight),
+        ] {
+            assert_eq!(parse_command(name), Some(expected), "{name}");
+        }
     }
 
     #[test]
@@ -2199,11 +2395,13 @@ default_width_preset_monitor_overrides = { "01" = 2, "0" = 2, "main" = 2, "2" = 
             column_width: None,
             open_in_column: None,
             sticky: false,
-            tile_on_os_monitor: false,
+            new_window_monitor: None,
+            match_max_width: None,
+            match_max_height: None,
         };
 
-        assert!(rule.matches("Notepad", "Untitled - Notepad", "notepad.exe"));
-        assert!(!rule.matches("Chrome_WidgetWin_1", "Google Chrome", "chrome.exe"));
+        assert!(rule.matches("Notepad", "Untitled - Notepad", "notepad.exe", None));
+        assert!(!rule.matches("Chrome_WidgetWin_1", "Google Chrome", "chrome.exe", None));
     }
 
     #[test]
@@ -2221,16 +2419,19 @@ default_width_preset_monitor_overrides = { "01" = 2, "0" = 2, "main" = 2, "2" = 
             column_width: None,
             open_in_column: None,
             sticky: false,
-            tile_on_os_monitor: false,
+            new_window_monitor: None,
+            match_max_width: None,
+            match_max_height: None,
         };
 
         assert!(rule.matches(
             "Chrome_WidgetWin_1",
             "DevTools - localhost:3000",
-            "chrome.exe"
+            "chrome.exe",
+            None
         ));
-        assert!(rule.matches("SomeClass", "Firefox DevTools", "firefox.exe"));
-        assert!(!rule.matches("Chrome_WidgetWin_1", "Google Chrome", "chrome.exe"));
+        assert!(rule.matches("SomeClass", "Firefox DevTools", "firefox.exe", None));
+        assert!(!rule.matches("Chrome_WidgetWin_1", "Google Chrome", "chrome.exe", None));
     }
 
     #[test]
@@ -2248,12 +2449,14 @@ default_width_preset_monitor_overrides = { "01" = 2, "0" = 2, "main" = 2, "2" = 
             column_width: None,
             open_in_column: None,
             sticky: false,
-            tile_on_os_monitor: false,
+            new_window_monitor: None,
+            match_max_width: None,
+            match_max_height: None,
         };
 
-        assert!(rule.matches("SpotifyClass", "Spotify - Song Title", "spotify.exe"));
-        assert!(rule.matches("SpotifyClass", "Spotify - Song Title", "SPOTIFY.EXE")); // Case insensitive
-        assert!(!rule.matches("SpotifyClass", "Spotify - Song Title", "chrome.exe"));
+        assert!(rule.matches("SpotifyClass", "Spotify - Song Title", "spotify.exe", None));
+        assert!(rule.matches("SpotifyClass", "Spotify - Song Title", "SPOTIFY.EXE", None)); // Case insensitive
+        assert!(!rule.matches("SpotifyClass", "Spotify - Song Title", "chrome.exe", None));
     }
 
     #[test]
@@ -2271,17 +2474,20 @@ default_width_preset_monitor_overrides = { "01" = 2, "0" = 2, "main" = 2, "2" = 
             column_width: None,
             open_in_column: None,
             sticky: false,
-            tile_on_os_monitor: false,
+            new_window_monitor: None,
+            match_max_width: None,
+            match_max_height: None,
         };
 
         // Both patterns must match
         assert!(rule.matches(
             "Chrome_WidgetWin_1",
             "YouTube - Google Chrome",
-            "chrome.exe"
+            "chrome.exe",
+            None
         ));
-        assert!(!rule.matches("Firefox", "YouTube - Mozilla Firefox", "firefox.exe")); // Class doesn't match
-        assert!(!rule.matches("Chrome_WidgetWin_1", "Google Chrome", "chrome.exe"));
+        assert!(!rule.matches("Firefox", "YouTube - Mozilla Firefox", "firefox.exe", None)); // Class doesn't match
+        assert!(!rule.matches("Chrome_WidgetWin_1", "Google Chrome", "chrome.exe", None));
         // Title doesn't match
     }
 
@@ -2300,10 +2506,12 @@ default_width_preset_monitor_overrides = { "01" = 2, "0" = 2, "main" = 2, "2" = 
             column_width: None,
             open_in_column: None,
             sticky: false,
-            tile_on_os_monitor: false,
+            new_window_monitor: None,
+            match_max_width: None,
+            match_max_height: None,
         };
 
-        assert!(!rule.matches("AnyClass", "Any Title", "any.exe"));
+        assert!(!rule.matches("AnyClass", "Any Title", "any.exe", None));
     }
 
     #[test]
@@ -2415,7 +2623,9 @@ default_width_preset_monitor_overrides = { "01" = 2, "0" = 2, "main" = 2, "2" = 
                 column_width: None,
                 open_in_column: None,
                 sticky: false,
-                tile_on_os_monitor: false,
+                new_window_monitor: None,
+                match_max_width: None,
+                match_max_height: None,
             },
             WindowRule {
                 match_class: Some("Notepad".to_string()),
@@ -2430,14 +2640,16 @@ default_width_preset_monitor_overrides = { "01" = 2, "0" = 2, "main" = 2, "2" = 
                 column_width: None,
                 open_in_column: None,
                 sticky: false,
-                tile_on_os_monitor: false,
+                new_window_monitor: None,
+                match_max_width: None,
+                match_max_height: None,
             },
         ];
 
         // First matching rule should be returned
         let mut matched_action = WindowAction::Tile; // Default
         for rule in &rules {
-            if rule.matches("Notepad", "Untitled", "notepad.exe") {
+            if rule.matches("Notepad", "Untitled", "notepad.exe", None) {
                 matched_action = rule.action;
                 break;
             }
@@ -2461,11 +2673,13 @@ default_width_preset_monitor_overrides = { "01" = 2, "0" = 2, "main" = 2, "2" = 
             column_width: None,
             open_in_column: None,
             sticky: false,
-            tile_on_os_monitor: false,
+            new_window_monitor: None,
+            match_max_width: None,
+            match_max_height: None,
         };
 
-        assert!(rule.matches("AnyClass", "[DEBUG] Application started", "app.exe"));
-        assert!(!rule.matches("AnyClass", "DEBUG Application started", "app.exe"));
+        assert!(rule.matches("AnyClass", "[DEBUG] Application started", "app.exe", None));
+        assert!(!rule.matches("AnyClass", "DEBUG Application started", "app.exe", None));
     }
 
     #[test]
@@ -2484,11 +2698,13 @@ default_width_preset_monitor_overrides = { "01" = 2, "0" = 2, "main" = 2, "2" = 
             column_width: None,
             open_in_column: None,
             sticky: false,
-            tile_on_os_monitor: false,
+            new_window_monitor: None,
+            match_max_width: None,
+            match_max_height: None,
         };
 
-        assert!(rule.matches("AnyClass", "Error Dialog", "app.exe"));
-        assert!(!rule.matches("AnyClass", "error dialog", "app.exe")); // Case mismatch
+        assert!(rule.matches("AnyClass", "Error Dialog", "app.exe", None));
+        assert!(!rule.matches("AnyClass", "error dialog", "app.exe", None)); // Case mismatch
     }
 
     #[test]
@@ -2507,12 +2723,14 @@ default_width_preset_monitor_overrides = { "01" = 2, "0" = 2, "main" = 2, "2" = 
             column_width: None,
             open_in_column: None,
             sticky: false,
-            tile_on_os_monitor: false,
+            new_window_monitor: None,
+            match_max_width: None,
+            match_max_height: None,
         };
 
-        assert!(rule.matches("AnyClass", "Error Dialog", "app.exe"));
-        assert!(rule.matches("AnyClass", "error dialog", "app.exe"));
-        assert!(rule.matches("AnyClass", "ERROR DIALOG", "app.exe"));
+        assert!(rule.matches("AnyClass", "Error Dialog", "app.exe", None));
+        assert!(rule.matches("AnyClass", "error dialog", "app.exe", None));
+        assert!(rule.matches("AnyClass", "ERROR DIALOG", "app.exe", None));
     }
 
     #[test]
@@ -2531,12 +2749,14 @@ default_width_preset_monitor_overrides = { "01" = 2, "0" = 2, "main" = 2, "2" = 
             column_width: None,
             open_in_column: None,
             sticky: false,
-            tile_on_os_monitor: false,
+            new_window_monitor: None,
+            match_max_width: None,
+            match_max_height: None,
         };
 
-        assert!(rule.matches("MyClass", "Any Title", "any.exe"));
-        assert!(rule.matches("MyClass", "Different Title", "different.exe"));
-        assert!(!rule.matches("OtherClass", "Any Title", "any.exe"));
+        assert!(rule.matches("MyClass", "Any Title", "any.exe", None));
+        assert!(rule.matches("MyClass", "Different Title", "different.exe", None));
+        assert!(!rule.matches("OtherClass", "Any Title", "any.exe", None));
     }
 
     #[test]
@@ -2555,12 +2775,14 @@ default_width_preset_monitor_overrides = { "01" = 2, "0" = 2, "main" = 2, "2" = 
             column_width: None,
             open_in_column: None,
             sticky: false,
-            tile_on_os_monitor: false,
+            new_window_monitor: None,
+            match_max_width: None,
+            match_max_height: None,
         };
 
-        assert!(rule.matches("AnyClass", "App Settings", "any.exe"));
-        assert!(rule.matches("DifferentClass", "Settings Panel", "different.exe"));
-        assert!(!rule.matches("AnyClass", "Main Window", "any.exe"));
+        assert!(rule.matches("AnyClass", "App Settings", "any.exe", None));
+        assert!(rule.matches("DifferentClass", "Settings Panel", "different.exe", None));
+        assert!(!rule.matches("AnyClass", "Main Window", "any.exe", None));
     }
 
     #[test]
@@ -2579,12 +2801,14 @@ default_width_preset_monitor_overrides = { "01" = 2, "0" = 2, "main" = 2, "2" = 
             column_width: None,
             open_in_column: None,
             sticky: false,
-            tile_on_os_monitor: false,
+            new_window_monitor: None,
+            match_max_width: None,
+            match_max_height: None,
         };
 
-        assert!(rule.matches("AnyClass", "Any Title", "notepad.exe"));
-        assert!(rule.matches("AnyClass", "Any Title", "NOTEPAD.EXE")); // Case insensitive
-        assert!(!rule.matches("AnyClass", "Any Title", "wordpad.exe"));
+        assert!(rule.matches("AnyClass", "Any Title", "notepad.exe", None));
+        assert!(rule.matches("AnyClass", "Any Title", "NOTEPAD.EXE", None)); // Case insensitive
+        assert!(!rule.matches("AnyClass", "Any Title", "wordpad.exe", None));
     }
 
     #[test]
@@ -2603,11 +2827,13 @@ default_width_preset_monitor_overrides = { "01" = 2, "0" = 2, "main" = 2, "2" = 
             column_width: None,
             open_in_column: None,
             sticky: false,
-            tile_on_os_monitor: false,
+            new_window_monitor: None,
+            match_max_width: None,
+            match_max_height: None,
         };
 
         // Should return false because regex is invalid
-        assert!(!rule.matches("AnyClass", "Any Title", "any.exe"));
+        assert!(!rule.matches("AnyClass", "Any Title", "any.exe", None));
     }
 
     #[test]
@@ -2626,11 +2852,13 @@ default_width_preset_monitor_overrides = { "01" = 2, "0" = 2, "main" = 2, "2" = 
             column_width: None,
             open_in_column: None,
             sticky: false,
-            tile_on_os_monitor: false,
+            new_window_monitor: None,
+            match_max_width: None,
+            match_max_height: None,
         };
 
-        assert!(rule.matches("", "Title", "app.exe")); // Empty class matches .*
-        assert!(rule.matches("SomeClass", "Title", "app.exe"));
+        assert!(rule.matches("", "Title", "app.exe", None)); // Empty class matches .*
+        assert!(rule.matches("SomeClass", "Title", "app.exe", None));
     }
 
     #[test]
@@ -2902,6 +3130,34 @@ default_width_preset_monitor_overrides = { "01" = 2, "0" = 2, "main" = 2, "2" = 
     }
 
     #[test]
+    fn wheel_swipes_setting_defaults_on_and_round_trips() {
+        for source in ["", "[gestures]\nenabled = true\n"] {
+            let config: Config = toml::from_str(source).unwrap();
+            assert_eq!(
+                serde_json::to_value(&config).unwrap()["gestures"]["wheel_swipes"],
+                true
+            );
+        }
+        assert_eq!(
+            serde_json::to_value(Config::default()).unwrap()["gestures"]["wheel_swipes"],
+            true
+        );
+        for enabled in [false, true] {
+            let config: Config =
+                toml::from_str(&format!("[gestures]\nwheel_swipes = {enabled}\n")).unwrap();
+            let saved = toml::to_string(&config).unwrap();
+            let restored: Config = toml::from_str(&saved).unwrap();
+            let json = serde_json::to_value(&restored).unwrap();
+            assert_eq!(json["gestures"]["wheel_swipes"], enabled);
+            let from_settings: Config = serde_json::from_value(json).unwrap();
+            assert_eq!(
+                serde_json::to_value(from_settings).unwrap()["gestures"]["wheel_swipes"],
+                enabled
+            );
+        }
+    }
+
+    #[test]
     fn raw_touchpad_setting_is_opt_in_and_round_trips() {
         let default = Config::default();
         assert!(!default.gestures.raw_input);
@@ -3071,7 +3327,9 @@ default_width_preset_monitor_overrides = { "01" = 2, "0" = 2, "main" = 2, "2" = 
                     column_width: None,
                     open_in_column: None,
                     sticky: false,
-                    tile_on_os_monitor: false,
+                    new_window_monitor: None,
+                    match_max_width: None,
+                    match_max_height: None,
                 },
                 WindowRule {
                     match_class: None,
@@ -3086,7 +3344,9 @@ default_width_preset_monitor_overrides = { "01" = 2, "0" = 2, "main" = 2, "2" = 
                     column_width: None,
                     open_in_column: None,
                     sticky: false,
-                    tile_on_os_monitor: false,
+                    new_window_monitor: None,
+                    match_max_width: None,
+                    match_max_height: None,
                 },
             ],
             ..Default::default()
@@ -3099,15 +3359,16 @@ default_width_preset_monitor_overrides = { "01" = 2, "0" = 2, "main" = 2, "2" = 
         assert!(compiled[0].matches(
             "Chrome_WidgetWin_1",
             "YouTube - Google Chrome",
-            "chrome.exe"
+            "chrome.exe",
+            None
         ));
-        assert!(!compiled[0].matches("Firefox", "YouTube", "firefox.exe")); // class doesn't match
-        assert!(!compiled[0].matches("Chrome_WidgetWin_1", "Google Chrome", "chrome.exe")); // title doesn't match
+        assert!(!compiled[0].matches("Firefox", "YouTube", "firefox.exe", None)); // class doesn't match
+        assert!(!compiled[0].matches("Chrome_WidgetWin_1", "Google Chrome", "chrome.exe", None)); // title doesn't match
 
         // Second rule: executable only
-        assert!(compiled[1].matches("AnyClass", "Any Title", "notepad.exe"));
-        assert!(compiled[1].matches("AnyClass", "Any Title", "NOTEPAD.EXE")); // case insensitive
-        assert!(!compiled[1].matches("AnyClass", "Any Title", "wordpad.exe"));
+        assert!(compiled[1].matches("AnyClass", "Any Title", "notepad.exe", None));
+        assert!(compiled[1].matches("AnyClass", "Any Title", "NOTEPAD.EXE", None)); // case insensitive
+        assert!(!compiled[1].matches("AnyClass", "Any Title", "wordpad.exe", None));
     }
 
     #[test]
@@ -3127,7 +3388,9 @@ default_width_preset_monitor_overrides = { "01" = 2, "0" = 2, "main" = 2, "2" = 
                     column_width: None,
                     open_in_column: None,
                     sticky: false,
-                    tile_on_os_monitor: false,
+                    new_window_monitor: None,
+                    match_max_width: None,
+                    match_max_height: None,
                 },
                 WindowRule {
                     match_class: Some("ValidClass".to_string()),
@@ -3142,7 +3405,9 @@ default_width_preset_monitor_overrides = { "01" = 2, "0" = 2, "main" = 2, "2" = 
                     column_width: None,
                     open_in_column: None,
                     sticky: false,
-                    tile_on_os_monitor: false,
+                    new_window_monitor: None,
+                    match_max_width: None,
+                    match_max_height: None,
                 },
             ],
             ..Default::default()
@@ -3151,7 +3416,90 @@ default_width_preset_monitor_overrides = { "01" = 2, "0" = 2, "main" = 2, "2" = 
         let compiled = config.compile_window_rules();
         // First rule should be skipped due to invalid regex
         assert_eq!(compiled.len(), 1 + BUILTIN_IGNORE_EXECUTABLES.len());
-        assert!(compiled[0].matches("ValidClass", "Any Title", "any.exe"));
+        assert!(compiled[0].matches("ValidClass", "Any Title", "any.exe", None));
+    }
+
+    #[test]
+    fn test_window_rule_size_matching() {
+        for (max_width, max_height, size, class, expected) in [
+            (Some(400), Some(300), Some((400, 300)), "QQ", true),
+            (Some(400), Some(300), Some((401, 300)), "QQ", false),
+            (Some(400), Some(300), Some((400, 301)), "QQ", false),
+            (Some(400), Some(300), None, "QQ", false),
+            (Some(400), None, Some((400, 900)), "QQ", true),
+            (None, Some(300), Some((900, 300)), "QQ", true),
+            (Some(400), Some(300), Some((400, 300)), "Other", false),
+            (None, None, None, "QQ", true),
+        ] {
+            let rule = WindowRule {
+                match_class: Some("^QQ$".into()),
+                match_title: Some("^QQ NT$".into()),
+                match_executable: Some("QQ.exe".into()),
+                match_max_width: max_width,
+                match_max_height: max_height,
+                action: WindowAction::Ignore,
+                ..Default::default()
+            };
+            let config = Config {
+                window_rules: vec![rule.clone()],
+                ..Default::default()
+            };
+            assert_eq!(rule.matches(class, "QQ NT", "qq.EXE", size), expected);
+            assert_eq!(
+                config.compile_window_rules()[0].matches(class, "QQ NT", "qq.EXE", size),
+                expected
+            );
+        }
+        let rule = WindowRule {
+            match_max_width: Some(400),
+            match_max_height: Some(300),
+            ..Default::default()
+        };
+        let config = Config {
+            window_rules: vec![rule.clone()],
+            ..Default::default()
+        };
+        assert!(!rule.matches("QQ", "QQ NT", "QQ.exe", Some((100, 100))));
+        assert!(!config.compile_window_rules()[0].matches(
+            "QQ",
+            "QQ NT",
+            "QQ.exe",
+            Some((100, 100))
+        ));
+    }
+
+    #[test]
+    fn test_window_rule_size_limits_validate_and_roundtrip() {
+        let config: Config = toml::from_str(
+            r#"
+            [[window_rules]]
+            match_executable = "QQ.exe"
+            match_max_width = 400
+            match_max_height = 300
+            action = "ignore"
+            [[window_rules]]
+            match_executable = "QQ.exe"
+            match_max_width = 0
+            match_max_height = -1
+            action = "float"
+        "#,
+        )
+        .unwrap();
+        let saved = toml::to_string(&config).unwrap();
+        let restored: Config = toml::from_str(&saved).unwrap();
+        let compiled = restored.compile_window_rules();
+        assert_eq!(compiled[0].match_max_width, Some(400));
+        assert_eq!(compiled[0].match_max_height, Some(300));
+        assert_eq!(compiled[1].match_max_width, None);
+        assert_eq!(compiled[1].match_max_height, None);
+        assert_eq!(compiled[1].action, WindowAction::Float);
+        assert!(compiled[1].matches("QQ", "QQ NT", "QQ.exe", None));
+        for rule in Config::default().compile_window_rules() {
+            assert!(
+                !rule.has_size_condition(),
+                "defaults must not add size thresholds"
+            );
+        }
     }
 
     #[test]
@@ -3180,6 +3528,54 @@ default_width_preset_monitor_overrides = { "01" = 2, "0" = 2, "main" = 2, "2" = 
     }
 
     #[test]
+    fn test_window_rule_new_window_monitor_defaults_to_none() {
+        let text = "[behavior]\nnew_window_monitor = \"focused\"\n\n\
+                    [[window_rules]]\nmatch_class = \"A\"\n\n\
+                    [[window_rules]]\nmatch_class = \"B\"\nnew_window_monitor = \"cursor\"\n";
+        let mut config: Config = toml::from_str(text).unwrap();
+        assert!(config.validate().is_empty());
+        let compiled = config.compile_window_rules();
+        // A rule without the key has no override, so the global value applies.
+        assert_eq!(config.window_rules[0].new_window_monitor, None);
+        assert_eq!(compiled[0].new_window_monitor, None);
+        assert_eq!(compiled[1].new_window_monitor, Some(NewWindowMonitor::Cursor));
+    }
+
+    #[test]
+    fn test_new_window_monitor_defaults_and_roundtrips() {
+        assert_eq!(
+            Config::default().behavior.new_window_monitor,
+            NewWindowMonitor::Opening
+        );
+        for text in ["", "[behavior]\n"] {
+            let config: Config = toml::from_str(text).unwrap();
+            assert_eq!(
+                config.behavior.new_window_monitor,
+                NewWindowMonitor::Opening
+            );
+        }
+        for (value, expected) in [
+            ("opening", NewWindowMonitor::Opening),
+            ("focused", NewWindowMonitor::Focused),
+            ("cursor", NewWindowMonitor::Cursor),
+        ] {
+            let text = format!("[behavior]\nnew_window_monitor = \"{value}\"\n");
+            let config: Config = toml::from_str(&text).unwrap();
+            assert_eq!(config.behavior.new_window_monitor, expected);
+            let encoded = toml::to_string_pretty(&config).unwrap();
+            assert!(encoded.contains(&format!("new_window_monitor = \"{value}\"")));
+            let decoded: Config = toml::from_str(&encoded).unwrap();
+            assert_eq!(decoded.behavior.new_window_monitor, expected);
+            let json = serde_json::to_string(&config).unwrap();
+            let decoded: Config = serde_json::from_str(&json).unwrap();
+            assert_eq!(decoded.behavior.new_window_monitor, expected);
+        }
+        assert!(
+            toml::from_str::<Config>("[behavior]\nnew_window_monitor = \"primary\"\n").is_err()
+        );
+    }
+
+    #[test]
     fn test_focus_new_windows_false_parsed() {
         let toml_str = r#"
             [behavior]
@@ -3200,15 +3596,81 @@ default_width_preset_monitor_overrides = { "01" = 2, "0" = 2, "main" = 2, "2" = 
     }
 
     #[test]
-    fn test_hide_offscreen_taskbar_buttons_defaults_true_and_roundtrips() {
-        // Absent from config => true (serde default).
-        let absent: Config = toml::from_str("[behavior]\n").unwrap();
-        assert!(absent.behavior.hide_offscreen_taskbar_buttons);
-        // Explicit false round-trips through serialize/deserialize.
-        let mut config = Config::default();
-        config.behavior.hide_offscreen_taskbar_buttons = false;
-        let parsed: Config = toml::from_str(&toml::to_string_pretty(&config).unwrap()).unwrap();
-        assert!(!parsed.behavior.hide_offscreen_taskbar_buttons);
+    fn test_center_single_column_defaults_false_and_roundtrips() {
+        let absent: Config = toml::from_str("[layout]\n").unwrap();
+        assert!(!absent.layout.center_single_column);
+        assert!(!Config::default().layout.center_single_column);
+        let enabled: Config = toml::from_str("[layout]\ncenter_single_column = true\n").unwrap();
+        assert!(enabled.layout.center_single_column);
+        let parsed: Config = toml::from_str(&toml::to_string_pretty(&enabled).unwrap()).unwrap();
+        assert!(parsed.layout.center_single_column);
+    }
+
+    #[test]
+    fn test_taskbar_buttons_config_migration_and_precedence() {
+        use TaskbarButtons::*;
+        assert_eq!(Config::default().behavior.taskbar_buttons, HideOffscreen);
+        for (fields, expected) in [
+            ("", HideOffscreen),
+            ("hide_offscreen_taskbar_buttons = true", HideOffscreen),
+            ("hide_offscreen_taskbar_buttons = false", ShowAll),
+            ("taskbar_buttons = \"hide_offscreen\"", HideOffscreen),
+            ("taskbar_buttons = \"hide_inactive_workspaces\"", HideInactiveWorkspaces),
+            ("taskbar_buttons = \"show_all\"", ShowAll),
+            ("hide_offscreen_taskbar_buttons = true\ntaskbar_buttons = \"show_all\"", ShowAll),
+            ("hide_offscreen_taskbar_buttons = false\ntaskbar_buttons = \"hide_inactive_workspaces\"", HideInactiveWorkspaces),
+            ("taskbar_buttons = \"hide_offscreen\"\nhide_offscreen_taskbar_buttons = false", HideOffscreen),
+        ] {
+            let config: Config = toml::from_str(&format!("[behavior]\n{fields}\n")).unwrap();
+            assert_eq!(config.behavior.taskbar_buttons, expected, "{fields}");
+            let saved = toml::to_string_pretty(&config).unwrap();
+            let parsed: Config = toml::from_str(&saved).unwrap();
+            assert_eq!(parsed.behavior.taskbar_buttons, expected, "{fields}");
+            assert!(!saved.contains("hide_offscreen_taskbar_buttons"));
+        }
+        for fields in [
+            "taskbar_buttons = \"unknown\"",
+            "taskbar_buttons = true",
+            "hide_offscreen_taskbar_buttons = \"false\"",
+            "hide_offscreen_taskbar_buttons = true\ntaskbar_buttons = \"unknown\"",
+        ] {
+            assert!(
+                toml::from_str::<Config>(&format!("[behavior]\n{fields}\n")).is_err(),
+                "{fields}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_taskbar_buttons_settings_json_saves_only_canonical_key() {
+        for mode in ["hide_offscreen", "hide_inactive_workspaces", "show_all"] {
+            let config: Config = serde_json::from_value(serde_json::json!({
+                "behavior": {
+                    "taskbar_buttons": mode,
+                    "hide_offscreen_taskbar_buttons": false,
+                    "mouse_follows_focus": true,
+                    "log_level": "warn"
+                }
+            }))
+            .unwrap();
+            let saved: toml::Value =
+                toml::from_str(&toml::to_string_pretty(&config).unwrap()).unwrap();
+            assert_eq!(saved["behavior"]["taskbar_buttons"].as_str(), Some(mode));
+            assert!(!saved["behavior"]
+                .as_table()
+                .unwrap()
+                .contains_key("hide_offscreen_taskbar_buttons"));
+            assert_eq!(
+                saved["behavior"]["mouse_follows_focus"].as_bool(),
+                Some(true)
+            );
+            assert_eq!(saved["behavior"]["log_level"].as_str(), Some("warn"));
+            let loaded = serde_json::to_value(&config).unwrap();
+            assert_eq!(loaded["behavior"]["taskbar_buttons"], mode);
+            assert!(loaded["behavior"]
+                .get("hide_offscreen_taskbar_buttons")
+                .is_none());
+        }
     }
 
     // =========================================================================
@@ -3421,6 +3883,35 @@ default_width_preset_monitor_overrides = { "01" = 2, "0" = 2, "main" = 2, "2" = 
     }
 
     #[test]
+    fn test_file_reload_validation_reports_floating_dependency_and_clamps() {
+        let dir = std::env::temp_dir().join(format!(
+            "leopardwm_test_floating_reload_{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        fs::write(
+            &path,
+            "[behavior]\nfloating_above_tiled = true\ntrack_focus_changes = false\n[layout]\ngap = -1\n",
+        )
+        .unwrap();
+        let mut loaded = Config::load_from_path(&path).unwrap();
+        let warnings = loaded.validate();
+        assert_eq!(
+            warnings
+                .iter()
+                .filter(|w| w.field == "behavior.floating_above_tiled")
+                .count(),
+            1
+        );
+        assert!(warnings.iter().any(|w| w.field == "layout.gap"));
+        assert_eq!(loaded.layout.gap, 0);
+        assert!(loaded.behavior.floating_above_tiled);
+        assert!(!loaded.behavior.track_focus_changes);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn test_config_save_roundtrip() {
         let dir = std::env::temp_dir().join("leopardwm_test_save_roundtrip");
         let _ = fs::remove_dir_all(&dir);
@@ -3441,3 +3932,4 @@ default_width_preset_monitor_overrides = { "01" = 2, "0" = 2, "main" = 2, "2" = 
         let _ = fs::remove_dir_all(&dir);
     }
 }
+

@@ -65,7 +65,7 @@ A few deliberate **non-features**, so you know what you're getting:
 - **Tabbed columns** — toggle a column between vertical-stack and tab-strip mode (`Ctrl+Alt+T`); only the active tab fills the column rect, the rest sit in a clickable strip above
 - **Scratchpad** — stash the focused window out of the layout (`Ctrl+Alt+Shift+S`) and summon it back as a floating, centered overlay on demand (`Ctrl+Alt+S`); stash it again to release it back to tiling
 - **Sticky windows** — pin a window (`Ctrl+Alt+Y`) so it follows you across workspaces, keeping its current mode: a tiled window stays tiled (a column you can cycle to), a floating window stays a floating overlay
-- **Overview mode** — `Ctrl+Alt+Space` opens a map of the monitor's non-empty workspaces; click a window card to jump to it, click a row to switch workspace, or drive it with arrows/Enter/digits
+- **Overview mode** — `Ctrl+Alt+Space` opens a map of the monitor's non-empty workspaces; click a window card to jump to it, click a row to switch workspace, or navigate with arrows or your configured keyboard `focus_left` / `focus_right` / `focus_up` / `focus_down` bindings while keeping the overview open. Your configured keyboard `move_window_up` / `move_window_down` bindings move the selected window to the previous / next numbered workspace on that monitor, including empty workspaces, without switching workspace or closing the overview; selection follows the moved window. Moves stop at workspace 1 or 9, sticky windows stay put, and `move_window_left` / `move_window_right` do nothing while the overview is open. Enter selects, digits switch workspace, and Esc cancels without undoing moves. Other bound actions and gesture bindings keep their normal behavior.
 - **Per-app window rules** — float, ignore, or tile by class/title/executable, plus per-app open behavior: target workspace, initial column width, open maximized
 - Floating and fullscreen toggles
 - Width and height presets with column equalization, maximize-column, center-column
@@ -75,6 +75,7 @@ A few deliberate **non-features**, so you know what you're getting:
 - Safe mode for troubleshooting (`--safe-mode`)
 - Built-in diagnostics (`lwm doctor`)
 - Workspace persistence and session recovery
+- Optional empty-workspace skipping for relative navigation
 - Autostart via Registry, configurable from CLI / Settings / tray
 - In-app update notifier — daily check against GitHub Releases, opt-out
 - Windows 11 Snap Layouts disabled for managed tiled windows
@@ -112,7 +113,8 @@ Current releases are not code-signed, so Windows SmartScreen may show a warning 
 
 ## Quick Start (from source)
 
-Prerequisites: [Rust](https://rustup.rs) with the MSVC toolchain (`stable-x86_64-pc-windows-msvc`)
+Prerequisites: [Rust](https://rustup.rs) with the MSVC toolchain (`stable-x86_64-pc-windows-msvc`).
+See [Contributing](CONTRIBUTING.md#development-setup) for development checks and the optional Node.js Settings check.
 
 ```bash
 git clone https://github.com/jcardama/LeopardWM.git
@@ -127,6 +129,8 @@ Start the daemon:
 ```
 
 A default config is created automatically at `%APPDATA%\leopardwm\config\config.toml`. Customize via the tray icon → Settings, or edit the file directly.
+
+Set `new_window_monitor = "focused"` under `[behavior]` or choose Settings → Behavior → New window monitor → Focused monitor to open new windows on the focused monitor's active workspace, including an empty workspace. The default, `"opening"`, uses the monitor where Windows opened the window, falling back to the focused monitor when it opens outside all monitors. If no focused monitor is known, `"focused"` uses the opening behavior. A workspace rule selects the workspace index on the policy-selected monitor; sticky windows retain their opening monitor and active-workspace placement. Floating windows moved by this policy are fitted to the chosen monitor's work area before being centered. Changes apply live on config reload or Settings save only to windows that open while LeopardWM is running. Already-open windows discovered at startup or during reload/rescan keep their existing monitor and are added to its active workspace; their floating rectangles are not moved or fitted by this policy. Already-managed windows and startup persistence restores are unchanged.
 
 ## Default Hotkeys
 
@@ -165,6 +169,18 @@ Most hotkeys use `Ctrl+Alt` as the base modifier. Layered pattern: base = focus,
 | `Ctrl+Alt+R` | Refresh (re-enumerate windows) |
 | `Ctrl+Alt+Shift+R` | Reload config |
 | `Win+Ctrl+Escape` | Emergency restore + panic-revert |
+
+These commands have no default keyboard binding and are also available in the
+Settings gesture menus:
+
+| Command | Action |
+|---|---|
+| `focus_next` / `focus_prev` | Focus the next / previous window across columns, wrapping at strip ends |
+| `scroll_left` / `scroll_right` | Move the strip viewport left / right by 100 px without changing focus |
+
+`scroll_up` and `scroll_down` under `[gestures]` default to `focus_next` and
+`focus_prev`. Hold `[hotkeys].scroll_modifier` (Ctrl+Alt by default) while using
+the mouse wheel to run them.
 
 > The scratchpad and sticky pins are session-scoped: they are keyed by window handle and reset when the daemon restarts.
 
@@ -254,12 +270,38 @@ as modifiers cannot be represented by PowerToys and are skipped with a warning;
 F13-F24 used as ordinary trigger keys can be exported. Warnings go to stderr so
 stdout remains usable YAML.
 
+### Interface language
+
+Choose **Settings → Appearance → Language**, or set this in `config.toml`:
+
+```toml
+[appearance]
+language = "en" # "en" (default) or "zh-CN"
+```
+
+The open Settings window, tray menu, and daemon notifications use the selected
+language after saving or reloading config; no daemon restart is needed. Unsupported
+values fall back to English with a config warning. There is no automatic OS-language
+selection. Simplified Chinese is a **human-reviewed translation**.
+Locale files are embedded in the daemon, so editing a translation requires a rebuild.
+See the [localization contributor guide](docs/localization.md) for file locations,
+placeholders, validation, and the surfaces that remain English.
+To edit or add a catalog, see [Translating LeopardWM](CONTRIBUTING.md#translating-leopardwm).
+
+### Layout options
+
+Enable **Settings → Layout → Center single column**, or set `center_single_column = true` under `[layout]`, to center the only active tiled column when it fits within the viewport’s outer gaps. It is off by default and applies with every `centering_mode` (`center`, `just_in_view`, or `on_overflow`), independently of `center_past_edges`. Minimized-only columns and floating windows do not count; wider columns keep the normal scrolling behavior.
+
+**Taskbar buttons** — Settings → Behavior → Taskbar buttons, or `taskbar_buttons` under `[behavior]`, offers `"hide_offscreen"` (default, hide buttons on inactive workspaces and for tiled windows scrolled out of view), `"hide_inactive_workspaces"` (keep every button on each monitor's active workspace, even when scrolled out of view), and `"show_all"`. Floating and minimized windows keep their buttons on the active workspace; inactive workspaces hide all buttons unless `"show_all"` is selected. Sticky windows follow the active workspace. Changes apply on config reload without changing window placement. Existing `hide_offscreen_taskbar_buttons = true` / `false` maps to `"hide_offscreen"` / `"show_all"`; when both keys are present, `taskbar_buttons` wins. Settings saves only the new key.
+
 ### Layout commands
 
 Most users drive the layout via hotkeys, but every hotkey has a CLI equivalent — useful for scripting or AutoHotkey integration.
 
 ```bash
 lwm focus left | right | up | down
+lwm cycle-width                       # next width preset, wrapping at the end
+lwm cycle-height                      # next height preset, wrapping at the end
 lwm move left | right                  # move focused column
 lwm move-window up | down              # reorder within a column
 lwm workspace 3                        # switch to workspace 3
@@ -270,6 +312,18 @@ lwm scratchpad-toggle                  # summon / hide the scratchpad
 lwm toggle-sticky                      # pin / unpin focused window on every workspace
 lwm toggle-ignore                      # session-only ignore for the OS foreground window
 ```
+
+Set `floating_above_tiled = true` under `[behavior]` or enable **Settings → Behavior → Keep floating windows above tiled windows** (off by default) to keep visible managed floating and sticky floating windows above tiled windows when a tiled window receives focus. This only changes relative ordering in the normal Z-order band: floating windows keep their order among themselves, do not become native topmost, and never take focus or move/resize. App-owned topmost and unmanaged windows are not modified. Minimized windows, inactive workspaces, and other monitors are excluded; fullscreen on that monitor and overview suspend re-raising.
+
+`floating_above_tiled` works only when `track_focus_changes = true` (the default). Restart LeopardWM after changing `track_focus_changes`, since focus tracking hooks are configured at startup. Turning tracking off also stops floating re-raises immediately on reload.
+
+Disabling the option simply stops re-raising. There is no daemon-owned Z-order state to restore on disable, ignore, release, or shutdown.
+
+Set `skip_empty_workspaces = true` under `[behavior]` or enable **Settings → Behavior → Skip empty workspaces** (off by default) to skip empty slots on the same monitor. This applies to `workspace_next` / `workspace_prev` and to `focus_down` / `focus_up` when `workspace_edge_wrap` switches workspaces, wrapping 1 ↔ 9. If no other occupied workspace exists, they do nothing.
+
+Tiled, floating, and minimized managed windows count as occupancy; sticky windows do not. Explicit numbered selection, all move-to-workspace commands (including edge-wrap moves), overview, and horizontal focus are unchanged. Closing or moving away the last window does not automatically switch workspaces.
+
+`cycle_width` and `cycle_height` are unbound by default; assign each a shortcut in Settings or `[hotkeys]`. Height cycling applies only to vertically stacked multi-window columns.
 
 `lwm toggle-ignore` targets the actual OS foreground window, not LeopardWM's cached
 focus. Toggling out unmanages that window for this daemon session only; toggling
@@ -324,6 +378,14 @@ legacy event set (`workspace_changed`, `focused_window_changed`, `layout_changed
 use 1-based indices and transfer focus to the named monitor; snapshot indices are
 0-based. Full schemas and sample clients are in `agent_docs/ipc-events.md`.
 
+### Yasb workspace buttons
+
+Show all nine workspaces on a selected monitor and switch by clicking a button in
+[Yasb](https://github.com/amnweb/yasb), using its built-in Custom widget and the
+existing CLI. See the [complete Yasb configuration and styling recipe](docs/yasb.md).
+It includes active/occupied indicators and workspace-name tooltips; updates are
+polled every five seconds rather than streamed. No plugin or IPC change is required.
+
 ### Troubleshooting
 
 ```bash
@@ -346,8 +408,20 @@ they are inactive.
 Set the Windows three- and four-finger touchpad gestures to Nothing under
 Settings > Bluetooth & devices > Touchpad, or Windows will consume the swipe.
 The existing mouse hook still handles modifier-plus-scroll; if native
-registration or device capability checks fail, wheel-based swipes remain active.
+registration or device capability checks fail, wheel-based swipes remain active
+when `wheel_swipes` is enabled.
 Raw Input compatibility varies by device.
+
+`wheel_swipes = true` under `[gestures]` is the default. Set it to `false` (or turn
+off Settings > Gestures > Wheel-based swipes) to stop injected wheel events from
+navigating windows, including mouse side wheels such as the MX Master. This
+applies live on config reload; wheel events still reach the application, and
+modifier-plus-wheel navigation is unchanged. Non-Precision touchpads that send
+swipes as wheel events lose those swipes with it off. Precision Touchpads can
+keep native swipes with `raw_input = true`. `enabled = false` still disables all
+gesture support. Changes to `enabled` apply live on Settings save or config
+reload. Re-enabling uses the native Raw Input setting from daemon startup;
+changing `raw_input` still requires a restart.
 
 Failed physical gestures are diagnosed with an opt-in, short capture — not by leaving general logging at TRACE. Capture is **default off**; turning it on does not change gesture behavior.
 
@@ -399,6 +473,8 @@ Failed physical gestures are diagnosed with an opt-in, short capture — not by 
 7. Set `diagnostic_capture_secs = 0` afterward so the next restart does not rearm capture and overwrite the report. Default-off does not truncate an existing file; a new capture replaces it.
 
 ## Config & Runtime Paths
+
+`track_focus_changes` under `[behavior]` synchronizes managed focus with Windows focus changes such as Alt-Tab. It defaults to `true`; changes to focus tracking hooks take effect the next time LeopardWM starts, not on config reload or Settings save.
 
 > **Note:** Crate names and on-disk paths still use `leopardwm` internally. A full crate rename is future work.
 
@@ -460,6 +536,22 @@ These processes are ignored via built-in window rules (action = `ignore`):
 | `CredentialUIBroker.exe` | Windows credential/login prompt |
 | `SnippingTool.exe` | Screen capture overlay |
 
+## Size Conditions for Window Rules
+
+Small helpers can share an app's class, title, and executable with its main window. For example, ignore QQ NT helpers with an app-specific size rule:
+
+```toml
+[[window_rules]]
+match_executable = "QQ.exe"
+match_max_width = 400
+match_max_height = 300
+action = "ignore"
+```
+
+Both optional limits use the outer window size in logical pixels, the same units as rule `width` and `height`. At 100% display scaling, these equal the window's pixel dimensions. At 150%, a 600 × 450 pixel window counts as 400 × 300 logical pixels.
+
+Limits are ANDed with the class, title, and executable conditions; size alone cannot match a window. Rules are first-match-wins, so put the size rule above broader rules for the same app. Size conditions apply on admission: an ignored small window is re-evaluated if it grows or its title changes, but a managed window is never dropped for shrinking. Edit **Max width** and **Max height** in a rule's **Options** menu in Settings. Leaving both blank preserves existing matching behavior.
+
 ## Focus Border Corners
 
 The focus border tries to match each window's actual corner radius. Apps that explicitly set `DWMWA_WINDOW_CORNER_PREFERENCE` are honored (`DONOTROUND` → 0 px, `ROUNDSMALL` → 4 px, `ROUND` → 8 px); everything else falls back to the 8 px Win11 default.
@@ -490,6 +582,12 @@ Thanks to everyone who has helped shape LeopardWM.
 
 <a href="https://github.com/Mihir-Null" title="Mihir Talati"><img src="https://avatars.githubusercontent.com/u/86654551?v=4&s=96" width="72" alt="Mihir Talati" /></a><br />
 <a href="https://github.com/Mihir-Null"><b>Mihir Talati</b></a> (<a href="https://github.com/Mihir-Null">@Mihir-Null</a>)
+
+<a href="https://github.com/c3us-dev" title="Conner C"><img src="https://avatars.githubusercontent.com/u/209130198?v=4&s=96" width="72" alt="Conner C" /></a><br />
+<a href="https://github.com/c3us-dev"><b>Conner C</b></a> (<a href="https://github.com/c3us-dev">@c3us-dev</a>)
+
+<a href="https://github.com/bd-dxg" title="冰冻大西瓜"><img src="https://avatars.githubusercontent.com/u/34816426?v=4&s=96" width="72" alt="冰冻大西瓜" /></a><br />
+<a href="https://github.com/bd-dxg"><b>冰冻大西瓜</b></a> (<a href="https://github.com/bd-dxg">@bd-dxg</a>)
 
 ## License
 

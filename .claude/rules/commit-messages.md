@@ -87,8 +87,13 @@ When a body is needed, keep it short:
 
 ## Merges
 
-When concluding a `/haha-rcm`, the merge commit uses git's default message
-("Merge branch 'main' into haha"); don't draft one.
+When concluding a `/haha-rcm`, the merge commit's first line is
+`Merge branch 'main' into haha, with haha tweaks`.
+
+The body lists only what haha does differently from main's incoming changes — never a summary of
+main's commits. One bullet per tweak, by what the user sees: a haha behavior kept over main's, a
+haha option added to main's feature, or a haha fix dropped because main now covers it. Skip
+resolutions that change nothing the user sees (code moved, tests adapted).
 
 ## Words to avoid
 

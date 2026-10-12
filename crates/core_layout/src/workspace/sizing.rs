@@ -2,6 +2,32 @@ use crate::*;
 
 use crate::workspace::Workspace;
 
+enum PresetCycle {
+    Up,
+    Down,
+    Wrap,
+}
+
+fn cycle_preset(presets: &[f64], current: f64, cycle: PresetCycle) -> Option<f64> {
+    let mut sorted = presets.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    const TOLERANCE: f64 = 0.005;
+    let target = match cycle {
+        PresetCycle::Down => sorted
+            .iter()
+            .rev()
+            .find(|&&p| p < current - TOLERANCE)
+            .copied(),
+        PresetCycle::Up | PresetCycle::Wrap => {
+            sorted.iter().find(|&&p| p > current + TOLERANCE).copied()
+        }
+    };
+    target.or_else(|| match cycle {
+        PresetCycle::Wrap => sorted.first().copied(),
+        _ => None,
+    })
+}
+
 impl Workspace {
     // ========================================================================
     // Minimum Width Methods
@@ -258,7 +284,8 @@ impl Workspace {
         // Reclamp scroll offset — column widths may have shrunk
         let vis_w = self.visible_width(viewport_width);
         let max_scroll = (self.total_width() - vis_w).max(0);
-        self.scroll_offset = self.scroll_offset.clamp(0.0, max_scroll as f64);
+        self.scroll_offset =
+            self.clamp_scroll_offset(self.scroll_offset, viewport_width, 0.0, max_scroll as f64);
     }
 
     /// Rescale all column widths after viewport or gap values change.
@@ -312,11 +339,17 @@ impl Workspace {
 
         let vis_w = self.visible_width(new_viewport_width);
         let max_scroll = (self.total_width() - vis_w).max(0) as f64;
-        if self.center_past_edges {
-            self.scroll_offset = self.scroll_offset.min(max_scroll);
+        let min_scroll = if self.center_past_edges {
+            f64::NEG_INFINITY
         } else {
-            self.scroll_offset = self.scroll_offset.clamp(0.0, max_scroll);
-        }
+            0.0
+        };
+        self.scroll_offset = self.clamp_scroll_offset(
+            self.scroll_offset,
+            new_viewport_width,
+            min_scroll,
+            max_scroll,
+        );
 
         true
     }
@@ -368,36 +401,22 @@ impl Workspace {
             .max(0)
     }
 
+    /// Cycle the focused column width through presets, wrapping to the smallest.
+    pub fn cycle_width(&mut self, presets: &[f64], viewport_width: i32) {
+        self.cycle_width_impl(presets, viewport_width, PresetCycle::Wrap);
+    }
+
     /// Cycle the focused column width up through the given presets.
     pub fn cycle_width_up(&mut self, presets: &[f64], viewport_width: i32) {
-        self.maximized_column = None;
-        if presets.is_empty() {
-            return;
-        }
-        let base = self.width_base(viewport_width);
-        let gap = self.gap.max(0);
-        let Some(column) = self.columns.get(self.focused_column) else {
-            return;
-        };
-        if base <= 0 {
-            return;
-        }
-        let current_frac =
-            self.effective_column_width(column).saturating_add(gap) as f64 / base as f64;
-
-        let mut sorted = presets.to_vec();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-
-        const TOLERANCE: f64 = 0.005;
-        let target = sorted.iter().find(|&&p| p > current_frac + TOLERANCE);
-        if let Some(&frac) = target {
-            let new_width = (base as f64 * frac - gap as f64).floor() as i32;
-            self.columns[self.focused_column].set_width(new_width);
-        }
+        self.cycle_width_impl(presets, viewport_width, PresetCycle::Up);
     }
 
     /// Cycle the focused column width down through the given presets.
     pub fn cycle_width_down(&mut self, presets: &[f64], viewport_width: i32) {
+        self.cycle_width_impl(presets, viewport_width, PresetCycle::Down);
+    }
+
+    fn cycle_width_impl(&mut self, presets: &[f64], viewport_width: i32, cycle: PresetCycle) {
         self.maximized_column = None;
         if presets.is_empty() {
             return;
@@ -413,12 +432,7 @@ impl Workspace {
         let current_frac =
             self.effective_column_width(column).saturating_add(gap) as f64 / base as f64;
 
-        let mut sorted = presets.to_vec();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-
-        const TOLERANCE: f64 = 0.005;
-        let target = sorted.iter().rev().find(|&&p| p < current_frac - TOLERANCE);
-        if let Some(&frac) = target {
+        if let Some(frac) = cycle_preset(presets, current_frac, cycle) {
             let new_width = (base as f64 * frac - gap as f64).floor() as i32;
             self.columns[self.focused_column].set_width(new_width);
         }
@@ -549,20 +563,26 @@ impl Workspace {
     // Height Preset Cycling
     // ========================================================================
 
+    /// Cycle the focused window's height through presets, wrapping to the smallest.
+    /// No-op for single-window or tabbed columns.
+    pub fn cycle_height(&mut self, presets: &[f64]) {
+        self.cycle_height_impl(presets, PresetCycle::Wrap);
+    }
+
     /// Cycle the focused window's height weight up through the given presets.
     /// Presets are fractions of column height (weight values).
     /// No-op for single-window columns.
     pub fn cycle_height_up(&mut self, presets: &[f64]) {
-        self.cycle_height_impl(presets, true);
+        self.cycle_height_impl(presets, PresetCycle::Up);
     }
 
     /// Cycle the focused window's height weight down through the given presets.
     /// No-op for single-window columns.
     pub fn cycle_height_down(&mut self, presets: &[f64]) {
-        self.cycle_height_impl(presets, false);
+        self.cycle_height_impl(presets, PresetCycle::Down);
     }
 
-    fn cycle_height_impl(&mut self, presets: &[f64], up: bool) {
+    fn cycle_height_impl(&mut self, presets: &[f64], cycle: PresetCycle) {
         if presets.is_empty() {
             return;
         }
@@ -580,25 +600,15 @@ impl Workspace {
         col.ensure_height_weights();
         let current_weight = col.height_weights[win_idx];
 
-        let mut sorted = presets.to_vec();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-
-        const TOLERANCE: f64 = 0.005;
-        let target = if up {
-            sorted
-                .iter()
-                .find(|&&p| p > current_weight + TOLERANCE)
-                .copied()
-        } else {
-            sorted
-                .iter()
-                .rev()
-                .find(|&&p| p < current_weight - TOLERANCE)
-                .copied()
-        };
-
-        if let Some(frac) = target {
+        let wrapping = matches!(cycle, PresetCycle::Wrap);
+        if let Some(frac) = cycle_preset(presets, current_weight, cycle) {
             col.set_height_weight(win_idx, frac);
+            if wrapping && frac > current_weight && col.height_weights[win_idx] <= current_weight {
+                // A larger preset can clamp back to the sibling ceiling instead of advancing.
+                if let Some(smallest) = cycle_preset(presets, f64::INFINITY, PresetCycle::Wrap) {
+                    col.set_height_weight(win_idx, smallest);
+                }
+            }
         }
     }
 

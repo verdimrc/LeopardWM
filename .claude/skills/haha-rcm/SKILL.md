@@ -175,9 +175,9 @@ Then report the files in three groups:
 | Fix-ups | Edited in steps 4–7 to fix build, Clippy, or tests | Unstaged — the user must `git add` them |
 | Merged cleanly | Brought in by the merge without conflicts; you did not touch them | Already staged by git |
 
-In state A the user concludes their merge with `git add` + `git commit` and git's
-default merge message; in state B there are no conflicted files, and the user
-commits the fix-ups themselves.
+In state A the user concludes their merge with `git add` + `git commit`; they can run
+`/haha-dcm` for the merge message (first line plus haha's tweaks, per the commit-message
+rules). In state B there are no conflicted files, and the user commits the fix-ups themselves.
 
 Wait for the user to confirm they've committed before starting step 9, so the
 changelog audit runs against the committed merge.

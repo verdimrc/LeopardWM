@@ -23,8 +23,9 @@
 //! (client-coordinate rects); the overlay only draws and hit-tests it,
 //! reporting user intent back through [`OverviewEvent`]s.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
 use std::sync::{mpsc, LazyLock, Mutex, MutexGuard};
 
 use leopardwm_core_layout::{Easing, Rect};
@@ -52,8 +53,163 @@ pub enum OverviewEvent {
     SwitchWorkspace(usize),
     /// Close the given window; the overview stays open.
     CloseWindow(u64),
+    MoveWindow {
+        window_id: u64,
+        forward: bool,
+        generation: u32,
+    },
     /// Dismiss the overview without acting (Esc, backdrop click, focus loss).
     Dismissed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverviewDirection {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+impl OverviewDirection {
+    fn key(self) -> u16 {
+        match self {
+            Self::Left => VK_LEFT.0,
+            Self::Right => VK_RIGHT.0,
+            Self::Up => VK_UP.0,
+            Self::Down => VK_DOWN.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverviewAction {
+    Navigate(OverviewDirection),
+    MoveUp,
+    MoveDown,
+    Noop,
+}
+
+const OVERVIEW_MOVE_UP: u16 = 0x100;
+const OVERVIEW_MOVE_DOWN: u16 = 0x101;
+const OVERVIEW_NOOP: u16 = 0x102;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OverviewInput {
+    Action(OverviewAction),
+    Key(u16),
+}
+
+impl OverviewInput {
+    pub(crate) fn key(self) -> u16 {
+        match self {
+            Self::Action(OverviewAction::Navigate(direction)) => direction.key(),
+            Self::Action(OverviewAction::MoveUp) => OVERVIEW_MOVE_UP,
+            Self::Action(OverviewAction::MoveDown) => OVERVIEW_MOVE_DOWN,
+            Self::Action(OverviewAction::Noop) => OVERVIEW_NOOP,
+            Self::Key(key) => key,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OverviewInputTarget {
+    hwnd: isize,
+    generation: u32,
+}
+
+struct OverviewInputSession {
+    hwnd: AtomicIsize,
+    generation: AtomicU32,
+}
+
+impl OverviewInputSession {
+    const fn new() -> Self {
+        Self {
+            hwnd: AtomicIsize::new(0),
+            generation: AtomicU32::new(0),
+        }
+    }
+
+    fn acquire(&self, hwnd: isize) {
+        self.hwnd.store(0, Ordering::SeqCst);
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        self.hwnd.store(hwnd, Ordering::SeqCst);
+    }
+
+    fn release(&self) {
+        self.hwnd.store(0, Ordering::SeqCst);
+        self.generation.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn target(&self) -> Option<OverviewInputTarget> {
+        let generation = self.generation.load(Ordering::SeqCst);
+        let hwnd = self.hwnd.load(Ordering::SeqCst);
+        (hwnd != 0 && generation == self.generation.load(Ordering::SeqCst))
+            .then_some(OverviewInputTarget { hwnd, generation })
+    }
+
+    fn is_current(&self, generation: u32) -> bool {
+        self.target()
+            .is_some_and(|target| target.generation == generation)
+    }
+
+    fn posted_key(&self, visible: bool, target: OverviewInputTarget, key: u16) -> Option<u16> {
+        (visible && self.target() == Some(target)).then_some(key)
+    }
+}
+
+static INPUT_SESSION: OverviewInputSession = OverviewInputSession::new();
+
+/// O(1), lock-free: the keyboard hook must never wait for overview rendering.
+pub(crate) fn input_target() -> Option<OverviewInputTarget> {
+    let target = INPUT_SESSION.target()?;
+    foreground_input_target(target.hwnd, unsafe { GetForegroundWindow().0 as isize })?;
+    Some(target)
+}
+
+pub(crate) fn foreground_input_target(hwnd: isize, foreground: isize) -> Option<isize> {
+    (hwnd != 0 && foreground == hwnd).then_some(hwnd)
+}
+
+pub fn is_input_session_current(generation: u32) -> bool {
+    INPUT_SESSION.is_current(generation)
+}
+
+fn release_input() {
+    INPUT_SESSION.release();
+    state().cancel_pending_input();
+    crate::keyboard_hook::clear_overview_press_ownership();
+}
+
+fn encode_input(target: OverviewInputTarget, input: OverviewInput) -> (WPARAM, LPARAM) {
+    (
+        WPARAM(usize::from(input.key())),
+        LPARAM(target.generation as isize),
+    )
+}
+
+fn decode_input(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> (OverviewInputTarget, u16) {
+    (
+        OverviewInputTarget {
+            hwnd: hwnd.0 as isize,
+            generation: lparam.0 as u32,
+        },
+        wparam.0 as u16,
+    )
+}
+
+pub(crate) fn post_input(target: OverviewInputTarget, input: OverviewInput) {
+    let (wparam, lparam) = encode_input(target, input);
+    unsafe {
+        if let Err(error) = PostMessageW(
+            Some(HWND(target.hwnd as *mut c_void)),
+            WM_OVERVIEW_NAVIGATE,
+            wparam,
+            lparam,
+        ) {
+            tracing::warn!("Failed to post overview input: {error}");
+        }
+    }
 }
 
 /// One placeholder window card. Rects are overlay client coordinates.
@@ -250,6 +406,9 @@ const WM_QUIT_OVERVIEW_THREAD: u32 = WM_USER + 5;
 /// must run on the overlay's own thread so WM_TIMER lands in its queue.
 const WM_OVERVIEW_START_ANIM: u32 = WM_USER + 6;
 
+const WM_OVERVIEW_NAVIGATE: u32 = WM_USER + 7;
+const WM_OVERVIEW_REPLAY_INPUT: u32 = WM_USER + 8;
+
 /// WM_TIMER id for the zoom-animation driver.
 const ANIM_TIMER_ID: usize = 1;
 
@@ -443,6 +602,9 @@ struct OverviewState {
     hovered: Option<(usize, usize)>,
     /// `(row_idx, card_idx)` of the keyboard selection, if any.
     selected: Option<(usize, usize)>,
+    input_generation: Option<u32>,
+    pending_move: bool,
+    deferred_keys: VecDeque<u16>,
     /// Whether `TrackMouseEvent` is armed for WM_MOUSELEAVE.
     mouse_tracking_armed: bool,
     backdrop: BackdropMode,
@@ -558,6 +720,9 @@ static STATE: LazyLock<Mutex<OverviewState>> = LazyLock::new(|| {
         window_rect: Rect::new(0, 0, 0, 0),
         hovered: None,
         selected: None,
+        input_generation: None,
+        pending_move: false,
+        deferred_keys: VecDeque::new(),
         mouse_tracking_armed: false,
         backdrop: BackdropMode::AlphaDim,
         event_tx: None,
@@ -1185,6 +1350,7 @@ impl OverviewOverlay {
         let animate = {
             let mut s = state();
             s.selected = selection_from_model(&model);
+            s.cancel_pending_input();
             // Only live DWM thumbnails can glide (the chrome is static):
             // without any — AlphaDim fallback, placeholder/snapshot mode,
             // compact-only rows — the overlay just appears. The anim row
@@ -1236,6 +1402,8 @@ impl OverviewOverlay {
             s.window_rect = monitor_rect;
             s.hovered = None;
             s.visible = true;
+            INPUT_SESSION.acquire(self.hwnd.0 as isize);
+            s.input_generation = INPUT_SESSION.target().map(|target| target.generation);
             s.anim.is_some()
         };
         // Register thumbnails BEFORE the window shows so the very first
@@ -1297,6 +1465,10 @@ impl OverviewOverlay {
         sync_mask();
     }
 
+    pub fn selected_window_id(&self) -> Option<u64> {
+        state().selection_window_id()
+    }
+
     /// Replace the displayed model in place (overlay stays visible).
     /// Strict no-op while the window is hidden or a close animation is
     /// in flight (see [`apply_model_update`]).
@@ -1308,6 +1480,30 @@ impl OverviewOverlay {
         render_overlay(self.hwnd);
         // Card rects/thumbnails may have moved: refresh the corner caps.
         sync_mask();
+    }
+
+    pub fn complete_window_move(&self, model: OverviewModel, wid: u64, generation: u32) {
+        if !is_input_session_current(generation) {
+            return;
+        }
+        let Some(repaint) = state().complete_window_move(model, wid, generation) else {
+            return;
+        };
+        if repaint {
+            sync_thumbnails(self.hwnd);
+            render_overlay(self.hwnd);
+            sync_mask();
+        }
+        unsafe {
+            if let Err(error) = PostMessageW(
+                Some(self.hwnd),
+                WM_OVERVIEW_REPLAY_INPUT,
+                WPARAM(0),
+                LPARAM(generation as isize),
+            ) {
+                tracing::warn!("Failed to post overview input replay: {error}");
+            }
+        }
     }
 
     /// Whether the overlay is mid-close or already hidden: a close
@@ -1325,6 +1521,7 @@ impl OverviewOverlay {
     /// chrome (the close-flash). Also frees the pre-rendered chrome-fade
     /// step DIBs (~28MB each at 5120x1440).
     pub fn hide(&self) {
+        release_input();
         {
             let mut s = state();
             s.visible = false;
@@ -1358,6 +1555,7 @@ impl OverviewOverlay {
     /// there is nothing to animate (`anim_ms == 0` or no live
     /// thumbnails); no-op when a close is already in flight.
     pub fn hide_animated(&self, target_workspace: Option<usize>) {
+        release_input();
         let start = {
             let mut s = state();
             if !s.visible {
@@ -1546,6 +1744,7 @@ fn start_close(s: &mut OverviewState, target_workspace: Option<usize>, notify: b
 /// does its bookkeeping. Sends `Dismissed` immediately when there is
 /// nothing to animate (the daemon then hides instantly, as before).
 fn user_close(hwnd: HWND) {
+    release_input();
     let start = {
         let mut s = state();
         if !s.visible {
@@ -1578,6 +1777,7 @@ fn drop_all_thumbnails() {
 
 impl Drop for OverviewOverlay {
     fn drop(&mut self) {
+        release_input();
         // Unregister thumbnails BEFORE destroying their destination window
         // so DwmUnregisterThumbnail releases valid handles.
         drop_all_thumbnails();
@@ -2171,6 +2371,7 @@ fn on_anim_tick(hwnd: HWND) {
                 s.anim = None;
                 s.visible = false;
             }
+            release_input();
             // Hide FIRST, then unregister: tearing the thumbnails down on
             // the still-visible window made DWM recomposite the bare map
             // chrome for a few ms — the "map reappears then hides" flash.
@@ -2192,7 +2393,112 @@ fn on_anim_tick(hwnd: HWND) {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum OverviewInputResult {
+    Pass,
+    Consumed,
+    Repaint,
+    Close,
+    Event(OverviewEvent),
+}
+
 impl OverviewState {
+    fn cancel_pending_input(&mut self) {
+        self.input_generation = None;
+        self.pending_move = false;
+        self.deferred_keys.clear();
+    }
+
+    fn move_window_event(&mut self, forward: bool) -> Option<OverviewEvent> {
+        if is_closing_state(self) {
+            return None;
+        }
+        let generation = self.input_generation?;
+        let window_id = self.selection_window_id()?;
+        self.pending_move = true;
+        Some(OverviewEvent::MoveWindow {
+            window_id,
+            forward,
+            generation,
+        })
+    }
+
+    fn activation_event(&self) -> Option<OverviewEvent> {
+        self.selection_window_id()
+            .map(OverviewEvent::ActivateWindow)
+    }
+
+    fn complete_window_move(
+        &mut self,
+        model: OverviewModel,
+        wid: u64,
+        generation: u32,
+    ) -> Option<bool> {
+        if self.input_generation != Some(generation) || is_closing_state(self) || !self.pending_move
+        {
+            return None;
+        }
+        let previous_selection = self.selected;
+        let model_changed = apply_model_update(self, model);
+        self.selected = locate_card(&self.model, wid).or(self.selected);
+        self.pending_move = false;
+        Some(model_changed || self.selected != previous_selection)
+    }
+
+    fn handle_input(&mut self, vk: u16) -> OverviewInputResult {
+        if is_closing_state(self) || self.input_generation.is_none() {
+            return OverviewInputResult::Consumed;
+        }
+        if matches!(self.anim, Some(a) if a.phase == AnimPhase::Opening) && vk != VK_ESCAPE.0 {
+            return OverviewInputResult::Consumed;
+        }
+        if vk == VK_ESCAPE.0 {
+            self.cancel_pending_input();
+            return OverviewInputResult::Close;
+        }
+        let supported = matches!(vk, OVERVIEW_MOVE_UP | OVERVIEW_MOVE_DOWN | OVERVIEW_NOOP | 0x0D | 0x25..=0x28 | 0x31..=0x39);
+        if !supported {
+            return OverviewInputResult::Pass;
+        }
+        if self.pending_move {
+            self.deferred_keys.push_back(vk);
+            return OverviewInputResult::Consumed;
+        }
+        let event = if vk == OVERVIEW_MOVE_UP || vk == OVERVIEW_MOVE_DOWN {
+            self.move_window_event(vk == OVERVIEW_MOVE_DOWN)
+        } else if vk == VK_RETURN.0 {
+            self.activation_event()
+        } else if (0x31..=0x39).contains(&vk) {
+            Some(OverviewEvent::SwitchWorkspace((vk - 0x31) as usize))
+        } else if vk == OVERVIEW_NOOP {
+            None
+        } else {
+            return if self.move_selection(vk) {
+                OverviewInputResult::Repaint
+            } else {
+                OverviewInputResult::Consumed
+            };
+        };
+        event.map_or(OverviewInputResult::Consumed, OverviewInputResult::Event)
+    }
+
+    fn next_input(&mut self, input: &mut Option<u16>) -> Option<OverviewInputResult> {
+        if *input == Some(VK_ESCAPE.0) {
+            return input.take().map(|key| self.handle_input(key));
+        }
+        self.next_deferred_input()
+            .or_else(|| input.take().map(|key| self.handle_input(key)))
+    }
+
+    fn next_deferred_input(&mut self) -> Option<OverviewInputResult> {
+        if self.pending_move {
+            return None;
+        }
+        self.deferred_keys
+            .pop_front()
+            .map(|key| self.handle_input(key))
+    }
+
     fn selection_window_id(&self) -> Option<u64> {
         let (ri, ci) = self.selected?;
         self.model
@@ -2281,40 +2587,33 @@ fn next_selection(model: &OverviewModel, ri: usize, ci: usize, key: u16) -> Opti
 
 /// Handle WM_KEYDOWN. Returns true when the key was consumed.
 fn handle_key_down(hwnd: HWND, vk: u16) -> bool {
-    // Close animation: input is ignored (the close is committed).
-    // Open animation: only Esc may interrupt (jumps into the close).
-    match state().anim.map(|a| a.phase) {
-        Some(AnimPhase::Closing) => return true,
-        Some(AnimPhase::Opening) if vk != VK_ESCAPE.0 => return true,
-        _ => {}
+    dispatch_pending_input(hwnd, Some(vk))
+}
+
+fn dispatch_pending_input(hwnd: HWND, mut input: Option<u16>) -> bool {
+    let mut consumed = true;
+    loop {
+        let result = state().next_input(&mut input);
+        let Some(result) = result else {
+            break;
+        };
+        consumed = dispatch_input_result(hwnd, result);
     }
-    if vk == VK_ESCAPE.0 {
-        // Overlay-owned close: animate out, send Dismissed at the end.
-        user_close(hwnd);
-        return true;
-    }
-    if vk == VK_RETURN.0 {
-        let wid = state().selection_window_id();
-        if let Some(wid) = wid {
-            send_event(OverviewEvent::ActivateWindow(wid));
-        }
-        return true;
-    }
-    // Digits 1-9 ('1' = 0x31).
-    if (0x31..=0x39).contains(&vk) {
-        send_event(OverviewEvent::SwitchWorkspace((vk - 0x31) as usize));
-        return true;
-    }
-    if vk == VK_LEFT.0 || vk == VK_RIGHT.0 || vk == VK_UP.0 || vk == VK_DOWN.0 {
-        let changed = state().move_selection(vk);
-        if changed {
+    consumed
+}
+
+fn dispatch_input_result(hwnd: HWND, result: OverviewInputResult) -> bool {
+    match result {
+        OverviewInputResult::Pass => return false,
+        OverviewInputResult::Consumed => {}
+        OverviewInputResult::Close => user_close(hwnd),
+        OverviewInputResult::Event(event) => send_event(event),
+        OverviewInputResult::Repaint => {
             render_overlay(hwnd);
-            // The accent ring moved cards: its corner-arc caps move too.
             sync_mask();
         }
-        return true;
     }
-    false
+    true
 }
 
 /// Handle mouse buttons. `middle` selects the close gesture.
@@ -2404,6 +2703,7 @@ unsafe extern "system" fn overview_wnd_proc(
             LRESULT(0)
         }
         WM_KILLFOCUS => {
+            release_input();
             // Click-away: overlay-owned animated close, but only while
             // logically visible — hide() clears the flag first so
             // daemon-driven hides don't echo a second Dismissed. During a
@@ -2428,6 +2728,22 @@ unsafe extern "system" fn overview_wnd_proc(
         }
         WM_PAINT => {
             paint_frame(hwnd);
+            LRESULT(0)
+        }
+        WM_OVERVIEW_REPLAY_INPUT => {
+            let generation = lparam.0 as u32;
+            if !is_input_session_current(generation) {
+                return LRESULT(0);
+            }
+            dispatch_pending_input(hwnd, None);
+            LRESULT(0)
+        }
+        WM_OVERVIEW_NAVIGATE => {
+            let (target, key) = decode_input(hwnd, wparam, lparam);
+            let visible = state().visible;
+            if let Some(key) = INPUT_SESSION.posted_key(visible, target, key) {
+                handle_key_down(hwnd, key);
+            }
             LRESULT(0)
         }
         WM_KEYDOWN => {
@@ -4179,6 +4495,503 @@ mod tests {
     use super::*;
 
     #[test]
+    fn queued_overview_controls_expire_on_release_and_reopen() {
+        let session = OverviewInputSession::new();
+        let mut s = overlay_state(glide_model(0));
+        session.acquire(42);
+        let queued_target = session.target().unwrap();
+        let inputs = [
+            (OverviewInput::Key(VK_RETURN.0), VK_RETURN.0),
+            (OverviewInput::Key(0x31), 0x31),
+            (
+                OverviewInput::Action(OverviewAction::Navigate(OverviewDirection::Right)),
+                VK_RIGHT.0,
+            ),
+            (
+                OverviewInput::Action(OverviewAction::MoveUp),
+                OVERVIEW_MOVE_UP,
+            ),
+            (
+                OverviewInput::Action(OverviewAction::MoveDown),
+                OVERVIEW_MOVE_DOWN,
+            ),
+            (OverviewInput::Action(OverviewAction::Noop), OVERVIEW_NOOP),
+        ];
+        let round_trip = |target: OverviewInputTarget, input| {
+            let (wparam, lparam) = encode_input(target, input);
+            let (decoded, key) = decode_input(HWND(target.hwnd as *mut c_void), wparam, lparam);
+            assert_eq!(decoded, target);
+            (decoded, key)
+        };
+        for (input, expected) in inputs {
+            let (target, key) = round_trip(queued_target, input);
+            assert_eq!(key, expected);
+            assert_eq!(session.posted_key(s.visible, target, key), Some(expected));
+            round_trip(
+                OverviewInputTarget {
+                    hwnd: 42,
+                    generation: u32::MAX,
+                },
+                input,
+            );
+        }
+
+        session.release();
+        assert!(matches!(
+            start_close(&mut s, None, true),
+            CloseStart::NotAnimatable
+        ));
+        assert!(s.visible);
+        for (input, _) in inputs {
+            let (target, key) = round_trip(queued_target, input);
+            assert_eq!(session.posted_key(s.visible, target, key), None);
+        }
+
+        session.acquire(42);
+        let reopened_target = session.target().unwrap();
+        for (input, expected) in inputs {
+            let (target, key) = round_trip(queued_target, input);
+            assert_eq!(session.posted_key(s.visible, target, key), None);
+            let (target, key) = round_trip(reopened_target, input);
+            assert_eq!(session.posted_key(s.visible, target, key), Some(expected));
+            assert_eq!(session.posted_key(false, target, key), None);
+        }
+    }
+
+    #[test]
+    fn directional_navigation_uses_arrow_selection_rules() {
+        let mut model = glide_model(0);
+        model.rows[0].cards[0].rect = Rect::new(0, 0, 100, 100);
+        let mut right = model.rows[0].cards[0].clone();
+        right.window_id = 8;
+        right.rect.x = 200;
+        model.rows[0].cards.push(right);
+        let mut row = model.rows[0].clone();
+        row.workspace_index = 2;
+        row.is_active = false;
+        for card in &mut row.cards {
+            card.window_id += 10;
+            card.rect.y = 200;
+        }
+        model.rows.push(row);
+        for translated in [false, true] {
+            let mut s = overlay_state(model.clone());
+            s.selected = Some((0, 0));
+            for (direction, arrow, expected) in [
+                (OverviewDirection::Right, VK_RIGHT.0, 8),
+                (OverviewDirection::Down, VK_DOWN.0, 18),
+                (OverviewDirection::Left, VK_LEFT.0, 17),
+                (OverviewDirection::Up, VK_UP.0, 7),
+            ] {
+                assert!(s.move_selection(if translated { direction.key() } else { arrow }));
+                assert_eq!(s.selection_window_id(), Some(expected));
+                assert_eq!(
+                    s.activation_event(),
+                    Some(OverviewEvent::ActivateWindow(expected))
+                );
+                assert!(s.visible);
+            }
+            assert!(!s.move_selection(VK_LEFT.0));
+            assert!(!s.move_selection(VK_UP.0));
+            assert_eq!(s.selection_window_id(), Some(7));
+        }
+    }
+
+    #[test]
+    fn move_event_targets_selection_and_rebuild_keeps_it_across_rows() {
+        for forward in [false, true] {
+            let mut model = glide_model(0);
+            let mut row = model.rows[0].clone();
+            row.workspace_index = 2;
+            row.is_active = false;
+            row.cards[0].window_id = 17;
+            row.cards[0].selected = false;
+            model.rows.push(row);
+            let mut s = overlay_state(model);
+            s.selected = Some((0, 0));
+            assert!(s.move_selection(VK_DOWN.0));
+            assert_eq!(
+                s.move_window_event(forward),
+                Some(OverviewEvent::MoveWindow {
+                    window_id: 17,
+                    forward,
+                    generation: 1,
+                })
+            );
+            let mut refreshed = s.model.clone();
+            refreshed.rows[1].workspace_index = if forward { 3 } else { 1 };
+            refreshed.rows[1].cards[0].rect.y += 50;
+            assert!(apply_model_update(&mut s, refreshed.clone()));
+            assert_eq!(s.selection_window_id(), Some(17));
+            refreshed.rows.remove(0);
+            assert!(apply_model_update(&mut s, refreshed.clone()));
+            assert_eq!(s.selected, Some((0, 0)));
+            assert_eq!(s.selection_window_id(), Some(17));
+            assert!(s.visible);
+            refreshed.rows[0].cards.clear();
+            assert!(apply_model_update(&mut s, refreshed));
+            assert_eq!(s.selection_window_id(), None);
+            assert_eq!(s.move_window_event(forward), None);
+            s.visible = false;
+            assert_eq!(s.move_window_event(forward), None);
+        }
+    }
+
+    #[test]
+    fn enter_waits_for_authoritative_move_completion_and_cancellation_wins() {
+        for cancel in [false, true] {
+            let mut s = overlay_state(glide_model(0));
+            s.selected = Some((0, 0));
+            assert_eq!(
+                s.handle_input(OVERVIEW_MOVE_DOWN),
+                OverviewInputResult::Event(OverviewEvent::MoveWindow {
+                    window_id: 7,
+                    forward: true,
+                    generation: 1
+                })
+            );
+            assert_eq!(s.handle_input(VK_RETURN.0), OverviewInputResult::Consumed);
+            assert_eq!(s.next_deferred_input(), None);
+            let mut model = s.model.clone();
+            model.rows[0].workspace_index = 1;
+            let mut other = model.rows[0].cards[0].clone();
+            other.window_id = 8;
+            model.rows[0].cards.insert(0, other);
+            if cancel {
+                let mut escape = Some(VK_ESCAPE.0);
+                assert_eq!(s.next_input(&mut escape), Some(OverviewInputResult::Close));
+            }
+            assert_eq!(s.complete_window_move(model, 7, 1).is_some(), !cancel);
+            assert_eq!(
+                s.next_deferred_input(),
+                if cancel {
+                    None
+                } else {
+                    Some(OverviewInputResult::Event(OverviewEvent::ActivateWindow(7)))
+                }
+            );
+            assert_eq!(s.next_deferred_input(), None);
+            assert!(!s.complete_window_move(s.model.clone(), 7, 1).is_some());
+        }
+    }
+
+    fn three_card_state() -> OverviewState {
+        let mut model = glide_model(0);
+        for (wid, offset) in [(8, 200), (9, 400)] {
+            let mut card = model.rows[0].cards[0].clone();
+            card.window_id = wid;
+            card.rect.x += offset;
+            card.selected = false;
+            model.rows[0].cards.push(card);
+        }
+        let mut s = overlay_state(model);
+        s.selected = Some((0, 0));
+        s
+    }
+
+    #[test]
+    fn move_completion_repaints_only_model_or_selection_changes() {
+        for (model_changed, selection_changed, repaint) in [
+            (false, false, false),
+            (true, false, true),
+            (false, true, true),
+        ] {
+            let mut s = three_card_state();
+            assert!(matches!(
+                s.handle_input(OVERVIEW_MOVE_UP),
+                OverviewInputResult::Event(_)
+            ));
+            if selection_changed {
+                s.selected = Some((0, 1));
+            }
+            let mut completion = s.model.clone();
+            if model_changed {
+                completion.rows[0].cards[0].title = "Updated title".into();
+            }
+            assert_eq!(s.complete_window_move(completion, 7, 1), Some(repaint));
+            assert!(!s.pending_move);
+            assert_eq!(s.selection_window_id(), Some(7));
+            assert_eq!(
+                s.handle_input(VK_RETURN.0),
+                OverviewInputResult::Event(OverviewEvent::ActivateWindow(7))
+            );
+        }
+    }
+
+    #[test]
+    fn completion_replay_uses_newer_model_membership() {
+        let mut s = three_card_state();
+        assert!(matches!(
+            s.handle_input(OVERVIEW_MOVE_DOWN),
+            OverviewInputResult::Event(_)
+        ));
+        assert_eq!(s.handle_input(VK_RIGHT.0), OverviewInputResult::Consumed);
+        assert_eq!(s.handle_input(VK_RETURN.0), OverviewInputResult::Consumed);
+        let mut completion = s.model.clone();
+        completion.rows[0].workspace_index = 1;
+        assert!(s.complete_window_move(completion.clone(), 7, 1).is_some());
+        let mut newer = completion;
+        newer.rows[0].cards.remove(1);
+        assert!(apply_model_update(&mut s, newer));
+        let mut input = None;
+        let mut replayed = Vec::new();
+        while let Some(result) = s.next_input(&mut input) {
+            replayed.push(result);
+        }
+        assert_eq!(
+            s.model.rows[0]
+                .cards
+                .iter()
+                .map(|card| card.window_id)
+                .collect::<Vec<_>>(),
+            [7, 9]
+        );
+        assert_eq!(
+            replayed,
+            [
+                OverviewInputResult::Repaint,
+                OverviewInputResult::Event(OverviewEvent::ActivateWindow(9))
+            ]
+        );
+        assert_eq!(s.selection_window_id(), Some(9));
+    }
+
+    #[test]
+    fn next_key_drains_deferred_input_when_replay_wakeup_is_undelivered() {
+        for further_move in [false, true] {
+            let mut s = three_card_state();
+            assert!(matches!(
+                s.handle_input(OVERVIEW_MOVE_UP),
+                OverviewInputResult::Event(_)
+            ));
+            assert_eq!(s.handle_input(VK_RIGHT.0), OverviewInputResult::Consumed);
+            if further_move {
+                assert_eq!(
+                    s.handle_input(OVERVIEW_MOVE_DOWN),
+                    OverviewInputResult::Consumed
+                );
+            }
+            assert_eq!(s.handle_input(VK_RETURN.0), OverviewInputResult::Consumed);
+            assert!(s.complete_window_move(s.model.clone(), 7, 1).is_some());
+            let mut input = Some(VK_LEFT.0);
+            let mut replayed = Vec::new();
+            while let Some(result) = s.next_input(&mut input) {
+                replayed.push(result);
+            }
+            if further_move {
+                assert_eq!(
+                    replayed,
+                    [
+                        OverviewInputResult::Repaint,
+                        OverviewInputResult::Event(OverviewEvent::MoveWindow {
+                            window_id: 8,
+                            forward: true,
+                            generation: 1
+                        }),
+                        OverviewInputResult::Consumed
+                    ]
+                );
+                assert!(s.complete_window_move(s.model.clone(), 8, 1).is_some());
+                while let Some(result) = s.next_input(&mut input) {
+                    replayed.push(result);
+                }
+                assert_eq!(
+                    &replayed[3..],
+                    [
+                        OverviewInputResult::Event(OverviewEvent::ActivateWindow(8)),
+                        OverviewInputResult::Repaint
+                    ]
+                );
+            } else {
+                assert_eq!(
+                    replayed,
+                    [
+                        OverviewInputResult::Repaint,
+                        OverviewInputResult::Event(OverviewEvent::ActivateWindow(8)),
+                        OverviewInputResult::Repaint
+                    ]
+                );
+            }
+            assert_eq!(s.selection_window_id(), Some(7));
+            assert!(!s.pending_move);
+            assert_eq!(s.next_input(&mut input), None);
+        }
+    }
+
+    #[test]
+    fn move_ack_replays_navigation_before_enter_on_refreshed_model() {
+        for real_move in [false, true] {
+            let mut model = glide_model(0);
+            let mut b = model.rows[0].cards[0].clone();
+            b.window_id = 8;
+            b.rect.x += 200;
+            b.selected = false;
+            model.rows[0].cards.push(b.clone());
+            let mut destination = model.rows[0].clone();
+            destination.workspace_index = 1;
+            destination.is_active = false;
+            b.window_id = 9;
+            destination.cards = vec![b];
+            model.rows.push(destination);
+            let mut s = overlay_state(model);
+            s.selected = Some((0, 0));
+            let key = if real_move {
+                OVERVIEW_MOVE_DOWN
+            } else {
+                OVERVIEW_MOVE_UP
+            };
+            assert_eq!(
+                s.handle_input(key),
+                OverviewInputResult::Event(OverviewEvent::MoveWindow {
+                    window_id: 7,
+                    forward: real_move,
+                    generation: 1,
+                })
+            );
+            assert_eq!(s.handle_input(VK_RIGHT.0), OverviewInputResult::Consumed);
+            assert_eq!(s.handle_input(VK_RETURN.0), OverviewInputResult::Consumed);
+            assert_eq!(s.selection_window_id(), Some(7));
+            let mut refreshed = s.model.clone();
+            if real_move {
+                let moved = refreshed.rows[0].cards.remove(0);
+                refreshed.rows[1].cards.insert(0, moved);
+            }
+            assert!(s.complete_window_move(refreshed, 7, 1).is_some());
+            assert_eq!(s.next_deferred_input(), Some(OverviewInputResult::Repaint));
+            assert_eq!(
+                s.next_deferred_input(),
+                Some(OverviewInputResult::Event(OverviewEvent::ActivateWindow(
+                    if real_move { 9 } else { 8 }
+                )))
+            );
+            assert_eq!(s.next_deferred_input(), None);
+        }
+    }
+
+    #[test]
+    fn close_start_invalidates_move_delivery_and_completion() {
+        let session = OverviewInputSession::new();
+        session.acquire(42);
+        let generation = session.target().unwrap().generation;
+        let mut s = overlay_state(glide_model(0));
+        s.input_generation = Some(generation);
+        s.selected = Some((0, 0));
+        assert_eq!(
+            s.handle_input(OVERVIEW_MOVE_DOWN),
+            OverviewInputResult::Event(OverviewEvent::MoveWindow {
+                window_id: 7,
+                forward: true,
+                generation
+            })
+        );
+        assert_eq!(s.handle_input(VK_RETURN.0), OverviewInputResult::Consumed);
+        let before = s.model.clone();
+        session.release();
+        assert_eq!(s.handle_input(VK_ESCAPE.0), OverviewInputResult::Close);
+        assert!(!session.is_current(generation));
+        assert!(!s
+            .complete_window_move(glide_model(1), 7, generation)
+            .is_some());
+        assert_eq!(s.model, before);
+        assert_eq!(s.selection_window_id(), Some(7));
+        assert_eq!(s.next_deferred_input(), None);
+        assert!(
+            s.visible,
+            "close start precedes daemon Dismissed bookkeeping"
+        );
+    }
+
+    #[test]
+    fn old_move_completion_cannot_acknowledge_reopened_session() {
+        let session = OverviewInputSession::new();
+        session.acquire(42);
+        let old = session.target().unwrap().generation;
+        let mut s = overlay_state(glide_model(0));
+        s.input_generation = Some(old);
+        s.selected = Some((0, 0));
+        assert!(matches!(
+            s.handle_input(OVERVIEW_MOVE_DOWN),
+            OverviewInputResult::Event(_)
+        ));
+        session.release();
+        s.cancel_pending_input();
+        session.acquire(42);
+        let new = session.target().unwrap().generation;
+        s.input_generation = Some(new);
+        s.model.rows[0].cards[0].window_id = 8;
+        assert_eq!(
+            s.handle_input(OVERVIEW_MOVE_DOWN),
+            OverviewInputResult::Event(OverviewEvent::MoveWindow {
+                window_id: 8,
+                forward: true,
+                generation: new
+            })
+        );
+        assert_eq!(s.handle_input(VK_RETURN.0), OverviewInputResult::Consumed);
+        let before = s.model.clone();
+        assert!(!session.is_current(old));
+        assert!(session.is_current(new));
+        assert!(!s.complete_window_move(glide_model(1), 7, old).is_some());
+        assert_eq!(s.model, before);
+        assert_eq!(s.selection_window_id(), Some(8));
+        assert_eq!(s.next_deferred_input(), None);
+        assert!(s.complete_window_move(before, 8, new).is_some());
+        assert_eq!(
+            s.next_deferred_input(),
+            Some(OverviewInputResult::Event(OverviewEvent::ActivateWindow(8)))
+        );
+    }
+
+    #[test]
+    fn deferred_moves_and_workspace_switch_replay_in_order() {
+        let mut model = glide_model(0);
+        let mut b = model.rows[0].cards[0].clone();
+        b.window_id = 8;
+        b.selected = false;
+        b.rect.x += 200;
+        model.rows[0].cards.push(b);
+        let mut s = overlay_state(model);
+        s.selected = Some((0, 0));
+        assert!(matches!(
+            s.handle_input(OVERVIEW_MOVE_UP),
+            OverviewInputResult::Event(_)
+        ));
+        for key in [
+            VK_RIGHT.0,
+            OVERVIEW_MOVE_DOWN,
+            VK_RETURN.0,
+            0x33,
+            OVERVIEW_NOOP,
+        ] {
+            assert_eq!(s.handle_input(key), OverviewInputResult::Consumed);
+        }
+        assert!(s.complete_window_move(s.model.clone(), 7, 1).is_some());
+        assert_eq!(s.next_deferred_input(), Some(OverviewInputResult::Repaint));
+        assert_eq!(
+            s.next_deferred_input(),
+            Some(OverviewInputResult::Event(OverviewEvent::MoveWindow {
+                window_id: 8,
+                forward: true,
+                generation: 1,
+            }))
+        );
+        assert_eq!(s.next_deferred_input(), None);
+        assert!(s.complete_window_move(s.model.clone(), 8, 1).is_some());
+        assert_eq!(
+            s.next_deferred_input(),
+            Some(OverviewInputResult::Event(OverviewEvent::ActivateWindow(8)))
+        );
+        assert_eq!(
+            s.next_deferred_input(),
+            Some(OverviewInputResult::Event(OverviewEvent::SwitchWorkspace(
+                2
+            )))
+        );
+        assert_eq!(s.next_deferred_input(), Some(OverviewInputResult::Consumed));
+        assert_eq!(s.next_deferred_input(), None);
+    }
+
+    #[test]
     fn test_thumb_body_titled_card_insets_below_title_strip() {
         let card = Rect::new(100, 50, 200, 150); // titled: >= 72x56
         let body = thumb_body(&card).expect("titled card gets a thumb body");
@@ -4233,6 +5046,9 @@ mod tests {
             window_rect: Rect::new(0, 0, 1920, 1080),
             hovered: None,
             selected: None,
+            input_generation: Some(1),
+            pending_move: false,
+            deferred_keys: VecDeque::new(),
             mouse_tracking_armed: false,
             backdrop: BackdropMode::Acrylic,
             event_tx: None,

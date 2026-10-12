@@ -36,6 +36,7 @@ pub struct HotkeyBind {
     pub modifiers: Modifiers,
     pub vk: u32,
     pub id: HotkeyId,
+    pub overview_action: Option<crate::overview::OverviewAction>,
 }
 
 /// Event produced by the global keyboard hook.
@@ -56,6 +57,9 @@ static HOOK_BINDS: std::sync::Mutex<Vec<HotkeyBind>> = std::sync::Mutex::new(Vec
 /// physical press and swallow auto-repeat, tracking each key independently so a
 /// second matched key held at the same time can't reset the first.
 static HOOK_HELD: std::sync::Mutex<Vec<i32>> = std::sync::Mutex::new(Vec::new());
+// A hotkey consumed over the overview owns its repeats until key-up, even
+// if modifiers change and the next repeat would otherwise reach WM_KEYDOWN.
+static HOOK_OVERVIEW_HELD: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
 /// Which F13–F24 keys any bind uses as a modifier (union of `fn_mods` across
 /// all binds). Keys in this mask are swallowed and tracked rather than passed
 /// through, so they act purely as modifiers and never reach the foreground app.
@@ -130,6 +134,10 @@ enum KeyMsg {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Action {
     Pass,
+    SwallowOverview {
+        input: crate::overview::OverviewInput,
+        start_menu_mask: bool,
+    },
     RecordingControl,
     Swallow,
     SwallowHotkey {
@@ -238,6 +246,83 @@ fn decide(
     Action::Pass
 }
 
+fn retain_overview_press(
+    msg: KeyMsg,
+    vk: u32,
+    action: Action,
+    overview_visible: bool,
+    owned_keys: &mut Vec<u32>,
+) -> Action {
+    if !overview_visible {
+        owned_keys.clear();
+    }
+    if msg == KeyMsg::Up {
+        owned_keys.retain(|&key| key != vk);
+    } else if msg == KeyMsg::Down {
+        if owned_keys.contains(&vk) {
+            return Action::Swallow;
+        }
+        if overview_visible
+            && matches!(
+                action,
+                Action::SwallowHotkey { .. }
+                    | Action::SwallowOverview {
+                        input: crate::overview::OverviewInput::Action(_),
+                        ..
+                    }
+            )
+        {
+            owned_keys.push(vk);
+        }
+    }
+    action
+}
+
+pub(crate) fn clear_overview_press_ownership() {
+    HOOK_OVERVIEW_HELD
+        .lock()
+        .unwrap_or_else(recover_poisoned_mutex)
+        .clear();
+}
+
+fn route_overview_action(
+    native_key_down: bool,
+    vk: u32,
+    action: Action,
+    overview_active: bool,
+    overview_action: Option<crate::overview::OverviewAction>,
+) -> Action {
+    use crate::overview::OverviewInput;
+
+    if !overview_active {
+        return action;
+    }
+    match action {
+        Action::SwallowHotkey {
+            emit: true,
+            start_menu_mask,
+            ..
+        } => {
+            if let Some(action) = overview_action {
+                return Action::SwallowOverview {
+                    input: OverviewInput::Action(action),
+                    start_menu_mask,
+                };
+            }
+        }
+        Action::Pass
+            if native_key_down && matches!(vk, 0x1B | 0x0D | 0x25..=0x28 | 0x31..=0x39) =>
+        {
+            return Action::SwallowOverview {
+                input: OverviewInput::Key(vk as u16),
+                start_menu_mask: false,
+            };
+        }
+        _ => {}
+    }
+    action
+}
+
 /// Set whether the installed hook captures a single Settings recorder chord.
 pub fn set_recording(enabled: bool) {
     HOOK_RECORDING.store(enabled, Ordering::SeqCst);
@@ -284,6 +369,10 @@ impl Drop for KeyboardHookHandle {
         let mut held = HOOK_HELD.lock().unwrap_or_else(recover_poisoned_mutex);
         held.clear();
         drop(held);
+        HOOK_OVERVIEW_HELD
+            .lock()
+            .unwrap_or_else(recover_poisoned_mutex)
+            .clear();
         let mut mask = HOOK_FN_MOD_MASK
             .lock()
             .unwrap_or_else(recover_poisoned_mutex);
@@ -306,6 +395,39 @@ impl Drop for KeyboardHookHandle {
         *pending = None;
         tracing::debug!("Keyboard hook stopped");
     }
+}
+
+fn reset_held_keys() -> Result<(), Win32Error> {
+    {
+        let mut held = HOOK_HELD
+            .lock()
+            .map_err(|_| Win32Error::HookInstallFailed("Hook held mutex poisoned".to_string()))?;
+        held.clear();
+    }
+    {
+        let mut fn_held = HOOK_FN_HELD.lock().map_err(|_| {
+            Win32Error::HookInstallFailed("Hook fn-held mutex poisoned".to_string())
+        })?;
+        *fn_held = 0;
+    }
+    {
+        let mut recording_fn_held = HOOK_RECORDING_FN_HELD.lock().map_err(|_| {
+            Win32Error::HookInstallFailed("Recording fn-held mutex poisoned".to_string())
+        })?;
+        *recording_fn_held = 0;
+    }
+    {
+        let mut pending = HOOK_RECORDED_PENDING.lock().map_err(|_| {
+            Win32Error::HookInstallFailed("Recorded-pending mutex poisoned".to_string())
+        })?;
+        *pending = None;
+    }
+    HOOK_OVERVIEW_HELD
+        .lock()
+        .unwrap_or_else(recover_poisoned_mutex)
+        .clear();
+    HOOK_RECORDING.store(false, Ordering::SeqCst);
+    Ok(())
 }
 
 /// Install the keyboard hook for the given binds. Spawns a dedicated thread
@@ -344,37 +466,13 @@ pub fn install_keyboard_hook(
         })?;
         *mask = fn_mod_mask;
     }
-    {
-        let mut held = HOOK_HELD
-            .lock()
-            .map_err(|_| Win32Error::HookInstallFailed("Hook held mutex poisoned".to_string()))?;
-        held.clear();
-    }
-    {
-        let mut fn_held = HOOK_FN_HELD.lock().map_err(|_| {
-            Win32Error::HookInstallFailed("Hook fn-held mutex poisoned".to_string())
-        })?;
-        *fn_held = 0;
-    }
+    reset_held_keys()?;
     {
         let mut sym = HOOK_SYMMETRIC_MODIFIERS
             .lock()
             .map_err(|_| Win32Error::HookInstallFailed("Hook sym-mod mutex poisoned".to_string()))?;
         *sym = symmetric_modifiers;
     }
-    {
-        let mut recording_fn_held = HOOK_RECORDING_FN_HELD.lock().map_err(|_| {
-            Win32Error::HookInstallFailed("Recording fn-held mutex poisoned".to_string())
-        })?;
-        *recording_fn_held = 0;
-    }
-    {
-        let mut pending = HOOK_RECORDED_PENDING.lock().map_err(|_| {
-            Win32Error::HookInstallFailed("Recorded-pending mutex poisoned".to_string())
-        })?;
-        *pending = None;
-    }
-    HOOK_RECORDING.store(false, Ordering::SeqCst);
 
     let (init_tx, init_rx) = std::sync::mpsc::channel::<Result<u32, Win32Error>>();
 
@@ -466,6 +564,9 @@ unsafe fn keyboard_ll_hook_inner(ncode: i32, wparam: WPARAM, lparam: LPARAM) -> 
     let kb = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
     let vk = kb.vkCode;
     let recording = HOOK_RECORDING.load(Ordering::SeqCst);
+    if crate::overview::input_target().is_none() {
+        clear_overview_press_ownership();
+    }
 
     if msg == KeyMsg::Up {
         let fn_held = *HOOK_FN_HELD.lock().unwrap_or_else(recover_poisoned_mutex);
@@ -592,7 +693,53 @@ unsafe fn keyboard_ll_hook_inner(ncode: i32, wparam: WPARAM, lparam: LPARAM) -> 
 }
 
 unsafe fn apply_action(action: Action, ncode: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    let msg = match wparam.0 as u32 {
+        WM_KEYDOWN | WM_SYSKEYDOWN => KeyMsg::Down,
+        WM_KEYUP | WM_SYSKEYUP => KeyMsg::Up,
+        _ => KeyMsg::Other,
+    };
+    let vk = (*(lparam.0 as *const KBDLLHOOKSTRUCT)).vkCode;
+    let target = crate::overview::input_target();
+    let overview_active = target.is_some() && !HOOK_RECORDING.load(Ordering::SeqCst);
+    let overview_action = if let Action::SwallowHotkey { event, .. } = action {
+        HOOK_BINDS
+            .lock()
+            .unwrap_or_else(recover_poisoned_mutex)
+            .iter()
+            .find(|bind| bind.id == event.id)
+            .and_then(|bind| bind.overview_action)
+    } else {
+        None
+    };
+    let action = route_overview_action(
+        wparam.0 as u32 == WM_KEYDOWN,
+        vk,
+        action,
+        overview_active,
+        overview_action,
+    );
+    let action = retain_overview_press(
+        msg,
+        vk,
+        action,
+        overview_active,
+        &mut HOOK_OVERVIEW_HELD
+            .lock()
+            .unwrap_or_else(recover_poisoned_mutex),
+    );
     match action {
+        Action::SwallowOverview {
+            input,
+            start_menu_mask,
+        } => {
+            if let Some(target) = target {
+                crate::overview::post_input(target, input);
+            }
+            if start_menu_mask {
+                send_start_menu_mask();
+            }
+            LRESULT(1)
+        }
         Action::Pass | Action::RecordingControl => CallNextHookEx(None, ncode, wparam, lparam),
         Action::Swallow => LRESULT(1),
         Action::SwallowHotkey {
@@ -665,11 +812,14 @@ unsafe fn send_start_menu_mask() {
 mod tests {
     use super::*;
 
+    static HOOK_STATE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn bind(modifiers: Modifiers, vk: u32) -> HotkeyBind {
         HotkeyBind {
             modifiers,
             vk,
             id: crate::Hotkey::stable_id(modifiers, vk),
+            overview_action: None,
         }
     }
 
@@ -679,6 +829,250 @@ mod tests {
             win: true,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn overview_release_preserves_held_key_until_key_up() {
+        let mut owned = vec![0x48];
+        assert_eq!(
+            retain_overview_press(KeyMsg::Down, 0x48, Action::Pass, false, &mut owned),
+            Action::Pass
+        );
+        assert!(owned.is_empty());
+
+        let _guard = HOOK_STATE_TEST_LOCK.lock().unwrap();
+        HOOK_HELD.lock().unwrap().extend([0x48, 0x49]);
+        HOOK_OVERVIEW_HELD.lock().unwrap().push(0x48);
+        clear_overview_press_ownership();
+        assert_eq!(*HOOK_HELD.lock().unwrap(), [0x48, 0x49]);
+        assert!(HOOK_OVERVIEW_HELD.lock().unwrap().is_empty());
+
+        let modifiers = win_ctrl();
+        let binds = [bind(modifiers, 0x48)];
+        for expected_emit in [false, true] {
+            let is_new_press = !HOOK_HELD.lock().unwrap().contains(&0x48);
+            let action = decide(
+                KeyMsg::Down,
+                0x48,
+                modifiers,
+                false,
+                &binds,
+                0,
+                0,
+                0,
+                is_new_press,
+                false,
+                None,
+            );
+            let routed = route_overview_action(
+                true,
+                0x48,
+                action,
+                false,
+                Some(crate::overview::OverviewAction::Navigate(
+                    crate::overview::OverviewDirection::Right,
+                )),
+            );
+            assert_eq!(
+                retain_overview_press(
+                    KeyMsg::Down,
+                    0x48,
+                    routed,
+                    false,
+                    &mut HOOK_OVERVIEW_HELD.lock().unwrap(),
+                ),
+                Action::SwallowHotkey {
+                    event: HotkeyEvent { id: binds[0].id },
+                    emit: expected_emit,
+                    start_menu_mask: false,
+                }
+            );
+            assert_eq!(
+                retain_overview_press(
+                    KeyMsg::Up,
+                    0x48,
+                    Action::Pass,
+                    false,
+                    &mut HOOK_OVERVIEW_HELD.lock().unwrap(),
+                ),
+                Action::Pass
+            );
+            HOOK_HELD.lock().unwrap().retain(|&key| key != 0x48);
+        }
+        HOOK_HELD.lock().unwrap().clear();
+    }
+
+    #[test]
+    fn navigation_and_enter_share_ordered_overview_ingress() {
+        use crate::overview::{OverviewAction, OverviewDirection, OverviewInput};
+        let navigate = OverviewAction::Navigate(OverviewDirection::Right);
+        let hotkey = Action::SwallowHotkey {
+            event: HotkeyEvent { id: 123 },
+            emit: true,
+            start_menu_mask: false,
+        };
+        for mapped in [
+            navigate,
+            OverviewAction::MoveUp,
+            OverviewAction::MoveDown,
+            OverviewAction::Noop,
+        ] {
+            let mut queued = Vec::new();
+            for (vk, action, metadata) in [(0x48, hotkey, Some(mapped)), (0x0D, Action::Pass, None)]
+            {
+                match route_overview_action(true, vk, action, true, metadata) {
+                    Action::SwallowOverview { input, .. } => queued.push(input),
+                    other => panic!("overview input escaped the ordered queue: {other:?}"),
+                }
+            }
+            assert_eq!(
+                queued,
+                [OverviewInput::Action(mapped), OverviewInput::Key(0x0D)]
+            );
+            assert_eq!(
+                route_overview_action(true, 0x48, hotkey, false, Some(mapped)),
+                hotkey,
+                "hidden, closing, or non-foreground overview keeps normal command dispatch"
+            );
+        }
+        assert_eq!(OverviewInput::Action(navigate).key(), 0x27);
+        assert_eq!(
+            route_overview_action(true, 0x48, hotkey, true, None),
+            hotkey
+        );
+        assert_eq!(
+            route_overview_action(false, 0x0D, Action::Pass, true, None),
+            Action::Pass
+        );
+    }
+
+    #[test]
+    fn native_overview_keys_pass_without_visible_foreground_overlay() {
+        for (hwnd, foreground, expected_active) in [(0, 99, false), (42, 99, false), (42, 42, true)]
+        {
+            let active = crate::overview::foreground_input_target(hwnd, foreground).is_some();
+            assert_eq!(active, expected_active);
+            for vk in [0x0D, 0x1B, 0x25, 0x28, 0x31] {
+                let routed = route_overview_action(true, vk, Action::Pass, active, None);
+                if expected_active {
+                    assert!(matches!(routed, Action::SwallowOverview { .. }));
+                } else {
+                    assert_eq!(routed, Action::Pass);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hook_install_reset_clears_every_held_key_tracker() {
+        let _guard = HOOK_STATE_TEST_LOCK.lock().unwrap();
+        HOOK_HELD.lock().unwrap().push(0x48);
+        HOOK_OVERVIEW_HELD.lock().unwrap().push(0x48);
+        *HOOK_FN_HELD.lock().unwrap() = 1;
+        *HOOK_RECORDING_FN_HELD.lock().unwrap() = 2;
+        *HOOK_RECORDED_PENDING.lock().unwrap() = Some(0x49);
+        HOOK_RECORDING.store(true, Ordering::SeqCst);
+        reset_held_keys().unwrap();
+        assert!(HOOK_HELD.lock().unwrap().is_empty());
+        assert!(HOOK_OVERVIEW_HELD.lock().unwrap().is_empty());
+        assert_eq!(*HOOK_FN_HELD.lock().unwrap(), 0);
+        assert_eq!(*HOOK_RECORDING_FN_HELD.lock().unwrap(), 0);
+        assert_eq!(*HOOK_RECORDED_PENDING.lock().unwrap(), None);
+        assert!(!HOOK_RECORDING.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn overview_hotkey_press_owns_repeats_until_release() {
+        let modifiers = win_ctrl();
+        let binds = [bind(modifiers, 0x25), bind(Modifiers::alt(), 0x25)];
+        let mut owned = Vec::new();
+        let first = decide(
+            KeyMsg::Down,
+            0x25,
+            modifiers,
+            false,
+            &binds,
+            0,
+            0,
+            0,
+            true,
+            false,
+            None,
+        );
+        assert!(matches!(
+            retain_overview_press(KeyMsg::Down, 0x25, first, true, &mut owned),
+            Action::SwallowHotkey { emit: true, .. }
+        ));
+        for held in [modifiers, Modifiers::default(), Modifiers::alt()] {
+            let repeat = decide(
+                KeyMsg::Down,
+                0x25,
+                held,
+                false,
+                &binds,
+                0,
+                0,
+                0,
+                false,
+                false,
+                None,
+            );
+            assert!(matches!(
+                retain_overview_press(KeyMsg::Down, 0x25, repeat, true, &mut owned),
+                Action::Swallow
+                    | Action::SwallowHotkey {
+                        emit: false,
+                        start_menu_mask: false,
+                        ..
+                    }
+            ));
+        }
+        assert_eq!(
+            retain_overview_press(KeyMsg::Down, 0x25, Action::Pass, false, &mut owned),
+            Action::Pass,
+            "closing the overview releases ownership even if key-up was missed"
+        );
+        assert_eq!(
+            retain_overview_press(KeyMsg::Down, 0x27, Action::Pass, true, &mut owned),
+            Action::Pass,
+            "unrelated arrows still reach the window"
+        );
+        assert_eq!(
+            retain_overview_press(KeyMsg::Up, 0x25, Action::Pass, true, &mut owned),
+            Action::Pass
+        );
+        assert_eq!(
+            retain_overview_press(KeyMsg::Down, 0x25, Action::Pass, true, &mut owned),
+            Action::Pass,
+            "a fresh bare arrow works after release"
+        );
+        assert!(matches!(
+            retain_overview_press(KeyMsg::Down, 0x25, first, true, &mut owned),
+            Action::SwallowHotkey { emit: true, .. }
+        ));
+    }
+
+    #[test]
+    fn closed_overview_does_not_change_hotkey_repeat_policy() {
+        let mut owned = Vec::new();
+        let action = Action::SwallowHotkey {
+            event: HotkeyEvent { id: 123 },
+            emit: true,
+            start_menu_mask: false,
+        };
+        assert_eq!(
+            retain_overview_press(KeyMsg::Down, 0x25, action, false, &mut owned),
+            action
+        );
+        assert_eq!(
+            retain_overview_press(KeyMsg::Down, 0x25, Action::Pass, false, &mut owned),
+            Action::Pass
+        );
+        assert_eq!(
+            retain_overview_press(KeyMsg::Down, 0x25, Action::Pass, true, &mut owned),
+            Action::Pass,
+            "unmatched input is never claimed on open"
+        );
     }
 
     #[test]

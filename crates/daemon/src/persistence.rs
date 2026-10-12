@@ -290,6 +290,7 @@ impl AppState {
             params.apply_to(&mut ws);
             ws.set_centering_mode(self.config.layout.centering_mode.into());
             ws.set_center_past_edges(self.config.layout.center_past_edges);
+            ws.set_center_single_column(self.config.layout.center_single_column);
             ws.set_reduce_motion(self.reduce_motion);
             ws.set_scroll_animation(
                 self.config.animation.scroll_duration_ms,
@@ -297,9 +298,8 @@ impl AppState {
             );
             let device_name = self.monitors.get(&monitor_id).map(|m| m.device_name.as_str()).unwrap_or("");
             ws.set_rtl(self.config.layout.is_rtl_monitor(device_name));
-            // Preserve the saved scroll offset (it serializes, but set it
-            // explicitly so a future skip on this field would not regress).
             ws.set_scroll_offset(ws_snapshot.workspace.scroll_offset());
+            ws.reconcile_scroll_bounds(vw);
 
             // Install into the per-monitor vec, extending with fresh empty
             // workspaces as needed.
@@ -316,6 +316,7 @@ impl AppState {
                 empty.set_tab_strip_reserve_px(params.tab_strip_reserve_px);
                 empty.set_centering_mode(self.config.layout.centering_mode.into());
                 empty.set_center_past_edges(self.config.layout.center_past_edges);
+                empty.set_center_single_column(self.config.layout.center_single_column);
                 empty.set_reduce_motion(self.reduce_motion);
                 empty.set_scroll_animation(
                     self.config.animation.scroll_duration_ms,
@@ -339,8 +340,9 @@ impl AppState {
     /// Restore workspace state from a saved snapshot.
     ///
     /// This should be called AFTER windows are enumerated so that scroll offsets
-    /// are not clamped against empty workspaces. Sets the scroll offset directly
-    /// (bypassing clamping) to preserve the saved value.
+    /// are reconciled against the current window set. Valid saved offsets are
+    /// preserved; offsets outside the current scroll bounds are normalized
+    /// without revealing the focused window.
     ///
     /// Returns the set of monitor IDs whose scroll offsets were successfully
     /// restored. The caller should skip `ensure_focused_visible()` for these
@@ -390,6 +392,7 @@ impl AppState {
                         ws.set_tab_strip_reserve_px(params.tab_strip_reserve_px);
                         ws.set_centering_mode(self.config.layout.centering_mode.into());
                         ws.set_center_past_edges(self.config.layout.center_past_edges);
+                        ws.set_center_single_column(self.config.layout.center_single_column);
                         ws.set_reduce_motion(self.reduce_motion);
                         ws.set_scroll_animation(
                             self.config.animation.scroll_duration_ms,
@@ -400,7 +403,10 @@ impl AppState {
                     }
                     // Restore scroll offset from saved workspace
                     let saved_offset = ws_snapshot.workspace.scroll_offset();
+                    ws_vec[ws_idx]
+                        .set_center_single_column(self.config.layout.center_single_column);
                     ws_vec[ws_idx].set_scroll_offset(saved_offset);
+                    ws_vec[ws_idx].reconcile_scroll_bounds(vw);
                     restored_monitors.insert(id);
                     info!(
                         "Restored workspace state for monitor '{}' workspace {}",

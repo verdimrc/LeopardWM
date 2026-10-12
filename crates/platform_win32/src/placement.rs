@@ -192,6 +192,7 @@ pub fn dwm_cloak_window(window_id: WindowId) {
 /// Bypasses `apply_cloak_state`'s OR-check: the intent here is "force
 /// visible" regardless of why the window was originally cloaked.
 pub fn dwm_uncloak_window(window_id: WindowId) {
+    forget_offscreen_placement(window_id);
     {
         let mut guard = lock_cloaked();
         if let Some(ref mut set) = *guard {
@@ -247,6 +248,9 @@ pub(crate) fn emergency_uncloak_tracked(window_ids: &[WindowId]) {
 /// Force-uncloak every tracked window from both sets. Called during
 /// shutdown and panic recovery. Bypasses `apply_cloak_state`.
 pub fn dwm_uncloak_all() {
+    if let Ok(mut records) = OFFSCREEN_PLACEMENTS.lock() {
+        records.clear();
+    }
     let global_ids: Vec<WindowId> = {
         let mut guard = lock_cloaked();
         match guard.as_mut() {
@@ -392,6 +396,9 @@ impl PlacementCache {
     }
 
     pub fn clear(&mut self) {
+        for id in self.positions.keys() {
+            forget_offscreen_placement(*id);
+        }
         self.positions.clear();
         // Keep inset cache — insets are a window property, not position-dependent
     }
@@ -400,6 +407,9 @@ impl PlacementCache {
     /// change (e.g., high contrast toggle) so that stale invisible-border
     /// values don't cause incorrect window sizing.
     pub fn clear_insets(&mut self) {
+        for id in self.insets.keys() {
+            forget_offscreen_placement(*id);
+        }
         self.insets.clear();
     }
 }
@@ -494,6 +504,7 @@ struct DeferEntry {
     visibility: Visibility,
     flags: windows::Win32::UI::WindowsAndMessaging::SET_WINDOW_POS_FLAGS,
     column_index: usize,
+    offscreen_rect: Option<Rect>,
 }
 
 /// Apply window placements from the layout engine.
@@ -544,13 +555,20 @@ pub fn apply_display_change_placements(
 
 fn apply_placements_inner(
     placements: &[WindowPlacement],
-    _config: &PlatformConfig,
+    config: &PlatformConfig,
     cache: &mut Option<&mut PlacementCache>,
     post_animation_landing: bool,
     allow_landing_measurement_retry: bool,
     queued_endpoints: &mut HashMap<WindowId, (i32, i32, i32, i32)>,
     owner_deferrals: &OwnerDeferrals,
 ) -> Result<ApplyPlacementsResult, Win32Error> {
+    if let Ok(mut records) = OFFSCREEN_PLACEMENTS.lock() {
+        for p in placements {
+            if p.visibility == Visibility::Visible {
+                records.remove(&p.window_id);
+            }
+        }
+    }
     let empty_result = ApplyPlacementsResult::default();
     if placements.is_empty() {
         if let Some(cache) = cache.as_deref_mut() {
@@ -558,6 +576,9 @@ fn apply_placements_inner(
         }
         // Uncloak all tracked windows — no placements means all previous
         // windows have left this layout (e.g., workspace switch to empty workspace).
+        if let Ok(mut records) = OFFSCREEN_PLACEMENTS.lock() {
+            records.clear();
+        }
         uncloak_all_tracked();
         return Ok(empty_result);
     }
@@ -598,6 +619,7 @@ fn apply_placements_inner(
         high_contrast,
         force_positioning,
         owner_deferrals,
+        &config.monitor_rects,
     );
     // Uncloak before positioning so DWM composites returning windows at their
     // new rect before the landing measurement. The retry can repeat this safely.
@@ -610,6 +632,18 @@ fn apply_placements_inner(
         &pending_window_ids,
         queued_endpoints,
     );
+    if let Ok(mut records) = OFFSCREEN_PLACEMENTS.lock() {
+        for entry in &entries {
+            if entry.visibility != Visibility::Visible {
+                records.remove(&entry.window_id);
+                if !failed_window_ids.contains(&entry.window_id) {
+                    if let Some(rect) = entry.offscreen_rect {
+                        records.insert(entry.window_id, rect);
+                    }
+                }
+            }
+        }
+    }
     failed_window_ids.extend(failed_recovery_window_ids.iter().copied());
     let mut guard = lock_async_positions();
     if let Some(submissions) = guard.as_mut() {
@@ -651,7 +685,7 @@ fn apply_placements_inner(
         evict_cached_border_insets(&detection.inset_artifact_windows, cache);
         return apply_placements_inner(
             placements,
-            _config,
+            config,
             cache,
             post_animation_landing,
             false,
@@ -669,7 +703,13 @@ fn apply_placements_inner(
         let current_ids: std::collections::HashSet<u64> =
             placements.iter().map(|p| p.window_id).collect();
         // Remove windows that are no longer in the layout
-        cache.positions.retain(|id, _| current_ids.contains(id));
+        cache.positions.retain(|id, _| {
+            if !current_ids.contains(id) {
+                forget_offscreen_placement(*id);
+                return false;
+            }
+            true
+        });
         cache.insets.retain(|id, _| current_ids.contains(id));
         // Update entries for windows that were actually positioned
         let positioned: std::collections::HashSet<u64> = entries
@@ -944,6 +984,66 @@ fn skip_visible_tiled_maximized(
     skip
 }
 
+static OFFSCREEN_PLACEMENTS: std::sync::LazyLock<Mutex<HashMap<WindowId, Rect>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+pub fn forget_offscreen_placement(window_id: WindowId) {
+    if let Ok(mut records) = OFFSCREEN_PLACEMENTS.lock() {
+        records.remove(&window_id);
+    }
+}
+
+pub fn offscreen_placement_matches(window_id: WindowId) -> Option<bool> {
+    let expected = OFFSCREEN_PLACEMENTS.lock().ok()?.get(&window_id).copied()?;
+    crate::get_window_chrome_rect(window_id).map(|actual| actual == expected)
+}
+
+/// Resolve a position-only placement without exposing extra app-owned width
+/// on a monitor that the requested slot did not already overlap.
+fn offscreen_frame_origin(
+    placement: &WindowPlacement,
+    frame_rect: Rect,
+    actual_size: (i32, i32),
+    monitor_rects: &[Rect],
+) -> (i32, i32) {
+    if placement.visibility != Visibility::Visible
+        && ((placement.rect.width == 0 && placement.rect.height == 0)
+            || crate::is_move_offscreen_sentinel_rect(&placement.rect))
+    {
+        // Sentinel parking is already in outer-frame space, not visible-frame space.
+        return (placement.rect.x, placement.rect.y);
+    }
+    if placement.visibility != Visibility::OffScreenLeft || actual_size.0 <= frame_rect.width {
+        return (frame_rect.x, frame_rect.y);
+    }
+    let x = frame_rect
+        .x
+        .saturating_sub(actual_size.0 - frame_rect.width);
+    let footprint = Rect::new(x, frame_rect.y, actual_size.0, actual_size.1);
+    if monitor_rects.is_empty()
+        || monitor_rects
+            .iter()
+            .any(|monitor| footprint.intersects(monitor) && !frame_rect.intersects(monitor))
+    {
+        let sentinel = crate::MOVE_OFFSCREEN_SENTINEL_COORD;
+        let park_x = monitor_rects
+            .iter()
+            .map(|monitor| monitor.x.saturating_sub(actual_size.0))
+            .min()
+            .unwrap_or(sentinel)
+            .min(sentinel);
+        let park_y = monitor_rects
+            .iter()
+            .map(|monitor| monitor.y.saturating_sub(actual_size.1))
+            .min()
+            .unwrap_or(sentinel)
+            .min(sentinel);
+        (park_x, park_y)
+    } else {
+        (x, frame_rect.y)
+    }
+}
+
 /// Build the defer-entry list for all placements, skipping cache-unchanged windows.
 fn build_defer_entries(
     placements: &[WindowPlacement],
@@ -952,6 +1052,7 @@ fn build_defer_entries(
     high_contrast: bool,
     force_positioning: bool,
     owner_deferrals: &OwnerDeferrals,
+    monitor_rects: &[Rect],
 ) -> (
     Vec<DeferEntry>,
     u32,
@@ -1046,6 +1147,7 @@ fn build_defer_entries(
                 visibility: placement.visibility,
                 flags,
                 column_index: placement.column_index,
+                offscreen_rect: None,
             });
         } else {
             // Off-screen: SWP_NOSIZE keeps current size (no resize side-effects).
@@ -1056,10 +1158,15 @@ fn build_defer_entries(
             // Converting them through frame insets makes the parked origin
             // depend on whether the inset cache is warm or cold after restart.
             let zero_size_hidden_tab = placement.rect.width == 0 && placement.rect.height == 0;
-            let (x, y, w) = if zero_size_hidden_tab {
-                (placement.rect.x, placement.rect.y, 0)
+            let actual_rect = crate::get_window_chrome_rect(placement.window_id);
+            let actual_size = actual_rect
+                .map(|rect| (rect.width, rect.height))
+                .unwrap_or((frame_rect.width, frame_rect.height));
+            let (x, y) = offscreen_frame_origin(placement, frame_rect, actual_size, monitor_rects);
+            let w = if zero_size_hidden_tab {
+                0
             } else {
-                (frame_rect.x, frame_rect.y, frame_rect.width)
+                frame_rect.width
             };
             entries.push(DeferEntry {
                 hwnd,
@@ -1076,6 +1183,7 @@ fn build_defer_entries(
                 visibility: placement.visibility,
                 flags: SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | async_flag,
                 column_index: placement.column_index,
+                offscreen_rect: actual_rect.map(|rect| Rect::new(x, y, rect.width, rect.height)),
             });
         }
     }
@@ -2030,7 +2138,12 @@ const STICKY_COMPOSITOR_CLASSES: &[&str] = &[
     "Chrome_WidgetWin_1", // Electron / Chromium (Slack, Beeper, Spotify, TradingView)
     "MozillaWindowClass", // Firefox / Zen
     "CASCADIA_HOSTING_WINDOW_CLASS", // Windows Terminal
+    "CabinetWClass",      // File Explorer
 ];
+
+fn is_sticky_compositor_class(class: &str) -> bool {
+    STICKY_COMPOSITOR_CLASSES.contains(&class)
+}
 
 /// Read the class name of a window. Returns empty string on failure.
 fn window_class_name(hwnd: HWND) -> String {
@@ -2065,7 +2178,7 @@ fn nudge_sticky_compositor_windows(targets: &[NudgeTarget]) {
             }
         }
         let class = window_class_name(t.hwnd);
-        if !STICKY_COMPOSITOR_CLASSES.iter().any(|c| *c == class) {
+        if !is_sticky_compositor_class(&class) {
             continue;
         }
         let flags = SWP_NOZORDER | SWP_NOACTIVATE;
@@ -2131,6 +2244,9 @@ fn inset_cache_generation() -> u64 {
 /// metrics change (e.g., high contrast toggle, display change) so that stale
 /// invisible-border values don't cause incorrect window sizing.
 pub fn clear_inset_cache() {
+    if let Ok(mut records) = OFFSCREEN_PLACEMENTS.lock() {
+        records.clear();
+    }
     if let Ok(mut global) = GLOBAL_INSET_CACHE.lock() {
         *global = None;
         // Bump under the cache lock so a concurrent publication either observes
@@ -2403,6 +2519,19 @@ pub(crate) fn invisible_border_insets(hwnd: HWND) -> (i32, i32, i32, i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sticky_compositor_nudge_includes_explorer_and_existing_classes_only() {
+        for class in [
+            "CabinetWClass",
+            "Chrome_WidgetWin_1",
+            "MozillaWindowClass",
+            "CASCADIA_HOSTING_WINDOW_CLASS",
+        ] {
+            assert!(is_sticky_compositor_class(class), "{class}");
+        }
+        assert!(!is_sticky_compositor_class("Notepad"));
+    }
 
     #[test]
     fn async_position_pending_expires_and_preserves_first_submission_time() {
@@ -2840,6 +2969,7 @@ mod tests {
                     visibility: Visibility::Visible,
                     flags,
                     column_index: 0,
+                    offscreen_rect: None,
                 };
                 position_entries(&[entry], landing)
             };
@@ -2969,6 +3099,7 @@ mod tests {
                     visibility: Visibility::Visible,
                     flags,
                     column_index: 0,
+                    offscreen_rect: None,
                 };
                 position_entries(&[entry], landing)
             })
@@ -2998,14 +3129,27 @@ mod tests {
     }
 
     #[test]
-    fn test_offscreen_sentinel_stays_recoverable_after_frame_conversion() {
+    fn test_offscreen_sentinel_origin_ignores_frame_insets() {
         let sentinel = crate::MOVE_OFFSCREEN_SENTINEL_COORD;
-        let visible = Rect::new(sentinel, sentinel, 1600, 900);
-        let frame = visible_rect_to_frame_rect(visible, (7, 1, 7, 8), false);
-
-        assert!(crate::is_move_offscreen_sentinel_rect(&frame));
-        assert!(frame.x <= sentinel && frame.y <= sentinel);
-        assert_eq!((frame.width, frame.height), (1614, 909));
+        let monitors = [Rect::new(0, 0, 5120, 1440), Rect::new(5120, 0, 800, 600)];
+        for (x, y) in [(sentinel, sentinel), (-100_000, -100_000)] {
+            for visibility in [Visibility::OffScreenLeft, Visibility::OffScreenRight] {
+                let park = Rect::new(x, y, 2545, 1372);
+                let placement = offscreen_placement(1, park, visibility);
+                for (insets, high_contrast) in [
+                    ((7, 0, 7, 7), false),
+                    ((0, 0, 0, 0), false),
+                    ((7, 1, 7, 8), true),
+                ] {
+                    let frame = visible_rect_to_frame_rect(park, insets, high_contrast);
+                    assert_eq!(
+                        offscreen_frame_origin(&placement, frame, (2559, 1379), &monitors),
+                        (x, y),
+                        "sentinel parking already supplies an outer-frame origin"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -3598,6 +3742,7 @@ mod tests {
             visibility: Visibility::Visible,
             flags: SET_WINDOW_POS_FLAGS(0),
             column_index: 0,
+            offscreen_rect: None,
         }
     }
 
@@ -4231,6 +4376,7 @@ mod tests {
             high_contrast,
             true,
             &OwnerDeferrals::default(),
+            &[Rect::new(0, 0, 800, 600)],
         );
         assert_eq!(skipped, 0);
         let entry = entries
@@ -4267,6 +4413,210 @@ mod tests {
             defer_origin(placement, insets, true),
             (logical.x, logical.y, logical.width, 0)
         );
+    }
+
+    #[test]
+    fn test_offscreen_frame_origin_avoids_new_monitor_overlap() {
+        let slot = Rect::new(-300, 0, 300, 560);
+        let placement = offscreen_placement(1, slot, Visibility::OffScreenLeft);
+        let owner = Rect::new(0, 0, 800, 560);
+        let neighbor = Rect::new(-1110, 0, 800, 560);
+        let origin = offscreen_frame_origin(&placement, slot, (315, 560), &[owner, neighbor]);
+        let footprint = Rect::new(origin.0, origin.1, 315, 560);
+        assert!(!footprint.intersects(&owner) && !footprint.intersects(&neighbor));
+        assert_eq!(
+            offscreen_frame_origin(&placement, slot, (315, 560), &[owner]),
+            (-315, 0)
+        );
+        let overlapping_neighbor = Rect::new(-1920, 0, 1920, 560);
+        assert_eq!(
+            offscreen_frame_origin(&placement, slot, (315, 560), &[owner, overlapping_neighbor]),
+            (-315, 0),
+            "a monitor already overlapped by the slot must not trigger parking"
+        );
+        let bordered_frame = Rect::new(-307, -1, 314, 569);
+        assert_eq!(
+            offscreen_frame_origin(&placement, bordered_frame, (330, 569), &[owner]),
+            (-323, -1),
+            "invisible borders already overlapping the owner are not new monitor overlap"
+        );
+        let slot = Rect::new(-300, 10, 300, 560);
+        let frame = Rect::new(-307, 9, 314, 569);
+        let monitors = [Rect::new(-1920, 0, 1920, 1080)];
+        for (visibility, size) in [
+            (Visibility::OffScreenLeft, (300, 600)),
+            (Visibility::OffScreenLeft, (314, 600)),
+            (Visibility::OffScreenRight, (500, 600)),
+            (Visibility::Visible, (500, 600)),
+        ] {
+            let placement = offscreen_placement(1, slot, visibility);
+            assert_eq!(
+                offscreen_frame_origin(&placement, frame, size, &monitors),
+                (-307, 9)
+            );
+        }
+        let placeholder =
+            offscreen_placement(1, Rect::new(-800, 0, 0, 0), Visibility::OffScreenLeft);
+        assert_eq!(
+            offscreen_frame_origin(
+                &placeholder,
+                Rect::new(-807, -1, 14, 9),
+                (500, 600),
+                &monitors
+            ),
+            (-800, 0)
+        );
+    }
+
+    #[test]
+    fn test_offscreen_record_uses_cached_insets_and_retained_frame_size() {
+        let _serialize = GENERATION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(crate::recover_poisoned_mutex);
+        let _cloak = lock_cloak_set_tests();
+        let window = HiddenPopup::new(-300, 0, 315, 560);
+        let _membership = CloakMembershipGuard::claim(window.id);
+        let _forget_insets = ForgetGlobalInsetsOnDrop(window.id);
+        let mut cache = PlacementCache::new();
+        cache.insets.insert(window.id, (7, 1, 7, 8));
+        assert_eq!(get_window_invisible_insets(window.id), (0, 0, 0, 0));
+        let config = PlatformConfig {
+            monitor_rects: vec![Rect::new(0, 0, 800, 600)],
+        };
+        let placement = offscreen_placement(
+            window.id,
+            Rect::new(-300, 0, 300, 560),
+            Visibility::OffScreenLeft,
+        );
+        apply_placements(
+            std::slice::from_ref(&placement),
+            &config,
+            Some(&mut cache),
+            false,
+        )
+        .unwrap();
+        let landed = window.rect();
+        assert_eq!(
+            (landed.x, landed.y),
+            if crate::is_high_contrast_enabled() {
+                (-315, 0)
+            } else {
+                (-308, -1)
+            }
+        );
+        assert_eq!(offscreen_placement_matches(window.id), Some(true));
+        unsafe {
+            SetWindowPos(
+                window.hwnd,
+                None,
+                landed.x,
+                landed.y,
+                315,
+                570,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            offscreen_placement_matches(window.id),
+            Some(false),
+            "size drift at the same origin must be detected"
+        );
+        cache.clear();
+        assert_eq!(offscreen_placement_matches(window.id), None);
+        apply_placements(
+            std::slice::from_ref(&placement),
+            &config,
+            Some(&mut cache),
+            false,
+        )
+        .unwrap();
+        assert_eq!(offscreen_placement_matches(window.id), Some(true));
+        forget_offscreen_placement(window.id);
+        assert_eq!(offscreen_placement_matches(window.id), None);
+        cache.clear();
+        apply_placements(
+            std::slice::from_ref(&placement),
+            &config,
+            Some(&mut cache),
+            false,
+        )
+        .unwrap();
+        let visible = offscreen_placement(
+            window.id,
+            Rect::new(-30000, -1000, 300, 560),
+            Visibility::Visible,
+        );
+        apply_placements(&[visible], &config, Some(&mut cache), false).unwrap();
+        assert_eq!(offscreen_placement_matches(window.id), None);
+    }
+
+    #[test]
+    fn test_offscreen_batch_uses_passed_topology_and_parks_without_it() {
+        let _serialize = GENERATION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(crate::recover_poisoned_mutex);
+        let _cloak = lock_cloak_set_tests();
+        let window = HiddenPopup::new(-300, 0, 315, 560);
+        let _membership = CloakMembershipGuard::claim(window.id);
+        let _forget_insets = ForgetGlobalInsetsOnDrop(window.id);
+        let placement = offscreen_placement(
+            window.id,
+            Rect::new(-300, 0, 300, 560),
+            Visibility::OffScreenLeft,
+        );
+        let owner = Rect::new(0, 0, 800, 600);
+        let neighbor = Rect::new(-1110, 0, 800, 600);
+        for (monitors, expected) in [
+            (vec![owner], (-315, 0)),
+            (
+                vec![owner, neighbor],
+                (
+                    crate::MOVE_OFFSCREEN_SENTINEL_COORD,
+                    crate::MOVE_OFFSCREEN_SENTINEL_COORD,
+                ),
+            ),
+            (
+                vec![],
+                (
+                    crate::MOVE_OFFSCREEN_SENTINEL_COORD,
+                    crate::MOVE_OFFSCREEN_SENTINEL_COORD,
+                ),
+            ),
+        ] {
+            let config = PlatformConfig {
+                monitor_rects: monitors,
+            };
+            apply_placements(std::slice::from_ref(&placement), &config, None, false).unwrap();
+            let actual = window.rect();
+            assert_eq!((actual.x, actual.y), expected);
+            assert_eq!((actual.width, actual.height), (315, 560));
+            assert_eq!(offscreen_placement_matches(window.id), Some(true));
+        }
+    }
+
+    #[test]
+    fn test_offscreen_left_window_wider_than_column_stays_off_screen() {
+        let window = HiddenPopup::new(120, 80, 700, 300);
+        let logical = Rect::new(-1000, 40, 600, 900);
+        let insets = (7, 1, 7, 8);
+        let converted = visible_rect_to_frame_rect(logical, insets, false);
+        let (left_x, _, _, _) = defer_origin(
+            offscreen_placement(window.id, logical, Visibility::OffScreenLeft),
+            insets,
+            false,
+        );
+        assert_eq!(
+            left_x + 700 - insets.2,
+            logical.x + logical.width,
+            "the window's visible right edge must stay at its column's right edge"
+        );
+        let (right_x, _, _, _) = defer_origin(
+            offscreen_placement(window.id, logical, Visibility::OffScreenRight),
+            insets,
+            false,
+        );
+        assert_eq!(right_x, converted.x);
     }
 
     #[test]

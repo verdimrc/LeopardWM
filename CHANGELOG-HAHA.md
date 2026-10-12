@@ -1,10 +1,11 @@
 # Changelog — haha branch
 
-## [Unreleased] — diff between `c2c8643` .. HEAD
+## [Unreleased] — diff between `b2a6bf5` .. HEAD
 
 ### Features
 
-- New windows open on the monitor under the cursor.
+- New windows can open on the monitor under the mouse cursor: `behavior.new_window_monitor = "cursor"`,
+  or Settings → Behavior → New window monitor → Monitor under cursor. The default stays `"opening"`.
 - `behavior.notify_elevation_blocked` silences the toast when a privilege-elevated window is excluded from tiling.
 - Right Ctrl and Right Alt are interchangeable with their left counterparts in hotkeys.
   Opt in with `behavior.symmetric_modifiers = true` in the config. Useful for one-handed operation.
@@ -20,9 +21,10 @@
   - Shows on all monitors simultaneously with Ctrl+Alt+Win+Space (`hotkeys.toggle_overview_all`).
   - Shows the monitor device name
   - Shows empty workspace rows on monitors with no windows.
-- Window rules support `tile_on_os_monitor` to respect the OS-chosen monitor.
-  Useful for PowerPoint presentation mode: respects where PowerPoint places both the slide show and the
-  presenter view windows, while still tiling the presenter view.
+- Window rules support `new_window_monitor` (`"opening"`, `"focused"` or `"cursor"`) to override
+  `behavior.new_window_monitor` per app. E.g. `"opening"` for PowerPoint presentation mode: respects
+  where PowerPoint places both the slide show and the presenter view windows, while still tiling the
+  presenter view.
 - Vertical monitor support:
   - Automatically detected from portrait orientation (height > width) — no configuration required; rotate
     the monitor in Windows Display Settings.
@@ -78,19 +80,15 @@
 | `hotkeys.toggle_overview_all` | `string` | `"Ctrl+Alt+Win+Space"` | Toggle overview on all monitors simultaneously. |
 | `hotkeys.toggle_desktop_peek_anchored` | `string` | `"Ctrl+Alt+'"` | Reveal desktop; focused window stays in place. |
 | `hotkeys.toggle_desktop_peek` | `string` | `"Ctrl+Alt+Shift+'"` | Reveal desktop; focused window moves to the minimum-width mark. |
-| Window rule: `tile_on_os_monitor` | `bool` | `false` | Tile the window on whichever monitor the OS places it, instead of the focused monitor. |
+| Window rule: `new_window_monitor` | `"opening" \| "focused" \| "cursor"` | (none) | Overrides `behavior.new_window_monitor` for matching windows. |
 | `layout.default_width_preset_monitor_overrides` | `{ "N" = u32 }` | `{}` | Per-display-index override of `layout.default_width_preset`. ⚠️ [Known issue with GUI settings](#known-issues-with-gui-settings) |
 | Window rule: `column_width` (extended) | `f64 \| u32 \| { "N" = f64\|u32 }` | (none) | Now accepts a preset index or a per-display-index map in addition to a viewport fraction. ⚠️ [Known issue with GUI settings](#known-issues-with-gui-settings) |
 | `hotkeys.toggle_new_window_placement_once` | `string` | `"Ctrl+Alt+Shift+N"` | Activate a one-shot new-window-placement override for the next window only. |
+| `behavior.new_window_monitor` (extended) | `"opening" \| "focused" \| "cursor"` | `"opening"` | Adds `"cursor"`: open new windows on the monitor under the mouse cursor. |
 
 ### Fixes
 
-- Focused monitor placement is restored correctly for new windows. (The implementation is retained to
-  support reverting to pre-0.2.8 behavior, but is superseded in practice by "new windows open on the
-  monitor under the cursor".)
 - Tray-menu and hotkey/IPC-triggered config changes no longer silently overwrite `config.toml`.
-- Apps that shrink themselves after being tiled no longer stay smaller than their column until the next
-  layout re-apply.
 - A vacated column stays visible on the source monitor after moving a window away.
 - Wrong window targeted by commands after layout animation completes (briefly tested; no consistent repro
   trigger).

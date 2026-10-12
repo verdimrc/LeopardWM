@@ -4,12 +4,11 @@ pub mod operations;
 pub mod sizing;
 pub mod state;
 
-use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
-
 use crate::animation::{Easing, ScrollAnimation, DEFAULT_ANIMATION_DURATION_MS};
 use crate::column::Column;
 use crate::types::*;
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 
 /// Focus centering mode.
 /// Determines how the viewport adjusts when focus changes.
@@ -54,7 +53,9 @@ pub struct FloatingWindow {
 /// 3. **Valid column widths:** All column widths are >= `MIN_COLUMN_WIDTH` (100px).
 /// 4. **Valid scroll range:** `0.0 <= scroll_offset <= max_scroll` where
 ///    `max_scroll = (total_width() - viewport_width).max(0)`.
-///    Exception: when `center_past_edges` is true, `scroll_offset` may be
+///    Exception: `center_single_column` collapses the range to the centered
+///    offset for one fitting active column; `center_past_edges` also allows
+///    negative offsets. When `center_past_edges` is true, `scroll_offset` may be
 ///    negative (centering first column) or exceed `max_scroll` (last column).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Workspace {
@@ -133,6 +134,8 @@ pub struct Workspace {
     /// Whether center-column can scroll past content edges.
     #[serde(skip)]
     pub(crate) center_past_edges: bool,
+    #[serde(skip)]
+    pub(crate) center_single_column: bool,
     /// State for maximized column toggle (fills viewport width).
     #[serde(skip)]
     pub(crate) maximized_column: Option<MaximizedColumnState>,
@@ -188,6 +191,7 @@ impl Default for Workspace {
             scroll_duration_ms: DEFAULT_ANIMATION_DURATION_MS,
             scroll_easing: Easing::default(),
             center_past_edges: false,
+            center_single_column: false,
             maximized_column: None,
             tab_strip_reserve_px: 0,
             rtl: false,
@@ -521,6 +525,15 @@ impl Workspace {
     pub fn set_scroll_animation(&mut self, duration_ms: u64, easing: Easing) {
         self.scroll_duration_ms = duration_ms;
         self.scroll_easing = easing;
+    }
+
+    /// Center the only active tiled column when it fits inside the viewport.
+    pub fn set_center_single_column(&mut self, center: bool) {
+        self.center_single_column = center;
+    }
+
+    pub fn center_single_column(&self) -> bool {
+        self.center_single_column
     }
 
     /// Set whether center-column can scroll past content edges.

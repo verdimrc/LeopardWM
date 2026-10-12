@@ -25,6 +25,7 @@ mod helpers;
 mod hotkey_resolution;
 mod ipc_server;
 mod layout_apply;
+mod locale;
 mod managed_lifetime;
 #[cfg(test)]
 mod managed_lifetime_tests;
@@ -348,10 +349,17 @@ struct HotkeyState {
 /// Build the tray quick-toggle state from config (reads autostart from the registry).
 fn quick_toggle_state(config: &Config) -> tray::QuickToggleState {
     tray::QuickToggleState {
+        language: config.appearance.language.clone(),
         active_border: config.appearance.active_border,
         focus_new_windows: config.behavior.focus_new_windows,
         focus_follows_mouse: config.behavior.focus_follows_mouse,
-        hide_offscreen_taskbar: config.behavior.hide_offscreen_taskbar_buttons,
+        taskbar_buttons: match config.behavior.taskbar_buttons {
+            config::TaskbarButtons::HideOffscreen => tray::TASKBAR_HIDE_OFFSCREEN,
+            config::TaskbarButtons::HideInactiveWorkspaces => {
+                tray::TASKBAR_HIDE_INACTIVE_WORKSPACES
+            }
+            config::TaskbarButtons::ShowAll => tray::TASKBAR_SHOW_ALL,
+        },
         auto_start: leopardwm_platform_win32::autostart::get_autostart().unwrap_or(false),
         centering_mode: match config.layout.centering_mode {
             config::CenteringModeConfig::Center => tray::CENTERING_CENTER,
@@ -443,6 +451,17 @@ async fn reload_config_and_hotkeys(
     // A reload always clears the daemon-side one-shot placement override
     // (see AppState::handle_reload); mirror that on the tray badge too.
     sync_tray_and_clear_once_placement(tray_manager, &new_config);
+    if let Some(manager) = tray_manager {
+        let state = state.lock().await;
+        manager.update_tooltip(
+            state.all_managed_window_ids().len(),
+            state.monitors.len(),
+            state.paused,
+            Some((hotkey_state.registered_count, hotkey_state.requested_count)),
+            (state.active_workspace_idx(state.focused_monitor) + 1) as u8,
+        );
+    }
+    settings::push_locale(&new_config.appearance.language);
     if let Some(ref overlay) = snap_hint_overlay {
         overlay.set_opacity(new_config.snap_hints.opacity);
     }
@@ -534,7 +553,9 @@ fn setup_hotkeys(config: &Config, event_tx: mpsc::Sender<DaemonEvent>) -> Hotkey
     // Include blocked F-key triggers to preserve the hook's modifier mask.
     // Resolution already deduplicated physical IDs, including across aliases.
     for entry in resolved.bindings {
-        let HotkeyBind { modifiers, vk, id } = entry.hook_binding;
+        let HotkeyBind {
+            modifiers, vk, id, ..
+        } = entry.hook_binding;
         debug!(
             "Configured hotkey {}: {} -> {:?}",
             id, entry.binding, entry.command
@@ -770,6 +791,7 @@ struct EventLoopCtx<'a> {
     idle_layout_reapply_timer: &'a mut Option<tokio::task::JoinHandle<()>>,
     display_change_apply_retry_timer: &'a mut Option<(u64, tokio::task::JoinHandle<()>)>,
     mouse_hook_handle: &'a mut Option<MouseHookHandle>,
+    gestures: &'a mut GestureRuntime,
 }
 
 async fn sync_pending_layout_apply_timeout_ui(
@@ -810,11 +832,13 @@ async fn sync_pending_layout_apply_timeout_ui(
         );
     }
 
+    let language = state.lock().await.config.appearance.language.clone();
     notify::show_toast(
-        "Tiling paused",
-        &format!(
-            "Window placement did not finish within {} seconds, so tiling was automatically paused. Choose Resume Tiling from the tray after the windows settle.",
-            report.timeout.as_secs()
+        &locale::text(&language, "notification.tiling_paused.title"),
+        &locale::format(
+            &language,
+            "notification.tiling_paused.body",
+            &[("seconds", &report.timeout.as_secs().to_string())],
         ),
     );
 }
@@ -1455,58 +1479,172 @@ fn sync_mouse_hook(
     }
 }
 
-/// Register gesture detection (if enabled).
-fn setup_gestures(
-    config: &Config,
-    event_tx: &mpsc::Sender<DaemonEvent>,
-    thread_handles: &mut Vec<std::thread::JoinHandle<()>>,
-) -> (
-    Option<leopardwm_platform_win32::GestureHandle>,
-    leopardwm_ipc::NativeSwipeStatus,
+#[derive(Debug, PartialEq, Eq)]
+enum GestureHookChange {
+    Install,
+    Stop,
+    None,
+}
+
+fn gesture_hook_change(installed: bool, enabled: bool, retry_install: bool) -> GestureHookChange {
+    match (installed, enabled, retry_install) {
+        (false, true, true) => GestureHookChange::Install,
+        (true, false, _) => GestureHookChange::Stop,
+        _ => GestureHookChange::None,
+    }
+}
+
+fn forward_gestures(
+    receiver: std::sync::mpsc::Receiver<GestureEvent>,
+    sender: mpsc::Sender<DaemonEvent>,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
 ) {
-    let (handle, registration_error, raw_input_error) = if config.gestures.enabled {
-        // Set scroll modifier before registering the hook
-        leopardwm_platform_win32::set_scroll_modifier(&config.hotkeys.scroll_modifier);
-
-        match register_gestures_with_raw_input(config.gestures.raw_input) {
-            Ok((handle, gesture_receiver, raw_input_error)) => {
-                info!("Gesture detection enabled");
-                leopardwm_platform_win32::emit_gesture_registration("registered");
-
-                // Spawn thread to forward gesture events
-                match spawn_forwarding_thread(
-                    "gesture-fwd",
-                    gesture_receiver,
-                    event_tx.clone(),
-                    DaemonEvent::Gesture,
-                ) {
-                    Ok(handle) => thread_handles.push(handle),
-                    Err(e) => warn!("{}", e),
-                }
-
-                (Some(handle), None, raw_input_error)
+    use std::sync::atomic::Ordering;
+    while let Ok(event) = receiver.recv() {
+        let mut event = DaemonEvent::Gesture(event);
+        let mut backpressured = false;
+        loop {
+            if cancel.load(Ordering::Acquire) {
+                return;
             }
-            Err(e) => {
-                warn!(
-                    "Failed to register gestures: {}. Gesture support disabled.",
-                    e
-                );
-                leopardwm_platform_win32::emit_gesture_registration("failed");
-                (None, Some(e.to_string()), None)
+            match sender.try_send(event) {
+                Ok(()) => break,
+                Err(mpsc::error::TrySendError::Closed(_)) => return,
+                Err(mpsc::error::TrySendError::Full(pending)) => {
+                    if !backpressured {
+                        debug!(target: "leopardwm::gesture_forwarding", "Gesture forwarding waiting for daemon channel capacity");
+                        backpressured = true;
+                    }
+                    event = pending;
+                    std::thread::sleep(Duration::from_millis(10));
+                }
             }
         }
-    } else {
+    }
+}
+
+fn install_gesture_detection(
+    raw_input: bool,
+    sender: mpsc::Sender<DaemonEvent>,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+) -> Result<(leopardwm_platform_win32::GestureHandle, Option<String>)> {
+    let (handle, receiver, raw_input_error) = register_gestures_with_raw_input(raw_input)?;
+    std::thread::Builder::new()
+        .name("gesture-fwd".into())
+        .spawn(move || forward_gestures(receiver, sender, cancel))?;
+    Ok((handle, raw_input_error))
+}
+
+struct GestureRuntime {
+    startup_raw_input: bool,
+    handle: Option<leopardwm_platform_win32::GestureHandle>,
+    cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+    retry_install: bool,
+}
+
+impl GestureRuntime {
+    fn sync(
+        &mut self,
+        enabled: bool,
+        event_tx: &mpsc::Sender<DaemonEvent>,
+    ) -> Option<leopardwm_ipc::NativeSwipeStatus> {
+        let change = gesture_hook_change(self.handle.is_some(), enabled, self.retry_install);
+        if !enabled {
+            self.retry_install = true;
+        }
+        match change {
+            GestureHookChange::Install => {
+                if !leopardwm_platform_win32::GestureHandle::finish_retired_shutdown() {
+                    return Some(self.status(
+                        true,
+                        Some("previous gesture detection is stopping; registration deferred"),
+                        None,
+                    ));
+                }
+                self.retry_install = false;
+                let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                match install_gesture_detection(
+                    self.startup_raw_input,
+                    event_tx.clone(),
+                    cancel.clone(),
+                ) {
+                    Ok((handle, raw_input_error)) => {
+                        self.handle = Some(handle);
+                        self.cancel = Some(cancel);
+                        info!("Gesture detection enabled");
+                        leopardwm_platform_win32::emit_gesture_registration("registered");
+                        Some(self.status(true, None, raw_input_error.as_deref()))
+                    }
+                    Err(error) => {
+                        warn!(%error, "Failed to register gestures; gesture support disabled");
+                        leopardwm_platform_win32::emit_gesture_registration("failed");
+                        Some(self.status(true, Some(&error.to_string()), None))
+                    }
+                }
+            }
+            GestureHookChange::Stop => {
+                self.stop();
+                info!("Gesture detection disabled by config (gestures.enabled = false)");
+                leopardwm_platform_win32::emit_gesture_registration("disabled");
+                Some(self.status(false, None, None))
+            }
+            GestureHookChange::None => {
+                leopardwm_platform_win32::GestureHandle::finish_retired_shutdown();
+                (!enabled).then(|| self.status(false, None, None))
+            }
+        }
+    }
+
+    fn status(
+        &self,
+        enabled: bool,
+        registration_error: Option<&str>,
+        raw_input_error: Option<&str>,
+    ) -> leopardwm_ipc::NativeSwipeStatus {
+        crate::state::derive_native_swipe_status(
+            self.startup_raw_input,
+            enabled,
+            registration_error,
+            raw_input_error,
+        )
+    }
+
+    fn stop(&mut self) {
+        if let Some(cancel) = self.cancel.take() {
+            cancel.store(true, std::sync::atomic::Ordering::Release);
+        }
+        self.handle = None;
+    }
+}
+
+impl Drop for GestureRuntime {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+async fn setup_gestures(
+    config: &Config,
+    event_tx: &mpsc::Sender<DaemonEvent>,
+    state: &Arc<Mutex<AppState>>,
+) -> GestureRuntime {
+    let mut gestures = GestureRuntime {
+        startup_raw_input: config.gestures.raw_input,
+        handle: None,
+        cancel: None,
+        retry_install: true,
+    };
+    leopardwm_platform_win32::set_scroll_modifier(&config.hotkeys.scroll_modifier);
+    leopardwm_platform_win32::set_wheel_swipes(config.gestures.wheel_swipes);
+    if !config.gestures.enabled {
         info!("Gesture detection disabled by config (gestures.enabled = false)");
         leopardwm_platform_win32::emit_gesture_registration("disabled");
-        (None, None, None)
-    };
-    let status = crate::state::derive_native_swipe_status(
-        config.gestures.raw_input,
-        config.gestures.enabled,
-        registration_error.as_deref(),
-        raw_input_error.as_deref(),
-    );
-    (handle, status)
+    }
+    let status = gestures
+        .sync(config.gestures.enabled, event_tx)
+        .expect("initial gesture reconciliation reports native swipe status");
+    state.lock().await.native_swipes = status;
+    gestures
 }
 
 /// Initialize the system tray icon and bridge its events into the event loop.
@@ -2147,6 +2285,10 @@ async fn handle_gesture_event(ctx: &mut EventLoopCtx<'_>, gesture_event: Gesture
         state.config.gestures.clone()
     };
 
+    if !gesture_config.enabled {
+        return false;
+    }
+
     let cmd_str = match gesture_event {
         GestureEvent::SwipeLeft => &gesture_config.swipe_left,
         GestureEvent::SwipeRight => &gesture_config.swipe_right,
@@ -2263,12 +2405,15 @@ async fn handle_release_all_windows(ctx: &mut EventLoopCtx<'_>) {
             (state.active_workspace_idx(state.focused_monitor) + 1) as u8,
         );
     }
+    let language = ctx.state.lock().await.config.appearance.language.clone();
     if let Some(error) = release_error {
         std::thread::spawn(move || {
             use windows::core::{w, HSTRING};
             use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
-            let message = HSTRING::from(format!(
-                "Windows may have been only partially released. Tiling remains paused.\n\nDetails: {error}"
+            let message = HSTRING::from(locale::format(
+                &language,
+                "dialog.release_failed",
+                &[("error", &error)],
             ));
             unsafe {
                 let _ = MessageBoxW(None, &message, w!("LeopardWM"), MB_OK | MB_ICONERROR);
@@ -2277,14 +2422,14 @@ async fn handle_release_all_windows(ctx: &mut EventLoopCtx<'_>) {
     } else {
         let event_tx_clone = ctx.event_tx.clone();
         std::thread::spawn(move || {
-            use windows::core::w;
+            use windows::core::{w, HSTRING};
             use windows::Win32::UI::WindowsAndMessaging::{
                 MessageBoxW, IDYES, MB_ICONQUESTION, MB_YESNO,
             };
             let result = unsafe {
                 MessageBoxW(
                     None,
-                    w!("All windows have been released and cascaded.\n\nWould you like to restart tiling?"),
+                    &HSTRING::from(locale::text(&language, "dialog.release_complete")),
                     w!("LeopardWM"),
                     MB_YESNO | MB_ICONQUESTION,
                 )
@@ -2449,16 +2594,13 @@ async fn handle_tray_event(ctx: &mut EventLoopCtx<'_>, tray_event: tray::TrayEve
                 }
             }
         }
-        tray::TrayEvent::ToggleHideOffscreenTaskbar => {
+        tray::TrayEvent::SetTaskbarButtons(mode) => {
             let mut state = ctx.state.lock().await;
-            state.config.behavior.hide_offscreen_taskbar_buttons =
-                !state.config.behavior.hide_offscreen_taskbar_buttons;
-            info!(
-                "Tray: Hide off-screen taskbar buttons toggled to {}",
-                state.config.behavior.hide_offscreen_taskbar_buttons
-            );
-            // Apply live: hide off-view buttons, or restore all when turned off.
+            // Transient: only the settings window writes config.toml.
+            state.config.behavior.taskbar_buttons = mode;
+            info!("Tray: Taskbar buttons set to {:?}", mode);
             state.sync_taskbar_buttons();
+            sync_tray_toggles(ctx.tray_manager, &state.config);
         }
         tray::TrayEvent::ToggleAutoStart => {
             use leopardwm_platform_win32::autostart;
@@ -2559,28 +2701,29 @@ async fn set_persistent_placement(
     sync_tray_and_clear_once_placement(ctx.tray_manager, &state.config);
 }
 
-/// Silent close-to-tray disappearance fires no WinEvent. While tracking still
-/// names that window, the next Focused is indistinguishable from
-/// auto-activation, so this tick prunes a dead tracked focus on its own.
-fn spawn_focus_liveness_ticker(event_tx: &mpsc::Sender<DaemonEvent>) {
+/// Check eventless focus disappearance and deferred moves after placement
+/// feedback suppression ends.
+fn spawn_periodic_ticker(event_tx: &mpsc::Sender<DaemonEvent>) {
     let tx = event_tx.clone();
     tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(Duration::from_millis(500));
+        let mut ticker = tokio::time::interval(crate::state::PERIODIC_CHECK_INTERVAL);
         ticker.tick().await;
         loop {
             ticker.tick().await;
-            if tx.send(DaemonEvent::FocusLivenessCheck).await.is_err() {
+            if tx.send(DaemonEvent::PeriodicCheck).await.is_err() {
                 break;
             }
         }
     });
 }
 
-/// Prune a tracked focus window that vanished without a WinEvent, and start
-/// the animation worker when that prune changes the layout.
-async fn handle_focus_liveness_check(ctx: &mut EventLoopCtx<'_>) {
+/// Prune vanished tracked focus, replay suppressed moves and re-check off-screen drift,
+/// and start the animation worker when either check changes the layout.
+async fn handle_periodic_check(ctx: &mut EventLoopCtx<'_>) {
     let mut state = ctx.state.lock().await;
-    if !state.check_tracked_focus_liveness() {
+    let focus_changed = state.check_tracked_focus_liveness();
+    let moves_checked = state.recheck_deferred_window_moves();
+    if !focus_changed && !moves_checked {
         return;
     }
     if state.overview_open {
@@ -3055,6 +3198,18 @@ async fn handle_overview_event(
                 warn!("Overview workspace switch failed: {}", message);
             }
         }
+        OverviewEvent::MoveWindow {
+            window_id,
+            forward,
+            generation,
+        } => {
+            let mut s = ctx.state.lock().await;
+            if let IpcResponse::Error { message } =
+                s.move_overview_window(window_id, forward, generation)
+            {
+                warn!("Overview window move failed: {}", message);
+            }
+        }
         OverviewEvent::CloseWindow(wid) => {
             if let Err(e) = leopardwm_platform_win32::close_window(wid) {
                 warn!("close_window from overview failed: {}", e);
@@ -3141,7 +3296,8 @@ async fn handle_settings_event(
             info!("Settings: config saved, triggering reload");
             let response = {
                 let mut state = ctx.state.lock().await;
-                state.handle_command(IpcCommand::Reload)
+                // Settings already logged validation warnings before saving the clamped config.
+                state.reload_config(false)
             };
             if matches!(response, IpcResponse::Ok) {
                 reload_config_and_hotkeys(
@@ -3631,6 +3787,10 @@ async fn handle_display_change_apply_retry(ctx: &mut EventLoopCtx<'_>, generatio
 /// Finish each processed event before waiting for the next one.
 async fn finish_daemon_event(ctx: &mut EventLoopCtx<'_>) {
     sync_pending_layout_apply_timeout_ui(ctx.state, ctx.tray_manager, &*ctx.hotkey_state).await;
+    let enabled = ctx.state.lock().await.config.gestures.enabled;
+    if let Some(status) = ctx.gestures.sync(enabled, ctx.event_tx) {
+        ctx.state.lock().await.native_swipes = status;
+    }
     let (should_arm_idle_reapply, display_retry_generation) = {
         let mut state = ctx.state.lock().await;
         let timer_needed = state.idle_layout_reapply_timer_needed();
@@ -3756,8 +3916,7 @@ async fn main() -> Result<()> {
     let mut mouse_hook_handle = setup_mouse_hook(&config, &event_tx, &mut thread_handles);
 
     // Register gesture detection (if enabled)
-    let (_gesture_handle, native_swipes) = setup_gestures(&config, &event_tx, &mut thread_handles);
-    state.lock().await.native_swipes = native_swipes;
+    let mut gestures = setup_gestures(&config, &event_tx, &state).await;
 
     // Initialize overlay for snap hints and drag ghost preview.
     // Always created — snap_hints.enabled only gates resize-hint visibility,
@@ -3820,7 +3979,7 @@ async fn main() -> Result<()> {
         });
     }
 
-    spawn_focus_liveness_ticker(&event_tx);
+    spawn_periodic_ticker(&event_tx);
 
     // Settings window forwarding channel + handle
     let (settings_sync_tx, settings_sync_rx) = std::sync::mpsc::channel();
@@ -3902,6 +4061,7 @@ async fn main() -> Result<()> {
         idle_layout_reapply_timer: &mut idle_layout_reapply_timer,
         display_change_apply_retry_timer: &mut display_change_apply_retry_timer,
         mouse_hook_handle: &mut mouse_hook_handle,
+        gestures: &mut gestures,
     };
 
     // Main event loop
@@ -3947,8 +4107,8 @@ async fn main() -> Result<()> {
             DaemonEvent::TabStripIconPoll => {
                 handle_tab_strip_icon_poll(&state).await;
             }
-            DaemonEvent::FocusLivenessCheck => {
-                handle_focus_liveness_check(&mut ctx).await;
+            DaemonEvent::PeriodicCheck => {
+                handle_periodic_check(&mut ctx).await;
             }
             DaemonEvent::PersistStateNow => {
                 handle_persist_state_now(&state).await;
@@ -4036,6 +4196,7 @@ async fn main() -> Result<()> {
     // Stop the update-checker worker so it doesn't hold up shutdown.
     update_check_cancel.store(true, std::sync::atomic::Ordering::SeqCst);
     abort_event_timers(&mut ctx);
+    ctx.gestures.stop();
     stop_animation_worker_and_run_recovery(animation_worker, &state, event_rx).await;
     quit_fallback.complete();
 

@@ -46,6 +46,40 @@ impl Workspace {
             .max(0)
     }
 
+    pub(super) fn scroll_bounds(
+        &self,
+        viewport_width: i32,
+        min_scroll: f64,
+        max_scroll: f64,
+    ) -> (f64, f64) {
+        if self.center_single_column && self.fullscreen_window.is_none() {
+            let mut active = self
+                .columns
+                .iter()
+                .filter(|column| self.is_column_active(column));
+            if let Some(column) = active.next() {
+                let width = self.effective_column_width(column);
+                let visible_width = self.visible_width(viewport_width);
+                if active.next().is_none() && width <= visible_width {
+                    let offset = (-(visible_width - width) / 2) as f64;
+                    return (offset, offset);
+                }
+            }
+        }
+        (min_scroll, max_scroll)
+    }
+
+    pub(super) fn clamp_scroll_offset(
+        &self,
+        offset: f64,
+        viewport_width: i32,
+        min_scroll: f64,
+        max_scroll: f64,
+    ) -> f64 {
+        let (min_scroll, max_scroll) = self.scroll_bounds(viewport_width, min_scroll, max_scroll);
+        offset.clamp(min_scroll, max_scroll)
+    }
+
     /// Whether the focused column should be centered under the current
     /// centering mode. `OnOverflow` centers only when the column is wider
     /// than the visible area (it cannot fit otherwise).
@@ -88,20 +122,20 @@ impl Workspace {
             }
         }
 
-        let raw_max = self.total_width() - vis_w;
-        if self.rtl && raw_max <= 0 {
+        let raw_max = (self.total_width() - vis_w) as f64;
+        let (min_scroll, max_scroll) = if self.rtl && raw_max <= 0.0 {
             // Content fits — right-anchor by allowing negative scroll_offset.
             // Negative viewport_left shifts all columns right on screen, so
             // the strip's right edge aligns with the viewport's right edge.
-            self.scroll_offset = raw_max as f64;
+            // center_single_column still wins via clamp_scroll_offset.
+            (raw_max, raw_max)
+        } else if self.center_past_edges {
+            (f64::NEG_INFINITY, raw_max.max(0.0))
         } else {
-            let max_scroll = raw_max.max(0);
-            if self.center_past_edges {
-                self.scroll_offset = self.scroll_offset.min(max_scroll as f64);
-            } else {
-                self.scroll_offset = self.scroll_offset.clamp(0.0, max_scroll as f64);
-            }
-        }
+            (0.0, raw_max.max(0.0))
+        };
+        self.scroll_offset =
+            self.clamp_scroll_offset(self.scroll_offset, viewport_width, min_scroll, max_scroll);
     }
 
     /// Resize the focused column by a delta amount.
@@ -201,9 +235,12 @@ impl Workspace {
             if self.focused_column > index {
                 self.focused_column -= 1;
             }
-            // Reclamp scroll offset — the strip may have shrunk
-            let max_scroll = self.total_width().max(0) as f64;
-            self.scroll_offset = self.scroll_offset.clamp(0.0, max_scroll);
+            // Outside fullscreen, centering needs a viewport; defer bounds repair
+            // to reveal/reconcile so removal preserves the animation's start.
+            if !self.center_single_column || self.fullscreen_window.is_some() {
+                let max_scroll = self.total_width().max(0) as f64;
+                self.scroll_offset = self.scroll_offset.clamp(0.0, max_scroll);
+            }
         }
         self.clamp_focus_indices();
         Some(col)
@@ -433,7 +470,8 @@ impl Workspace {
         self.scroll_offset += safe_delta;
         let vis_w = self.visible_width(viewport_width);
         let max_scroll = (self.total_width() - vis_w).max(0);
-        self.scroll_offset = self.scroll_offset.clamp(0.0, max_scroll as f64);
+        self.scroll_offset =
+            self.clamp_scroll_offset(self.scroll_offset, viewport_width, 0.0, max_scroll as f64);
     }
 
     /// Repair bounds without revealing focus; preserve valid animations and edge centering.
@@ -457,13 +495,19 @@ impl Workspace {
                 max_scroll = max_scroll.max(last_center.saturating_sub(vis_w / 2) as f64);
             }
         }
+        let (min_scroll, max_scroll) = self.scroll_bounds(viewport_width, min_scroll, max_scroll);
         let current = self.effective_scroll_offset();
         let target = self
             .active_animation
             .as_ref()
             .map_or(current, |anim| anim.target());
         let bounds = min_scroll..=max_scroll;
-        if bounds.contains(&current) && bounds.contains(&target) {
+        if bounds.contains(&target)
+            && (bounds.contains(&current)
+                || (self.center_single_column
+                    && self.fullscreen_window.is_none()
+                    && self.active_animation.is_some()))
+        {
             return;
         }
         self.cancel_animation();
@@ -504,7 +548,8 @@ impl Workspace {
         // the strip's right edge aligns with the viewport's right edge.
         let min_scroll = if self.rtl { raw_max.min(0) as f64 } else { 0.0 };
         let max_scroll = raw_max.max(0);
-        let clamped_target = target.clamp(min_scroll, max_scroll as f64);
+        let clamped_target =
+            self.clamp_scroll_offset(target, viewport_width, min_scroll, max_scroll as f64);
         self.animate_scroll_to(clamped_target, duration_ms, easing);
     }
 
@@ -612,6 +657,8 @@ impl Workspace {
                     0.0
                 } else if current > max_scroll + 0.5 {
                     max_scroll
+                } else if self.center_single_column {
+                    current
                 } else {
                     return;
                 }
@@ -619,11 +666,13 @@ impl Workspace {
         };
 
         let max_scroll = (self.total_width() - vis_w).max(0) as f64;
-        let target = if self.center_past_edges {
-            target_offset.min(max_scroll)
+        let min_scroll = if self.center_past_edges {
+            f64::NEG_INFINITY
         } else {
-            target_offset.clamp(0.0, max_scroll)
+            0.0
         };
+        let target =
+            self.clamp_scroll_offset(target_offset, viewport_width, min_scroll, max_scroll);
         self.animate_scroll_to(target, None, None);
     }
 
@@ -641,7 +690,12 @@ impl Workspace {
 
         let vis_w = self.visible_width(viewport_width);
         let col_center = col_x.saturating_add(col_width / 2);
-        let target = (col_center - vis_w / 2) as f64;
+        let target = self.clamp_scroll_offset(
+            (col_center - vis_w / 2) as f64,
+            viewport_width,
+            f64::NEG_INFINITY,
+            f64::INFINITY,
+        );
 
         if self.center_past_edges {
             // Unclamped — allow negative offsets and scrolling past the end
@@ -657,7 +711,8 @@ impl Workspace {
             if self.reduce_motion {
                 self.stop_animation();
                 let max_scroll = (self.total_width() - vis_w).max(0);
-                self.scroll_offset = target.clamp(0.0, max_scroll as f64);
+                self.scroll_offset =
+                    self.clamp_scroll_offset(target, viewport_width, 0.0, max_scroll as f64);
                 return;
             }
 

@@ -14,8 +14,11 @@ is the single source of truth; follow it exactly. This skill is the procedure ar
 
 ## 1. Read the diff being committed
 
-1. `git rev-parse -q --verify MERGE_HEAD` — if a merge is in progress, this commit concludes it:
-   tell the user the merge commit uses git's default message and stop.
+1. `git rev-parse -q --verify MERGE_HEAD` — if a merge is in progress, this commit concludes it.
+   Draft it per the rules' Merges section. A tweak is a staged change that came from neither
+   side: take `git diff --cached HEAD` (everything the merge changes on haha) and remove what
+   main brought (`git diff HEAD...MERGE_HEAD`); what's left are the conflict resolutions and
+   fix-ups. Describe each by what the user sees. Skip steps 2–4.
 2. `git diff --cached --stat` and `git diff --cached` — the staged changes are the only input.
    If nothing is staged, tell the user to stage what they want to commit, and stop.
 3. `git diff --stat` — only to detect unstaged changes. Never draft from them; if any exist,

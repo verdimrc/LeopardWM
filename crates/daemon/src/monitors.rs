@@ -3,7 +3,7 @@
 use crate::helpers::ScaledLayoutParams;
 use crate::state::*;
 use leopardwm_core_layout::{Rect, Workspace};
-use leopardwm_platform_win32::{find_monitor_for_rect, MonitorId, MonitorInfo};
+use leopardwm_platform_win32::{MonitorId, MonitorInfo};
 use std::collections::{HashMap, HashSet};
 use tracing::{info, warn};
 
@@ -161,6 +161,7 @@ impl AppState {
                     for workspace in &mut stashed_ws {
                         workspace.set_centering_mode(self.config.layout.centering_mode.into());
                         workspace.set_center_past_edges(self.config.layout.center_past_edges);
+                        workspace.set_center_single_column(self.config.layout.center_single_column);
                         workspace.ensure_focused_visible(source_viewport_width);
                     }
                     let returning: HashSet<u64> =
@@ -236,6 +237,7 @@ impl AppState {
                 workspace.set_tab_strip_reserve_px(params.tab_strip_reserve_px);
                 workspace.set_centering_mode(self.config.layout.centering_mode.into());
                 workspace.set_center_past_edges(self.config.layout.center_past_edges);
+                workspace.set_center_single_column(self.config.layout.center_single_column);
                 workspace.set_reduce_motion(self.reduce_motion);
                 workspace.set_scroll_animation(
                     self.config.animation.scroll_duration_ms,
@@ -386,14 +388,14 @@ impl AppState {
         }
     }
 
-    /// After workspace model and fullscreen sessions are current, resync
-    /// minimized flags from the OS and park inactive-workspace windows that
-    /// `apply_layout` will not place. Shared by startup and display-change
-    /// reconciliation so a stashed reconnect cannot leave those windows on the
-    /// remaining monitor. Pause keeps the old display-change resync but skips
-    /// parking and fullscreen observation.
+    /// Resync minimized flags and park inactive-workspace windows for startup and resume.
+    /// Pause still resyncs but skips parking and fullscreen observation.
     pub(crate) fn prepare_inactive_workspace_windows(&mut self) {
         self.resync_minimized_from_os();
+        self.park_inactive_workspace_windows();
+    }
+
+    pub(crate) fn park_inactive_workspace_windows(&mut self) {
         if self.paused {
             return;
         }
@@ -408,13 +410,7 @@ impl AppState {
                     if workspace.is_minimized(wid) || self.is_application_fullscreen(wid) {
                         continue;
                     }
-                    let (chrome_rect, dwm_rect) = self.application_fullscreen_geometry(wid);
-                    if let Some(session) = self.observe_application_fullscreen(
-                        wid,
-                        chrome_rect,
-                        dwm_rect,
-                        leopardwm_platform_win32::is_window_maximized(wid),
-                    ) {
+                    if let Some(session) = self.observe_current_application_fullscreen(wid) {
                         self.application_fullscreen.insert(wid, session);
                         continue;
                     }
@@ -422,6 +418,8 @@ impl AppState {
                     if let Err(e) = leopardwm_platform_win32::queue_window_offscreen(wid) {
                         warn!("Failed to park inactive workspace window {:#x}: {}", wid, e);
                     }
+                    #[cfg(test)]
+                    self.inactive_workspace_park_requests.push(wid);
                     #[cfg(test)]
                     if self.injected_native_offscreen_enabled {
                         if let Err(e) = leopardwm_platform_win32::queue_window_offscreen(wid) {
@@ -619,19 +617,20 @@ impl AppState {
         }
     }
 
-    /// Select the monitor for a newly created window. Uses the cursor monitor
-    /// first; falls back to strict rect-center containment (no primary-monitor
-    /// fallback for off-screen rects); finally uses `focused_monitor`.
-    /// When `use_os_rect` is true, uses Win32 rect-based selection instead
-    /// (for `tile_on_os_monitor` rules).
-    pub(crate) fn monitor_for_new_window(&self, win_rect: &Rect, use_os_rect: bool) -> MonitorId {
-        if use_os_rect {
-            let monitors: Vec<_> = self.monitors.values().cloned().collect();
-            return find_monitor_for_rect(&monitors, win_rect)
-                .map(|m| m.id)
-                .unwrap_or(self.focused_monitor);
-        }
-        self.monitor_under_cursor()
+    /// Select the monitor for a newly created window under `policy` (the
+    /// effective `new_window_monitor`). `Cursor` uses the cursor monitor
+    /// first; otherwise (and as the fallback) strict rect-center containment
+    /// (no primary-monitor fallback for off-screen rects); finally
+    /// `focused_monitor`. `Focused` is resolved by the caller.
+    pub(crate) fn monitor_for_new_window(
+        &self,
+        win_rect: &Rect,
+        policy: crate::config::NewWindowMonitor,
+    ) -> MonitorId {
+        let use_cursor = policy == crate::config::NewWindowMonitor::Cursor;
+        use_cursor
+            .then(|| self.monitor_under_cursor())
+            .flatten()
             .or_else(|| {
                 self.monitors
                     .values()

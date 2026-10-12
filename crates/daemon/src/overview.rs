@@ -11,7 +11,7 @@
 use crate::state::AppState;
 use leopardwm_core_layout::{Rect, Visibility, Workspace};
 use leopardwm_platform_win32::overview::{
-    OverviewCard, OverviewModel, OverviewOverlay, OverviewRow, SecondaryOverlay,
+    OverviewCard, OverviewDirection, OverviewModel, OverviewOverlay, OverviewRow, SecondaryOverlay,
     DEFAULT_ACCENT_BGR, PANEL_INNER_PAD, SELECT_PAD, VIEWPORT_RING_PAD,
 };
 use tracing::{info, warn};
@@ -183,10 +183,92 @@ fn inset_card(r: &Rect) -> Rect {
     Rect::new(r.x + ix, r.y + iy, r.width - 2 * ix, r.height - 2 * iy)
 }
 
+pub(crate) fn overview_direction(command: &leopardwm_ipc::IpcCommand) -> Option<OverviewDirection> {
+    use leopardwm_ipc::IpcCommand;
+
+    match command {
+        IpcCommand::FocusLeft => Some(OverviewDirection::Left),
+        IpcCommand::FocusRight => Some(OverviewDirection::Right),
+        IpcCommand::FocusUp => Some(OverviewDirection::Up),
+        IpcCommand::FocusDown => Some(OverviewDirection::Down),
+        _ => None,
+    }
+}
+
 impl AppState {
-    /// Build the overview display model for the focused monitor.
+    pub(crate) fn move_overview_window(
+        &mut self,
+        wid: u64,
+        forward: bool,
+        generation: u32,
+    ) -> leopardwm_ipc::IpcResponse {
+        if !leopardwm_platform_win32::overview::is_input_session_current(generation) {
+            return leopardwm_ipc::IpcResponse::Ok;
+        }
+        let response = self.transfer_overview_window(wid, forward);
+        if self.overview_open
+            && leopardwm_platform_win32::overview::is_input_session_current(generation)
+        {
+            match self.build_overview_model_with_selection(Some(wid)) {
+                Some((_, model)) => {
+                    if let Some(overlay) = &self.overview_overlay {
+                        overlay.complete_window_move(model, wid, generation);
+                    }
+                }
+                None if leopardwm_platform_win32::overview::is_input_session_current(
+                    generation,
+                ) =>
+                {
+                    self.hide_overview()
+                }
+                None => {}
+            }
+        }
+        response
+    }
+
+    fn transfer_overview_window(&mut self, wid: u64, forward: bool) -> leopardwm_ipc::IpcResponse {
+        use leopardwm_ipc::IpcResponse;
+
+        if !self.overview_open || self.sticky_windows.contains(&wid) {
+            return IpcResponse::Ok;
+        }
+        let Some((monitor, source)) = self.find_window_workspace(wid) else {
+            return IpcResponse::Ok;
+        };
+        if monitor != self.focused_monitor {
+            return IpcResponse::Ok;
+        }
+        #[cfg(not(test))]
+        if !leopardwm_platform_win32::is_window_valid(wid) {
+            return IpcResponse::Ok;
+        }
+        let destination = if forward {
+            source.checked_add(1).filter(|&idx| idx < 9)
+        } else {
+            source.checked_sub(1)
+        };
+        let Some(destination) = destination else {
+            return IpcResponse::Ok;
+        };
+        self.move_window_to_workspace(monitor, source, wid, (destination + 1) as u8, false)
+    }
+
+    /// Build the overview display model for the focused monitor, keeping the
+    /// overlay's current selection.
     pub(crate) fn build_overview_model(&mut self) -> Option<(Rect, OverviewModel)> {
-        self.build_overview_model_for(self.focused_monitor)
+        let selection = self
+            .overview_overlay
+            .as_ref()
+            .and_then(OverviewOverlay::selected_window_id);
+        self.build_overview_model_with_selection(selection)
+    }
+
+    fn build_overview_model_with_selection(
+        &mut self,
+        selection: Option<u64>,
+    ) -> Option<(Rect, OverviewModel)> {
+        self.build_overview_model_for(self.focused_monitor, selection)
     }
 
     /// Build the overview display model for the given monitor.
@@ -196,6 +278,7 @@ impl AppState {
     pub(crate) fn build_overview_model_for(
         &mut self,
         monitor: isize,
+        selection: Option<u64>,
     ) -> Option<(Rect, OverviewModel)> {
         let work_area = self.monitors.get(&monitor)?.work_area;
         let layout_vp = self.layout_viewport(monitor);
@@ -247,7 +330,11 @@ impl AppState {
         for (ws_idx, ws) in ws_vec.iter().enumerate() {
             let geom = &geoms[ws_idx];
             let is_active = ws_idx == active_idx;
-            let selected_wid = if is_active { focused_wid } else { None };
+            let selected_wid = match selection {
+                Some(wid) => ws.contains_window(wid).then_some(wid),
+                None if is_active => focused_wid,
+                None => None,
+            };
             // Vertical symmetry: the 1px panel frame is stroked INSIDE
             // the panel's bottom edge (the active accent ring sits
             // OUTSIDE) while the top boundary is the label band's
@@ -261,9 +348,9 @@ impl AppState {
             );
             let (mut cards, mut viewport, content_primary) =
                 self.overview_cards_for(ws, work_area, layout_vp, orient, strip, selected_wid, is_active);
-            // The active row always carries a selection: fall back to its
-            // first card when the focused window isn't represented.
-            if is_active && !cards.iter().any(|c| c.selected) {
+            // Initial selection falls back to the active row's first card
+            // when the focused window isn't represented.
+            if selection.is_none() && is_active && !cards.iter().any(|c| c.selected) {
                 if let Some(first) = cards.first_mut() {
                     first.selected = true;
                 }
@@ -398,8 +485,8 @@ impl AppState {
     /// Every rect goes through ONE uniform [`StripTransform`] — same
     /// scale, same offset — so relative geometry is exact.
     ///
-    /// A fullscreen workspace collapses to ONE viewport-sized card for
-    /// the fullscreen window instead of the underlying strip layout.
+    /// A fullscreen workspace collapses to ONE viewport-sized card unless
+    /// selection follows another window moved into its underlying strip.
     #[allow(clippy::too_many_arguments)]
     fn overview_cards_for(
         &self,
@@ -425,7 +512,8 @@ impl AppState {
 
         let fullscreen = ws
             .fullscreen_window_id()
-            .filter(|&wid| ws.contains_window(wid) && !ws.is_minimized(wid));
+            .filter(|&wid| ws.contains_window(wid) && !ws.is_minimized(wid))
+            .filter(|&wid| selected_wid.is_none_or(|selected| selected == wid));
         let sources: Vec<(u64, Rect, Option<usize>)> = if let Some(fs_wid) = fullscreen {
             // The fullscreen window covers the whole viewport (physical space).
             vec![(fs_wid, viewport_region, None)]
@@ -657,7 +745,7 @@ impl AppState {
             .filter(|&id| id != self.focused_monitor)
             .collect();
         for mon_id in other_monitors {
-            let Some((rect, model)) = self.build_overview_model_for(mon_id) else {
+            let Some((rect, model)) = self.build_overview_model_for(mon_id, None) else {
                 continue;
             };
             let Some(tx) = self.overview_event_tx.clone() else {
@@ -826,6 +914,328 @@ mod tests {
         for &wid in wids {
             ws.insert_window(wid, None).unwrap();
         }
+    }
+
+    #[test]
+    fn directional_hotkeys_carry_overview_actions_and_keep_normal_commands() {
+        for (binding, action, direction, start, destination) in [
+            (
+                "Ctrl+Alt+A",
+                "focus_left",
+                OverviewDirection::Left,
+                201,
+                101,
+            ),
+            ("F13+D", "focus_right", OverviewDirection::Right, 101, 201),
+            ("Win+K", "focus_up", OverviewDirection::Up, 102, 101),
+            ("Alt+J", "focus_down", OverviewDirection::Down, 101, 102),
+        ] {
+            let mut state = test_state();
+            let ws = state.ensure_workspace_exists(1, 0).unwrap();
+            ws.insert_window(101, None).unwrap();
+            ws.insert_window_in_column(102, 0).unwrap();
+            ws.insert_window(201, None).unwrap();
+            ws.focus_window(start).unwrap();
+            state.config.hotkeys.bindings.clear();
+            state
+                .config
+                .hotkeys
+                .bindings
+                .insert(binding.into(), action.into());
+            let resolved = crate::hotkey_resolution::resolve_hotkeys(&state.config.hotkeys);
+            assert!(resolved.issues.is_empty());
+            let command = resolved.bindings[0].command.clone();
+            assert_eq!(overview_direction(&command), Some(direction));
+
+            assert_eq!(
+                resolved.bindings[0].hook_binding.overview_action,
+                Some(leopardwm_platform_win32::overview::OverviewAction::Navigate(direction))
+            );
+            state.overview_open = true;
+            assert!(matches!(
+                state.handle_command(command),
+                leopardwm_ipc::IpcResponse::Ok
+            ));
+            assert_eq!(
+                state.workspaces[&1][0].focused_window(),
+                Some(destination),
+                "{binding} keeps its normal command even if daemon overview state is stale"
+            );
+        }
+    }
+
+    #[test]
+    fn stale_overview_move_does_not_transfer_or_refresh() {
+        for wid in [201, 999] {
+            let mut state = test_state();
+            add_windows(&mut state, 0, &[201]);
+            state.overview_open = true;
+            state.previous_focused_hwnd = Some(201);
+            assert!(matches!(
+                state.move_overview_window(wid, true, 1),
+                leopardwm_ipc::IpcResponse::Ok
+            ));
+            assert_eq!(state.find_window_workspace(201), Some((1, 0)));
+            assert!(state.overview_open);
+            assert_eq!(state.previous_focused_hwnd, Some(201));
+            assert!(
+                state.overview_icon_cache.is_empty(),
+                "stale moves must not rebuild the model"
+            );
+        }
+        let mut empty = test_state();
+        empty.overview_open = true;
+        assert!(matches!(
+            empty.move_overview_window(999, true, 1),
+            leopardwm_ipc::IpcResponse::Ok
+        ));
+        assert!(
+            empty.overview_open,
+            "a stale move must not hide a fresh empty overview"
+        );
+    }
+
+    #[test]
+    fn overview_move_without_layout_transition_does_not_suppress_scroll_landing() {
+        let mut state = test_state();
+        state.paused = false;
+        state.reduce_motion = true;
+        // Disable structural transitions, but keep the independent workspace scroll animated.
+        state.workspaces.get_mut(&1).unwrap()[0].set_reduce_motion(false);
+        add_windows(&mut state, 0, &[101, 201]);
+        {
+            let ws = &mut state.workspaces.get_mut(&1).unwrap()[0];
+            ws.set_all_column_widths(1400);
+            ws.focus_window(201).unwrap();
+            ws.set_scroll_offset(1400.0);
+        }
+        state.overview_open = true;
+        assert!(matches!(
+            state.transfer_overview_window(201, true),
+            leopardwm_ipc::IpcResponse::Ok
+        ));
+        assert!(state.layout_transition.is_none());
+        assert!(
+            state.is_animating(),
+            "source visibility starts an independent scroll animation"
+        );
+        assert!(!state.pending_suppress_landing_focus_resync);
+    }
+
+    #[test]
+    fn overview_selected_window_transfer_preserves_membership_and_foreground() {
+        for mode in [
+            "tiled",
+            "floating",
+            "stacked",
+            "tabbed",
+            "fullscreen",
+            "destination_fullscreen",
+        ] {
+            for (source, forward, destination) in [(2, false, 1), (2, true, 3), (1, false, 0)] {
+                let mut state = test_state();
+                state.paused = false;
+                state.reduce_motion = false;
+                state.workspaces.get_mut(&1).unwrap()[0].set_reduce_motion(false);
+                add_windows(&mut state, 0, &[101]);
+                if mode == "floating" {
+                    state
+                        .ensure_workspace_exists(1, source)
+                        .unwrap()
+                        .add_floating(201, Rect::new(40, 50, 300, 400))
+                        .unwrap();
+                } else {
+                    add_windows(&mut state, source, &[201]);
+                }
+                if matches!(mode, "stacked" | "tabbed") {
+                    let ws = &mut state.workspaces.get_mut(&1).unwrap()[source];
+                    ws.insert_window_in_column(202, 0).unwrap();
+                    if mode == "tabbed" {
+                        ws.toggle_focused_column_tabbed_mode();
+                    }
+                }
+                if mode == "fullscreen" {
+                    state.workspaces.get_mut(&1).unwrap()[source].toggle_fullscreen();
+                }
+                if mode == "destination_fullscreen" {
+                    add_windows(&mut state, destination, &[301]);
+                    state.workspaces.get_mut(&1).unwrap()[destination].toggle_fullscreen();
+                }
+                state.overview_open = true;
+                state.previous_focused_hwnd = Some(101);
+                assert!(
+                    matches!(
+                        state.transfer_overview_window(201, forward),
+                        leopardwm_ipc::IpcResponse::Ok
+                    ),
+                    "{mode}"
+                );
+                state.tick_animations(1000);
+                let suppress = state.pending_suppress_landing_focus_resync;
+                state.apply_layout().unwrap();
+                state.finish_animation_landing_focus_resync(suppress);
+                assert!(state.overview_open);
+                assert_eq!(state.focused_monitor, 1);
+                assert_eq!(state.active_workspace_idx(1), 0);
+                assert_eq!(
+                    state.previous_focused_hwnd,
+                    Some(101),
+                    "must not steal foreground"
+                );
+                assert_eq!(
+                    state.workspaces[&1][0].focused_window(),
+                    Some(if destination == 0 && mode != "floating" {
+                        201
+                    } else {
+                        101
+                    })
+                );
+                assert_eq!(state.find_window_workspace(201), Some((1, destination)));
+                if destination != 0 {
+                    assert!(
+                        !state.last_placed_layout_rects.contains_key(&201),
+                        "inactive windows must not enter the visible placement plan"
+                    );
+                }
+                assert_eq!(
+                    state.workspaces[&1]
+                        .iter()
+                        .filter(|ws| ws.contains_window(201))
+                        .count(),
+                    1
+                );
+                assert!(!state.workspaces[&1][source].contains_window(201));
+                assert_eq!(
+                    state.workspaces[&1][source].contains_window(202),
+                    matches!(mode, "stacked" | "tabbed")
+                );
+                assert_eq!(state.workspaces[&1][source].fullscreen_window_id(), None);
+                if mode == "floating" {
+                    assert!(state.workspaces[&1][destination].is_floating(201));
+                    assert_eq!(
+                        state.workspaces[&1][destination]
+                            .floating_windows()
+                            .iter()
+                            .find(|f| f.id == 201)
+                            .unwrap()
+                            .rect,
+                        Rect::new(40, 50, 300, 400)
+                    );
+                }
+                if mode == "destination_fullscreen" {
+                    assert_eq!(
+                        state.workspaces[&1][destination].fullscreen_window_id(),
+                        Some(301)
+                    );
+                }
+                let (_, model) = state
+                    .build_overview_model_with_selection(Some(201))
+                    .unwrap();
+                let selected: Vec<_> = model
+                    .rows
+                    .iter()
+                    .flat_map(|row| {
+                        row.cards
+                            .iter()
+                            .filter(|card| card.selected)
+                            .map(move |card| (row.workspace_index, card.window_id))
+                    })
+                    .collect();
+                assert_eq!(selected, vec![(destination, 201)], "{mode}");
+                assert_eq!(
+                    model
+                        .rows
+                        .iter()
+                        .flat_map(|row| &row.cards)
+                        .filter(|c| c.window_id == 201)
+                        .count(),
+                    1
+                );
+                // The source row stays even when the move empties it: the
+                // overview shows empty workspaces too.
+                assert!(model.rows.iter().any(|row| row.workspace_index == source));
+            }
+        }
+    }
+
+    #[test]
+    fn overview_move_from_active_workspace_does_not_move_its_focused_window() {
+        let mut state = test_state();
+        state.paused = false;
+        add_windows(&mut state, 0, &[101, 201]);
+        state.workspaces.get_mut(&1).unwrap()[0]
+            .focus_window(101)
+            .unwrap();
+        state.previous_focused_hwnd = Some(101);
+        state.overview_open = true;
+        state.workspaces.get_mut(&1).unwrap()[0].set_all_column_widths(400);
+        state.apply_layout().unwrap();
+        assert!(state.last_placed_layout_rects.contains_key(&201));
+        assert!(matches!(
+            state.transfer_overview_window(201, true),
+            leopardwm_ipc::IpcResponse::Ok
+        ));
+        state.tick_animations(1000);
+        let suppress = state.pending_suppress_landing_focus_resync;
+        state.apply_layout().unwrap();
+        state.finish_animation_landing_focus_resync(suppress);
+        assert_eq!(state.find_window_workspace(101), Some((1, 0)));
+        assert_eq!(state.find_window_workspace(201), Some((1, 1)));
+        assert_eq!(state.workspaces[&1][0].focused_window(), Some(101));
+        assert_eq!(state.previous_focused_hwnd, Some(101));
+        assert_eq!(state.active_workspace_idx(1), 0);
+        assert!(!state.last_placed_layout_rects.contains_key(&201));
+        assert!(state.overview_open);
+    }
+
+    #[test]
+    fn overview_selected_window_transfer_noops_for_ineligible_or_stale_actions() {
+        for reason in ["first", "last", "closed", "sticky", "dismissed"] {
+            let mut state = test_state();
+            let source = if reason == "last" { 8 } else { 0 };
+            add_windows(&mut state, source, &[201, 101]);
+            state.overview_open = reason != "dismissed";
+            state.previous_focused_hwnd = Some(201);
+            if reason == "closed" {
+                state.workspaces.get_mut(&1).unwrap()[source]
+                    .remove_window(201)
+                    .unwrap();
+            }
+            if reason == "sticky" {
+                state.sticky_windows.insert(201);
+            }
+            let before: Vec<_> = state.workspaces[&1]
+                .iter()
+                .map(Workspace::all_window_ids)
+                .collect();
+            assert!(matches!(
+                state.transfer_overview_window(201, reason != "first"),
+                leopardwm_ipc::IpcResponse::Ok
+            ));
+            assert_eq!(
+                state.workspaces[&1]
+                    .iter()
+                    .map(Workspace::all_window_ids)
+                    .collect::<Vec<_>>(),
+                before,
+                "{reason}"
+            );
+            assert_eq!(state.previous_focused_hwnd, Some(201));
+        }
+    }
+
+    #[test]
+    fn other_hotkey_actions_keep_their_normal_overview_behavior() {
+        let mut state = test_state();
+        add_windows(&mut state, 0, &[101, 102]);
+        state.workspaces.get_mut(&1).unwrap()[0]
+            .focus_window(101)
+            .unwrap();
+        state.overview_open = true;
+        state.handle_command(leopardwm_ipc::IpcCommand::FocusNext);
+        assert_eq!(state.workspaces[&1][0].focused_window(), Some(102));
+        state.handle_command(leopardwm_ipc::IpcCommand::ToggleOverview);
+        assert!(!state.overview_open);
     }
 
     #[test]
@@ -1711,6 +2121,23 @@ mod tests {
                 "from_rect must be the window's real rect in client coords"
             );
         }
+    }
+
+    #[test]
+    fn test_center_single_column_overview_tracks_real_geometry() {
+        let mut state = test_state();
+        add_windows(&mut state, 0, &[101]);
+        let ws = &mut state.workspaces.get_mut(&1).unwrap()[0];
+        ws.set_all_column_widths(400);
+        ws.set_center_single_column(true);
+        ws.set_scroll_offset(137.0);
+        ws.reconcile_scroll_bounds(1920);
+        let (_, model) = state.build_overview_model().expect("model");
+        let card = &model.rows[0].cards[0];
+        assert_eq!(card.window_id, 101);
+        assert_eq!(card.from_rect.unwrap().x, 760);
+        assert_eq!(card.from_rect.unwrap().width, 400);
+        assert_eq!(state.workspaces[&1][0].scroll_offset(), -750.0);
     }
 
     #[test]

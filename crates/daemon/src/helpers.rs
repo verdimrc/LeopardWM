@@ -178,12 +178,14 @@ impl AppState {
         // reload — the next transition starts from a clean slate.
         self.abort_active_ghost_transition();
         let old_border_on = self.config.appearance.active_border;
-        self.compiled_rules = config.compile_window_rules();
+        let previous_rules =
+            std::mem::replace(&mut self.compiled_rules, config.compile_window_rules());
 
         self.config = config;
 
         // Update scroll modifier for the gesture hook
         leopardwm_platform_win32::set_scroll_modifier(&self.config.hotkeys.scroll_modifier);
+        leopardwm_platform_win32::set_wheel_swipes(self.config.gestures.wheel_swipes);
 
         self.refresh_high_contrast();
 
@@ -224,11 +226,13 @@ impl AppState {
                 // (not the raw config values) so rescale_column_widths works correctly.
                 let old_gap = workspace.gap();
                 let (old_ol, old_or, _, _) = workspace.outer_gaps();
+                let was_center_single_column = workspace.center_single_column();
 
                 params.apply_to(workspace);
                 workspace.set_centering_mode(self.config.layout.centering_mode.into());
                 workspace.set_center_past_edges(self.config.layout.center_past_edges);
                 workspace.set_rtl(self.config.layout.is_rtl_monitor(&device_name));
+                workspace.set_center_single_column(self.config.layout.center_single_column);
 
                 // Rescale column widths to preserve fractions under new gap values
                 workspace.rescale_column_widths(
@@ -243,6 +247,10 @@ impl AppState {
                     self.config.animation.easing,
                 );
 
+                if was_center_single_column && !self.config.layout.center_single_column {
+                    workspace.reconcile_scroll_bounds(viewport_width);
+                }
+
                 // Recalculate scroll offset for new gap values so all columns
                 // are positioned correctly (not just the rightmost ones).
                 workspace.ensure_focused_visible_animated(viewport_width);
@@ -251,7 +259,7 @@ impl AppState {
 
         // Re-evaluate window rules for already-managed windows so that
         // newly added/changed rules take effect without restart.
-        self.reapply_window_rules();
+        self.reapply_window_rules(&previous_rules);
 
         // Pick up previously-ignored windows that should now be tiled/floated.
         if let Ok(added) = self.enumerate_and_add_windows() {
@@ -272,8 +280,6 @@ impl AppState {
             }
         }
 
-        // Apply a toggled hide_offscreen_taskbar_buttons setting live (restores
-        // all buttons when turned off, re-hides off-view ones when turned on).
         self.sync_taskbar_buttons();
 
         info!(
@@ -295,17 +301,9 @@ impl AppState {
         ids
     }
 
-    /// Keep a window's taskbar button iff it's actually visible in a viewport:
-    /// hidden when on an inactive workspace OR scrolled off-viewport on the
-    /// active one; shown when visible (and always for floating/minimized
-    /// windows, which the user still reaches via the taskbar). External windows
-    /// can't be hidden from the taskbar by cloaking or off-screen position, so
-    /// this drives `ITaskbarList` directly. Idempotent and change-gated in the
-    /// controller, so it's cheap to call after any layout/scroll change.
-    pub(crate) fn sync_taskbar_buttons(&self) {
-        use leopardwm_core_layout::Visibility;
+    fn apply_taskbar_button_action(&self, wid: u64, action: TaskbarButtonAction) {
         use leopardwm_platform_win32::taskbar::{taskbar_hide, taskbar_show};
-        let apply = |wid: u64, action: TaskbarButtonAction| match action {
+        match action {
             TaskbarButtonAction::Show => {
                 #[cfg(test)]
                 self.recorded_taskbar_commands
@@ -323,17 +321,37 @@ impl AppState {
                 taskbar_hide(wid);
             }
             TaskbarButtonAction::Unchanged => {}
-        };
+        }
+    }
+
+    pub(crate) fn restore_taskbar_buttons(&self) {
+        for wid in self.all_managed_window_ids() {
+            self.apply_taskbar_button_action(wid, TaskbarButtonAction::Show);
+        }
+    }
+
+    pub(crate) fn sync_inactive_workspace_taskbar_button(&self, wid: u64) {
+        let show =
+            self.paused || self.config.behavior.taskbar_buttons == config::TaskbarButtons::ShowAll;
+        self.apply_taskbar_button_action(wid, taskbar_button_action(false, show));
+    }
+
+    pub(crate) fn sync_taskbar_buttons(&self) {
+        use leopardwm_core_layout::Visibility;
+        if self.paused {
+            self.restore_taskbar_buttons();
+            return;
+        }
         // Disabled: make sure no button stays hidden (restores any we hid before
         // the user turned the option off), then leave the taskbar alone.
-        if !self.config.behavior.hide_offscreen_taskbar_buttons {
+        if self.config.behavior.taskbar_buttons == config::TaskbarButtons::ShowAll {
             for ws_vec in self.workspaces.values() {
                 for workspace in ws_vec {
                     for wid in workspace.all_window_ids() {
                         if taskbar_button_action(self.is_application_fullscreen(wid), true)
                             == TaskbarButtonAction::Show
                         {
-                            apply(wid, TaskbarButtonAction::Show);
+                            self.apply_taskbar_button_action(wid, TaskbarButtonAction::Show);
                         }
                     }
                 }
@@ -346,16 +364,15 @@ impl AppState {
             for (idx, workspace) in ws_vec.iter().enumerate() {
                 if idx != active {
                     for wid in workspace.all_window_ids() {
-                        apply(
+                        self.apply_taskbar_button_action(
                             wid,
                             taskbar_button_action(self.is_application_fullscreen(wid), false),
                         );
                     }
                     continue;
                 }
-                // Active workspace: a tiled window keeps its button only while
-                // it's visible in the viewport; floating and minimized windows
-                // always keep theirs.
+                // HideOffscreen keeps visible, floating, and minimized buttons
+                // on the active workspace; HideInactiveWorkspaces keeps them all.
                 let visible: std::collections::HashSet<u64> = workspace
                     .compute_placements(viewport)
                     .iter()
@@ -363,10 +380,12 @@ impl AppState {
                     .map(|p| p.window_id)
                     .collect();
                 for wid in workspace.all_window_ids() {
-                    let keep = workspace.is_floating(wid)
+                    let keep = self.config.behavior.taskbar_buttons
+                        == config::TaskbarButtons::HideInactiveWorkspaces
+                        || workspace.is_floating(wid)
                         || workspace.is_minimized(wid)
                         || visible.contains(&wid);
-                    apply(
+                    self.apply_taskbar_button_action(
                         wid,
                         taskbar_button_action(self.is_application_fullscreen(wid), keep),
                     );
@@ -679,6 +698,7 @@ impl AppState {
     fn evict_unmanaged_window_metadata(&mut self) {
         if self.window_managed_at.is_empty()
             && self.window_last_maximized_at.is_empty()
+            && self.post_admission_maximize_restore_eligible.is_empty()
             && self.application_fullscreen.is_empty()
             && self.recreated_window_slots.identities.is_empty()
             && self.managed_lifetime_tokens.is_empty()
@@ -707,6 +727,8 @@ impl AppState {
                 || crate::managed_lifetime::is_stashed_scratchpad(self.scratchpad, *hwnd)
         });
         self.managed_lifetime_admitted_at_event_ms
+            .retain(|hwnd, _| self.managed_lifetime_tokens.contains_key(hwnd));
+        self.post_admission_maximize_restore_eligible
             .retain(|hwnd, _| self.managed_lifetime_tokens.contains_key(hwnd));
         self.recreated_window_slots
             .identities
@@ -968,6 +990,7 @@ impl AppState {
             source
         );
         if self.paused {
+            self.restore_taskbar_buttons();
             // Restore WS_MAXIMIZEBOX so windows behave normally while paused
             self.restore_snap_for_all_windows();
             self.hide_border();

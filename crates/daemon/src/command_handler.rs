@@ -6,7 +6,7 @@ use crate::layout_apply::LayoutApplyOutcome;
 use crate::state::{
     validate_set_width_fraction, AppState, ElevationBlockedRecord, PendingWorkspaceSwitchFocus,
 };
-use leopardwm_core_layout::{LayoutError, Rect, Workspace};
+use leopardwm_core_layout::{LayoutError, Rect, Visibility, WindowPlacement, Workspace};
 use leopardwm_ipc::{
     ElevationBlockReason, ElevationBlockedWindow, HotkeyBindingInfo, IpcCommand, IpcResponse,
 };
@@ -15,7 +15,7 @@ use leopardwm_platform_win32::{
     monitor_to_right, ManageBlock, MonitorId, MonitorInfo,
 };
 use std::collections::HashMap;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// How a command interacts with a workspace that is currently fullscreen.
 enum FullscreenPolicy {
@@ -117,6 +117,8 @@ fn fullscreen_policy(cmd: &IpcCommand) -> FullscreenPolicy {
         Resize { .. }
         | Scroll { .. }
         | SetColumnWidth { .. }
+        | CycleWidth
+        | CycleHeight
         | CycleWidthUp
         | CycleWidthDown
         | CycleHeightUp
@@ -159,23 +161,18 @@ fn elevation_blocked_health_views(
 }
 
 impl AppState {
-    /// Snapshot a workspace's current animated placements as `(window_id, rect)` pairs.
-    fn workspace_placements(
+    /// Snapshot a workspace's current animated placements.
+    pub(crate) fn workspace_placements(
         &self,
         monitor: leopardwm_platform_win32::MonitorId,
         ws_idx: usize,
-    ) -> Vec<(u64, Rect)> {
+    ) -> Vec<WindowPlacement> {
         let viewport = self.layout_viewport(monitor);
         self.workspaces
             .get(&monitor)
             .and_then(|v| v.get(ws_idx))
             .filter(|_| self.monitors.contains_key(&monitor))
-            .map(|ws| {
-                ws.compute_placements_animated(viewport)
-                    .into_iter()
-                    .map(|p| (p.window_id, p.rect))
-                    .collect()
-            })
+            .map(|ws| ws.compute_placements_animated(viewport))
             .unwrap_or_default()
     }
 
@@ -331,6 +328,7 @@ impl AppState {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn handle_command(&mut self, cmd: IpcCommand) -> IpcResponse {
         if let Some(resp) = self.apply_fullscreen_policy(&cmd) {
             return resp;
@@ -541,6 +539,21 @@ impl AppState {
                     info!("Equalized column widths");
                 })
             }
+            IpcCommand::CycleWidth => {
+                let presets = self.config.layout.width_presets.clone();
+                self.execute_workspace_command(true, false, |ws, vw| {
+                    ws.cycle_width(&presets, vw);
+                    ws.ensure_focused_visible_animated(vw);
+                    info!("Cycled column width");
+                })
+            }
+            IpcCommand::CycleHeight => {
+                let presets = self.config.layout.height_presets.clone();
+                self.execute_workspace_command(true, false, |ws, _vw| {
+                    ws.cycle_height(&presets);
+                    info!("Cycled window height");
+                })
+            }
             IpcCommand::CycleWidthUp => {
                 let presets = self.config.layout.width_presets.clone();
                 self.execute_workspace_command(true, false, |ws, vw| {
@@ -712,8 +725,17 @@ impl AppState {
 
     /// Handle `IpcCommand::Reload`.
     fn handle_reload(&mut self) -> IpcResponse {
+        self.reload_config(true)
+    }
+
+    pub(crate) fn reload_config(&mut self, log_validation_warnings: bool) -> IpcResponse {
         match Config::load() {
-            Ok(new_config) => {
+            Ok(mut new_config) => {
+                for warning in new_config.validate() {
+                    if log_validation_warnings {
+                        warn!("Config: {} - {}", warning.field, warning.message);
+                    }
+                }
                 self.apply_config(new_config);
                 // Session-only: a reload always starts a fresh session for
                 // this override rather than carrying a stale one-shot
@@ -841,10 +863,31 @@ impl AppState {
         const COUNT: usize = 9;
         let monitor = self.focused_monitor;
         let current = self.active_workspace_idx(monitor);
-        let (target, forward) = match cmd {
-            IpcCommand::WorkspacePrev => ((current + COUNT - 1) % COUNT, false),
-            IpcCommand::WorkspaceNext => ((current + 1) % COUNT, true),
+        let forward = match cmd {
+            IpcCommand::WorkspacePrev => false,
+            IpcCommand::WorkspaceNext => true,
             _ => unreachable!(),
+        };
+        let target = (1..COUNT).find_map(|distance| {
+            let idx = if forward {
+                (current + distance) % COUNT
+            } else {
+                (current + COUNT - distance) % COUNT
+            };
+            let occupied = || {
+                self.workspaces
+                    .get(&monitor)
+                    .and_then(|workspaces| workspaces.get(idx))
+                    .is_some_and(|ws| {
+                        ws.all_window_ids()
+                            .iter()
+                            .any(|hwnd| !self.sticky_windows.contains(hwnd))
+                    })
+            };
+            (!self.config.behavior.skip_empty_workspaces || occupied()).then_some(idx)
+        });
+        let Some(target) = target else {
+            return IpcResponse::Ok;
         };
         self.handle_switch_workspace_with_direction((target + 1) as u8, Some(forward))
     }
@@ -1187,6 +1230,7 @@ impl AppState {
         relative_forward: Option<bool>,
         focus_target_monitor: bool,
     ) -> IpcResponse {
+        self.preserve_deferred_floating_moves();
         let idx = (index - 1) as usize;
         let target_was_focused = monitor == self.focused_monitor;
         // A switch initiated outside the overlay (hotkey, CLI) dismisses
@@ -1302,8 +1346,8 @@ impl AppState {
         // after they move offscreen below. Skipped otherwise (PrintWindow
         // per window is not free).
         if self.config.overview.render == crate::config::OverviewRender::Snapshot {
-            for (wid, _) in &old_placements {
-                let _ = leopardwm_platform_win32::snapshot::snapshot_capture(*wid);
+            for placement in &old_placements {
+                let _ = leopardwm_platform_win32::snapshot::snapshot_capture(placement.window_id);
             }
         }
 
@@ -1333,11 +1377,13 @@ impl AppState {
 
         // Keep sticky windows out of the slide animation so they sit
         // still while the rest of the layout scrolls past.
-        old_placements.retain(|(w, _)| {
-            !self.sticky_windows.contains(w) && !self.is_application_fullscreen(*w)
+        old_placements.retain(|p| {
+            !self.sticky_windows.contains(&p.window_id)
+                && !self.is_application_fullscreen(p.window_id)
         });
-        new_placements.retain(|(w, _)| {
-            !self.sticky_windows.contains(w) && !self.is_application_fullscreen(*w)
+        new_placements.retain(|p| {
+            !self.sticky_windows.contains(&p.window_id)
+                && !self.is_application_fullscreen(p.window_id)
         });
 
         // Build animation rects:
@@ -1347,9 +1393,10 @@ impl AppState {
         let mut exit_rects = std::collections::HashMap::new();
 
         // New workspace windows enter from the opposite side.
-        for (wid, rect) in &new_placements {
+        for placement in &new_placements {
+            let rect = placement.rect;
             start_rects.insert(
-                *wid,
+                placement.window_id,
                 leopardwm_core_layout::Rect::new(
                     rect.x,
                     rect.y + y_offset,
@@ -1360,10 +1407,14 @@ impl AppState {
         }
 
         // Old workspace windows slide out.
-        for (wid, rect) in &old_placements {
-            start_rects.insert(*wid, *rect);
+        for placement in &old_placements {
+            if placement.visibility != Visibility::Visible {
+                continue;
+            }
+            let rect = placement.rect;
+            start_rects.insert(placement.window_id, rect);
             exit_rects.insert(
-                *wid,
+                placement.window_id,
                 leopardwm_core_layout::Rect::new(
                     rect.x,
                     rect.y - y_offset,
@@ -1379,6 +1430,12 @@ impl AppState {
         // would otherwise move them off-screen, so without this they linger as
         // ghosts on top of the new workspace.
         let animating = !start_rects.is_empty() && !self.reduce_motion;
+        for placement in &old_placements {
+            if !animating || placement.visibility != Visibility::Visible {
+                #[cfg(not(test))]
+                let _ = leopardwm_platform_win32::move_window_offscreen(placement.window_id);
+            }
+        }
         if animating {
             let duration = self.config.animation.workspace_switch_duration_ms;
             self.start_workspace_switch_transition(start_rects, exit_rects, duration);
@@ -1392,12 +1449,6 @@ impl AppState {
             // No replacement slide. A deferred border lands now; a
             // non-deferred transition only clears.
             self.abort_layout_transition();
-            for (wid, _) in &old_placements {
-                if !self.is_application_fullscreen(*wid) {
-                    #[cfg(not(test))]
-                    let _ = leopardwm_platform_win32::move_window_offscreen(*wid);
-                }
-            }
         }
 
         if let Err(e) = self.apply_layout() {
@@ -1498,6 +1549,30 @@ impl AppState {
             }
         };
 
+        self.move_window_to_workspace(monitor, current_idx, focused_hwnd, index, true)
+    }
+
+    pub(crate) fn move_window_to_workspace(
+        &mut self,
+        monitor: MonitorId,
+        current_idx: usize,
+        focused_hwnd: u64,
+        index: u8,
+        sync_focus: bool,
+    ) -> IpcResponse {
+        if !(1..=9).contains(&index) {
+            return IpcResponse::error("Workspace index must be 1-9");
+        }
+        let idx = usize::from(index - 1);
+        if idx == current_idx
+            || !self
+                .workspaces
+                .get(&monitor)
+                .and_then(|v| v.get(current_idx))
+                .is_some_and(|ws| ws.contains_window(focused_hwnd))
+        {
+            return IpcResponse::Ok;
+        }
         let snapshot = self.snapshot_layout();
 
         // Ensure target workspace exists (lazy creation)
@@ -1674,14 +1749,14 @@ impl AppState {
             self.move_origins.remove(&focused_hwnd);
         }
 
-        // Target workspace is not active — hide the moved window
-        // (capture-on-hide first for the overview's snapshot mode).
-        if self.config.overview.render == crate::config::OverviewRender::Snapshot {
-            let _ = leopardwm_platform_win32::snapshot::snapshot_capture(focused_hwnd);
-        }
-        if !self.is_application_fullscreen(focused_hwnd) {
-            #[cfg(not(test))]
-            let _ = leopardwm_platform_win32::move_window_offscreen(focused_hwnd);
+        if idx != self.active_workspace_idx(monitor) {
+            if self.config.overview.render == crate::config::OverviewRender::Snapshot {
+                let _ = leopardwm_platform_win32::snapshot::snapshot_capture(focused_hwnd);
+            }
+            if !self.is_application_fullscreen(focused_hwnd) {
+                #[cfg(not(test))]
+                let _ = leopardwm_platform_win32::move_window_offscreen(focused_hwnd);
+            }
         }
 
         // Ensure the source workspace scrolls to show its new focused window
@@ -1694,14 +1769,19 @@ impl AppState {
             workspace.ensure_focused_visible_animated(viewport_width);
         }
 
-        self.start_layout_transition(snapshot);
+        let started_transition = self.start_layout_transition(snapshot);
+        if started_transition && !sync_focus {
+            if let Some(transition) = &mut self.layout_transition {
+                transition.suppress_landing_focus_resync = true;
+            }
+        }
         if let Err(e) = self.apply_layout() {
             return IpcResponse::error(format!("Failed to apply layout: {}", e));
         }
-        // The moved window now lives on an inactive workspace; cloak it so its
-        // taskbar button goes too.
         self.sync_taskbar_buttons();
-        self.sync_foreground_window();
+        if sync_focus {
+            self.sync_foreground_window();
+        }
         info!("Moved window {} to workspace {}", focused_hwnd, index);
         IpcResponse::Ok
     }
@@ -2263,3 +2343,67 @@ mod set_active_tab_tests {
 #[cfg(test)]
 #[path = "workspace_switch_tests.rs"]
 mod workspace_switch_tests;
+
+#[cfg(test)]
+mod wrap_cycle_tests {
+    use super::*;
+    use crate::config::Config;
+    use leopardwm_core_layout::Rect;
+    use leopardwm_platform_win32::MonitorInfo;
+
+    #[test]
+    fn test_wrap_cycle_dispatch_uses_configured_presets() {
+        let mut config = Config::default();
+        config.layout.gap = 0;
+        config.layout.outer_gap_left = 0;
+        config.layout.outer_gap_right = 0;
+        config.layout.outer_gap_top = 0;
+        config.layout.outer_gap_bottom = 0;
+        config.layout.width_presets = vec![0.8, 0.3, 0.6];
+        config.layout.height_presets = vec![0.8, 0.3, 0.6];
+        let mut state = AppState::new_with_config(
+            config,
+            vec![MonitorInfo {
+                id: 1,
+                rect: Rect::new(0, 0, 1000, 1000),
+                work_area: Rect::new(0, 0, 1000, 1000),
+                is_primary: true,
+                device_name: "DISPLAY1".to_string(),
+                scale_factor: 1.0,
+            }],
+        );
+        assert!(state.paused);
+        let ws = state.focused_workspace_mut().unwrap();
+        ws.insert_window(100, Some(800)).unwrap();
+        ws.insert_window_in_column(200, 0).unwrap();
+        ws.set_focus(0, 0).unwrap();
+        ws.cycle_height_up(&[0.8]);
+        assert_eq!(
+            state.handle_command(IpcCommand::CycleWidth),
+            IpcResponse::Ok
+        );
+        assert_eq!(state.focused_workspace().unwrap().columns()[0].width(), 300);
+        assert_eq!(
+            state.handle_command(IpcCommand::CycleHeight),
+            IpcResponse::Ok
+        );
+        assert!(
+            (state.focused_workspace().unwrap().columns()[0].height_weights()[0] - 0.3).abs()
+                < 1e-9
+        );
+        let ws = state.focused_workspace_mut().unwrap();
+        ws.toggle_fullscreen();
+        assert_eq!(
+            state.handle_command(IpcCommand::CycleWidth),
+            IpcResponse::Ok
+        );
+        assert_eq!(
+            state.handle_command(IpcCommand::CycleHeight),
+            IpcResponse::Ok
+        );
+        let ws = state.focused_workspace().unwrap();
+        assert_eq!(ws.columns()[0].width(), 300);
+        assert!((ws.columns()[0].height_weights()[0] - 0.3).abs() < 1e-9);
+        assert!(ws.is_fullscreen());
+    }
+}

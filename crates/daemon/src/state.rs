@@ -2,7 +2,7 @@
 
 use crate::config::{self, Config};
 use crate::physical_placement::PhysicalPresentation;
-use leopardwm_core_layout::{Rect, Workspace};
+use leopardwm_core_layout::{Rect, Visibility, Workspace};
 use leopardwm_ipc::NativeSwipeStatus;
 use leopardwm_platform_win32::{MonitorId, MonitorInfo, PlatformConfig};
 use serde::{Deserialize, Serialize};
@@ -163,6 +163,11 @@ pub(crate) const DISPLAY_CHANGE_APPLY_RETRY_DELAY: Duration = Duration::from_sec
 /// (it compares actual-vs-expected rect and short-circuits when they match
 /// within a small epsilon), which operates independently of this suppression.
 pub(crate) const MOVED_OR_RESIZED_SUPPRESSION_WINDOW: Duration = Duration::from_millis(250);
+pub(crate) const PERIODIC_CHECK_INTERVAL: Duration = Duration::from_millis(500);
+/// Two suppression windows plus one tick cover placement feedback and replay scheduling.
+pub(crate) const WINDOW_MOVE_RECHECK_FIGHT_WINDOW: Duration = MOVED_OR_RESIZED_SUPPRESSION_WINDOW
+    .saturating_add(MOVED_OR_RESIZED_SUPPRESSION_WINDOW)
+    .saturating_add(PERIODIC_CHECK_INTERVAL);
 /// Max age for a `crossfade_sources` re-registration barrier entry. A
 /// crossfade runs ~130ms (8 frames); 2s is a generous bound. An entry
 /// older than this means its `CrossfadeComplete` never arrived (worker
@@ -289,6 +294,12 @@ pub(crate) fn derive_native_swipe_status(
 pub(crate) struct ElevationBlockedRecord {
     pub title: String,
     pub reason: leopardwm_platform_win32::ManageBlock,
+}
+
+pub(crate) struct WindowMoveRecheckAttempt {
+    pub(crate) target: (Rect, Visibility),
+    pub(crate) issued_at: std::time::Instant,
+    pub(crate) gave_up: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -624,6 +635,9 @@ pub(crate) struct AppState {
     pub(crate) pending_drag_hint: Option<DragHintAction>,
     /// Per-window suppression deadline for MovedOrResized events after apply_layout().
     pub(crate) moved_or_resized_suppression: HashMap<u64, std::time::Instant>,
+    pub(crate) deferred_moved_or_resized: HashSet<u64>,
+    pub(crate) size_ignored_windows: HashSet<u64>,
+    pub(crate) window_move_recheck_attempts: HashMap<u64, WindowMoveRecheckAttempt>,
     /// Last-placed layout rect per managed window (in layout coordinates, the
     /// rect the layout engine asked for — not the OS-level window rect with
     /// invisible borders). Updated on every successful apply_layout. Used by
@@ -735,6 +749,9 @@ pub(crate) struct AppState {
     /// (managed for a long time, e.g., close-to-tray apps).
     pub(crate) window_managed_at: HashMap<u64, std::time::Instant>,
     pub(crate) pending_maximized_admission_restores: HashSet<u64>,
+    /// Admission input baseline and restores issued for this lifetime, including the admission restore.
+    pub(crate) post_admission_maximize_restore_eligible:
+        HashMap<u64, (Option<std::time::Instant>, u8)>,
     /// Last time each tiled window was seen maximized. Lets a window that opens
     /// maximized and momentarily restores itself mid-burst (an app opening
     /// several windows/tabs at once) re-assert maximize instead of being snapped
@@ -864,6 +881,8 @@ pub(crate) struct AppState {
     #[cfg(test)]
     pub(crate) injected_window_maximized: HashMap<u64, bool>,
     #[cfg(test)]
+    pub(crate) injected_input_age_ms: Option<u32>,
+    #[cfg(test)]
     pub(crate) departing_foreground_evidence_reads: usize,
     /// Test-only GetTickCount stand-in for last-window departure arming.
     #[cfg(test)]
@@ -872,6 +891,8 @@ pub(crate) struct AppState {
     /// synthetic HWND never reaches `SetWindowPos`.
     #[cfg(test)]
     pub(crate) injected_native_offscreen_enabled: bool,
+    #[cfg(test)]
+    pub(crate) inactive_workspace_park_requests: Vec<u64>,
     /// Stale HWNDs consumed by the next prune that actually runs. Empty is a
     /// no-op; a throttled or same-HWND focus leaves the list pending.
     #[cfg(test)]
@@ -1082,6 +1103,12 @@ pub(crate) struct StateSnapshot {
 }
 
 impl AppState {
+    pub(crate) fn placement_platform_config(&self) -> PlatformConfig {
+        let mut config = self.platform_config.clone();
+        config.monitor_rects = self.monitors.values().map(|monitor| monitor.rect).collect();
+        config
+    }
+
     /// Create new state with config and monitors.
     pub(crate) fn new_with_config(config: Config, monitors: Vec<MonitorInfo>) -> Self {
         use crate::helpers::ScaledLayoutParams;
@@ -1117,6 +1144,7 @@ impl AppState {
             workspace.set_tab_strip_reserve_px(params.tab_strip_reserve_px);
             workspace.set_centering_mode(config.layout.centering_mode.into());
             workspace.set_center_past_edges(config.layout.center_past_edges);
+            workspace.set_center_single_column(config.layout.center_single_column);
             workspace.set_reduce_motion(initial_reduce_motion);
             workspace
                 .set_scroll_animation(config.animation.scroll_duration_ms, config.animation.easing);
@@ -1216,6 +1244,9 @@ impl AppState {
             resize_animation_active: Arc::new(AtomicBool::new(false)),
             pending_drag_hint: None,
             moved_or_resized_suppression: HashMap::new(),
+            deferred_moved_or_resized: HashSet::new(),
+            size_ignored_windows: HashSet::new(),
+            window_move_recheck_attempts: HashMap::new(),
             last_placed_layout_rects: HashMap::new(),
             last_physical_presentations: HashMap::new(),
             pending_physical_presentations: HashMap::new(),
@@ -1255,6 +1286,7 @@ impl AppState {
             stashed_monitor_layouts: HashMap::new(),
             window_managed_at: HashMap::new(),
             pending_maximized_admission_restores: HashSet::new(),
+            post_admission_maximize_restore_eligible: HashMap::new(),
             window_last_maximized_at: HashMap::new(),
             snap_disabled_hwnds: HashSet::new(),
             on_battery_or_saver,
@@ -1315,11 +1347,15 @@ impl AppState {
             #[cfg(test)]
             injected_window_maximized: HashMap::new(),
             #[cfg(test)]
+            injected_input_age_ms: None,
+            #[cfg(test)]
             departing_foreground_evidence_reads: 0,
             #[cfg(test)]
             injected_event_time_ms: None,
             #[cfg(test)]
             injected_native_offscreen_enabled: false,
+            #[cfg(test)]
+            inactive_workspace_park_requests: Vec::new(),
             #[cfg(test)]
             injected_stale_hwnds: Vec::new(),
             #[cfg(test)]
@@ -1701,6 +1737,7 @@ impl AppState {
             ws.set_tab_strip_reserve_px(params.tab_strip_reserve_px);
             ws.set_centering_mode(config.layout.centering_mode.into());
             ws.set_center_past_edges(config.layout.center_past_edges);
+            ws.set_center_single_column(config.layout.center_single_column);
             ws.set_reduce_motion(self.reduce_motion);
             ws.set_scroll_animation(config.animation.scroll_duration_ms, config.animation.easing);
             let device_name = self.monitors.get(&monitor_id).map(|m| m.device_name.as_str()).unwrap_or("");

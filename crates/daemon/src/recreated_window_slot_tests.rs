@@ -300,7 +300,7 @@ fn rule(action: WindowAction, sticky: bool) -> WindowRule {
         )),
         open_in_column: Some(8),
         sticky,
-        ..WindowRule::default()
+        ..Default::default()
     }
 }
 

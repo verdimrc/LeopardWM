@@ -416,6 +416,7 @@ static GESTURE_SENDER: std::sync::Mutex<Option<mpsc::Sender<GestureEvent>>> =
 /// Initialized to `None`; `register_gestures()` sets it to `Some(...)`.
 static GESTURE_STATE: std::sync::Mutex<Option<GestureAccumState>> = std::sync::Mutex::new(None);
 static RAW_GESTURES_ACTIVE: AtomicBool = AtomicBool::new(false);
+static WHEEL_SWIPES_ENABLED: AtomicBool = AtomicBool::new(true);
 
 /// Handle for gesture detection.
 ///
@@ -426,38 +427,84 @@ pub struct GestureHandle {
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
-impl Drop for GestureHandle {
-    fn drop(&mut self) {
-        // Signal the thread to exit
-        unsafe {
-            let _ = PostThreadMessageW(
+static RETIRED_GESTURE_HANDLE: std::sync::Mutex<Option<GestureHandle>> =
+    std::sync::Mutex::new(None);
+
+impl GestureHandle {
+    /// Reap a previously dropped hook, keeping registration blocked until it exits.
+    pub fn finish_retired_shutdown() -> bool {
+        let finished = {
+            let mut retired = RETIRED_GESTURE_HANDLE
+                .lock()
+                .unwrap_or_else(recover_poisoned_mutex);
+            if let Some(handle) = retired.as_mut() {
+                if !handle.stop() {
+                    return false;
+                }
+            }
+            retired.take()
+        };
+        drop(finished);
+        true
+    }
+
+    /// Request shutdown and reap the hook only after its thread has exited.
+    pub fn stop(&mut self) -> bool {
+        let Some(thread) = self.thread.as_ref() else {
+            return true;
+        };
+        if thread.is_finished() {
+            let _ = self
+                .thread
+                .take()
+                .expect("finished gesture thread exists")
+                .join();
+            clear_gesture_state();
+            tracing::debug!("Gesture detection stopped");
+            emit_gesture_registration("stopped");
+            return true;
+        }
+        if let Err(error) = unsafe {
+            PostThreadMessageW(
                 self.thread_id,
                 WM_QUIT_LLHOOK_THREAD,
                 windows::Win32::Foundation::WPARAM(0),
                 windows::Win32::Foundation::LPARAM(0),
-            );
+            )
+        } {
+            tracing::warn!(%error, thread_id = self.thread_id, "Failed to signal gesture thread shutdown");
         }
-        if let Some(thread) = self.thread.take() {
-            // Give the thread a moment to clean up
-            for _ in 0..30 {
-                if thread.is_finished() {
-                    let _ = thread.join();
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-        }
-
-        // Clear the global sender and state (recover from mutex poisoning)
-        let mut sender = GESTURE_SENDER.lock().unwrap_or_else(recover_poisoned_mutex);
-        *sender = None;
-        drop(sender);
-        let mut state = GESTURE_STATE.lock().unwrap_or_else(recover_poisoned_mutex);
-        *state = None;
-
-        tracing::debug!("Gesture detection stopped");
-        emit_gesture_registration("stopped");
+        false
     }
+}
+
+impl Drop for GestureHandle {
+    fn drop(&mut self) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(300);
+        while !self.stop() {
+            if std::time::Instant::now() >= deadline {
+                tracing::warn!("Gesture thread is still stopping; re-registration deferred");
+                // Keep the old thread and its globals reserved until it can be reaped.
+                let previous = {
+                    let mut retired = RETIRED_GESTURE_HANDLE
+                        .lock()
+                        .unwrap_or_else(recover_poisoned_mutex);
+                    retired.replace(GestureHandle {
+                        thread_id: self.thread_id,
+                        thread: self.thread.take(),
+                    })
+                };
+                drop(previous);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+}
+
+fn clear_gesture_state() {
+    *GESTURE_SENDER.lock().unwrap_or_else(recover_poisoned_mutex) = None;
+    *GESTURE_STATE.lock().unwrap_or_else(recover_poisoned_mutex) = None;
 }
 
 /// Set the modifier keys required for scroll wheel navigation.
@@ -487,6 +534,12 @@ pub fn set_scroll_modifier(modifier_str: &str) {
     );
 }
 
+/// Enable or disable wheel-based swipes without changing modifier navigation
+/// or native Precision Touchpad input. Takes effect without re-registering hooks.
+pub fn set_wheel_swipes(enabled: bool) {
+    WHEEL_SWIPES_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
 /// Register a low-level mouse hook for gesture detection via wheel events.
 ///
 /// Spawns a dedicated thread with a Win32 message pump so that `WH_MOUSE_LL`
@@ -503,6 +556,12 @@ pub fn register_gestures() -> Result<(GestureHandle, mpsc::Receiver<GestureEvent
 pub fn register_gestures_with_raw_input(
     raw_input: bool,
 ) -> Result<(GestureHandle, mpsc::Receiver<GestureEvent>, Option<String>), Win32Error> {
+    if !GestureHandle::finish_retired_shutdown() {
+        return Err(Win32Error::HookInstallFailed(
+            "Previous gesture thread is still stopping; registration deferred".to_string(),
+        ));
+    }
+
     // Create channel for events
     let (tx, rx) = mpsc::channel();
 
@@ -520,6 +579,14 @@ pub fn register_gestures_with_raw_input(
         *sender = Some(tx);
     }
 
+    let result = start_gesture_thread(raw_input).map(|(handle, error)| (handle, rx, error));
+    if result.is_err() {
+        clear_gesture_state();
+    }
+    result
+}
+
+fn start_gesture_thread(raw_input: bool) -> Result<(GestureHandle, Option<String>), Win32Error> {
     // Initialize accumulator state
     {
         let mut state = GESTURE_STATE.lock().map_err(|_| {
@@ -618,9 +685,20 @@ pub fn register_gestures_with_raw_input(
         })?;
 
     // Wait for initialization
-    let (thread_id, raw_input_error) = init_rx.recv().map_err(|_| {
-        Win32Error::HookInstallFailed("Gesture thread initialization failed".to_string())
-    })??;
+    let initialization = init_rx
+        .recv()
+        .map_err(|_| {
+            Win32Error::HookInstallFailed("Gesture thread initialization failed".to_string())
+        })
+        .and_then(|result| result);
+    let (thread_id, raw_input_error) = match initialization {
+        Ok(result) => result,
+        Err(error) => {
+            let _ = thread.join();
+            RAW_GESTURES_ACTIVE.store(false, Ordering::Release);
+            return Err(error);
+        }
+    };
 
     tracing::info!("Gesture detection registered (low-level mouse hook)");
 
@@ -629,7 +707,6 @@ pub fn register_gestures_with_raw_input(
             thread_id,
             thread: Some(thread),
         },
-        rx,
         raw_input_error,
     ))
 }
@@ -739,8 +816,8 @@ fn emit_wheel_diagnostics_active(
     }
 }
 
-fn wheel_swipe_candidate(flags: u32, native_active: bool) -> bool {
-    flags & LLMHF_INJECTED != 0 && !native_active
+fn wheel_swipe_candidate(flags: u32, native_active: bool, wheel_swipes: bool) -> bool {
+    wheel_swipes && flags & LLMHF_INJECTED != 0 && !native_active
 }
 
 /// Low-level mouse hook callback for gesture detection.
@@ -767,6 +844,7 @@ unsafe extern "system" fn gesture_mouse_hook_proc(
             let swipe_candidate = wheel_swipe_candidate(
                 mouse_struct.flags,
                 RAW_GESTURES_ACTIVE.load(Ordering::Acquire),
+                WHEEL_SWIPES_ENABLED.load(Ordering::Relaxed),
             );
 
             let mut state_guard = GESTURE_STATE.lock().unwrap_or_else(recover_poisoned_mutex);
@@ -853,9 +931,9 @@ mod tests {
 
     #[test]
     fn native_backend_prevents_duplicate_wheel_swipes() {
-        assert!(wheel_swipe_candidate(LLMHF_INJECTED, false));
-        assert!(!wheel_swipe_candidate(LLMHF_INJECTED, true));
-        assert!(!wheel_swipe_candidate(0, false));
+        assert!(wheel_swipe_candidate(LLMHF_INJECTED, false, true));
+        assert!(!wheel_swipe_candidate(LLMHF_INJECTED, true, true));
+        assert!(!wheel_swipe_candidate(0, false, true));
     }
 
     static DIAGNOSTIC_GATE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -891,6 +969,52 @@ mod tests {
             flags,
             mods_held,
             swipe_candidate: flags & LLMHF_INJECTED != 0,
+        }
+    }
+
+    #[test]
+    fn wheel_swipes_switch_preserves_passthrough_and_modifier_navigation() {
+        for axis in [WheelAxis::Horizontal, WheelAxis::Vertical] {
+            for delta in [-120, 120] {
+                for enabled in [false, true] {
+                    let mut engine = WheelGestureEngine::new();
+                    let candidate = wheel_swipe_candidate(LLMHF_INJECTED, false, enabled);
+                    assert_eq!(candidate, enabled);
+                    for index in 0..3 {
+                        let result = engine.process(WheelGestureInput {
+                            swipe_candidate: candidate,
+                            ..input(index * 10, axis, delta, false, LLMHF_INJECTED)
+                        });
+                        let expected = if enabled && index == 2 {
+                            Some(match (axis, delta > 0) {
+                                (WheelAxis::Horizontal, false) => GestureEvent::SwipeLeft,
+                                (WheelAxis::Horizontal, true) => GestureEvent::SwipeRight,
+                                (WheelAxis::Vertical, false) => GestureEvent::SwipeUp,
+                                (WheelAxis::Vertical, true) => GestureEvent::SwipeDown,
+                            })
+                        } else {
+                            None
+                        };
+                        assert_eq!(result.event, expected);
+                        assert!(!result.consume);
+                        if !enabled {
+                            assert_eq!(result.trace.classifier, Some(ClassifierKind::Reject));
+                        }
+                    }
+                }
+            }
+        }
+        let mut engine = WheelGestureEngine::new();
+        for (now_ms, delta, expected) in [
+            (0, 120, GestureEvent::ScrollUp),
+            (100, -120, GestureEvent::ScrollDown),
+        ] {
+            let result = engine.process(WheelGestureInput {
+                swipe_candidate: wheel_swipe_candidate(LLMHF_INJECTED, false, false),
+                ..input(now_ms, WheelAxis::Vertical, delta, true, LLMHF_INJECTED)
+            });
+            assert_eq!(result.event, Some(expected));
+            assert!(result.consume);
         }
     }
 

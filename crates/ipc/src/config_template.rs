@@ -60,13 +60,26 @@ height_presets = [0.333, 0.5, 0.667]
 # - on_overflow: Center only when the column is wider than the viewport
 centering_mode = "{centering_mode}"
 
+# Center the only active tiled column when it fits, regardless of centering mode.
+center_single_column = false
+
 [appearance]
+# Settings, tray, and daemon notification language: bundled locale filename stem (default "en")
+language = "en"
 
 [behavior]
 # Automatically focus new windows when they appear
 focus_new_windows = true
 
+# Windows opening while LeopardWM runs use "opening" (default), "focused", or
+# "cursor" (the monitor under the mouse cursor).
+# Already-open windows discovered at startup or reload/rescan keep their placement.
+# Workspace rules select the workspace index on that monitor for live openings.
+# Sticky windows keep their existing placement.
+new_window_monitor = "opening"
+
 # Track focus changes from Windows (sync with Alt-Tab, etc.)
+# Changes to focus tracking hooks take effect the next time LeopardWM starts.
 track_focus_changes = true
 
 # Log level: trace, debug, info, warn, error
@@ -91,19 +104,32 @@ focus_follows_mouse = false
 # per-frame SetWindowPos path.
 # swap_chain_ghost_animation = false
 
+# Keep visible floating and sticky floating windows above tiled windows without
+# activating them. Relative ordering only, not native topmost; skipped during
+# fullscreen and overview. Default false.
+# Requires track_focus_changes = true (the default). Restart LeopardWM after
+# changing that setting; turning it off also stops re-raises immediately on reload.
+# floating_above_tiled = false
+
 # Where newly opened windows go: "new_column" (default, own column to the
 # right) or "in_column" (stacked into the focused column).
 # new_window_placement = "new_column"
 
-# Hide a window's taskbar button while it isn't visible in the current view
-# (on another workspace, or scrolled out of view). Floating and minimized
-# windows always keep their button. Default true.
-# hide_offscreen_taskbar_buttons = true
+# Taskbar buttons: "hide_offscreen" (default, hide inactive workspaces and
+# scrolled-offscreen windows), "hide_inactive_workspaces" (keep every button
+# on each monitor's active workspace), or "show_all". Floating and minimized
+# windows keep their buttons on the active workspace in every mode.
+# taskbar_buttons = "hide_offscreen"
 
 # Wrap vertical focus/move at a column's top or bottom edge into the adjacent
 # workspace. When on, focus_up/focus_down at the edge switch workspaces and
 # move_window_up/move_window_down at the edge move the window there. Default false.
 # workspace_edge_wrap = false
+
+# Skip empty workspaces for prev/next and edge-wrap focus on this monitor.
+# Tiled, floating and minimized windows count; sticky windows do not.
+# No other occupied workspace means no change. Window moves are unaffected.
+# skip_empty_workspaces = false
 
 # Warp the mouse cursor onto the focused window after a focus-navigation command
 # (the inverse of focus_follows_mouse). Default false.
@@ -122,6 +148,7 @@ focus_follows_mouse = false
 [hotkeys]
 {hotkeys}
 [gestures]
+# wheel_swipes = true  # Disable wheel-based swipes without disabling modifier+wheel or native swipes.
 # raw_input = false  # Opt in to native Precision Touchpad swipes; restart required.
 # Requires Windows three- and four-finger touchpad gestures set to Nothing.
 # Touchpad gesture support
@@ -179,6 +206,18 @@ corner_style = "square"
 # match_class = "Chrome_WidgetWin_1"
 # match_title = ".*DevTools.*"
 # action = "float"
+
+# Ignore small QQ NT helpers using outer sizes in logical pixels, the same units
+# as rule width/height. At 100% scaling these equal the window's pixel dimensions;
+# at 150%, 600x450 pixels count as 400x300. Put this before broader QQ rules
+# (first match wins). Size limits require a class, title, or executable match
+# and apply on admission. Ignored windows are re-evaluated on growth or title
+# changes; managed windows stay managed.
+# [[window_rules]]
+# match_executable = "QQ.exe"
+# match_max_width = 400
+# match_max_height = 300
+# action = "ignore"
 
 # Per-app open behavior: open on a workspace (1-9), pin to a column slot
 # (open_in_column, 1-based), set the initial column width (viewport fraction),

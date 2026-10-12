@@ -64,19 +64,21 @@ pub use enumeration::{
 };
 pub use event_hooks::{install_event_hooks, EventHookHandle, WindowEvent};
 pub use focus::{
-    close_window, current_event_time_ms, get_foreground_window, ms_since_last_user_input,
-    raise_window_no_activate, restore_window_no_activate, set_foreground_window,
+    can_raise_normal_window, close_window, current_event_time_ms, get_foreground_window,
+    ms_since_last_user_input, raise_normal_window_no_activate, raise_window_no_activate,
+    restore_window_no_activate, set_foreground_window, visible_window_z_order,
     warp_cursor_to_window,
 };
 pub use placement::apply_cloak_state;
 pub use placement::clear_suspected_oversize;
 pub use placement::{
     apply_display_change_placements, apply_placements, clear_inset_cache, drain_ghost_cloaked,
-    dwm_cloak_window, dwm_uncloak_all, dwm_uncloak_window, get_window_frame_insets,
-    get_window_invisible_insets, get_window_style_bits, is_placement_cloaked, is_placement_parked,
-    mark_ghost_cloaked, park_window_for_placement, set_dwm_transitions_disabled,
-    unmark_ghost_cloaked, visible_rect_to_frame_rect, ApplyPlacementsResult, HeightViolation,
-    PlacementCache, PlacementLanding, WidthViolation,
+    dwm_cloak_window, dwm_uncloak_all, dwm_uncloak_window, forget_offscreen_placement,
+    get_window_frame_insets, get_window_invisible_insets, get_window_style_bits,
+    is_placement_cloaked, is_placement_parked, mark_ghost_cloaked, offscreen_placement_matches,
+    park_window_for_placement, set_dwm_transitions_disabled, unmark_ghost_cloaked,
+    visible_rect_to_frame_rect, ApplyPlacementsResult, HeightViolation, PlacementCache,
+    PlacementLanding, WidthViolation,
 };
 pub use system::{
     are_animations_enabled, get_system_highlight_color_bgr, is_high_contrast_enabled,
@@ -97,9 +99,9 @@ pub use window_identity::{
 pub use window_query::{
     cursor_is_over_window, get_cursor_pos, get_window_chrome_rect, get_window_corner_radius,
     get_window_icon, get_window_visible_rect, is_cursor_on_resize_border, is_dialog_like_window,
-    is_frameless_popup, is_shift_key_pressed, is_valid_window, is_window_maximized,
-    is_window_shell_cloaked, is_window_valid, is_window_visible, window_minimized_state,
-    window_presence, WindowPresence,
+    is_frameless_fixed_size_window, is_frameless_popup, is_shift_key_pressed, is_valid_window,
+    is_window_maximized, is_window_shell_cloaked, is_window_valid, is_window_visible,
+    window_minimized_state, window_presence, WindowPresence,
 };
 pub use window_style::{
     queue_maximized_window_restore, remove_maximizebox, reset_window_border_color,

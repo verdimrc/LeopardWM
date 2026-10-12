@@ -19,7 +19,7 @@ use std::sync::{
 use thiserror::Error;
 use tracing::{debug, info, warn};
 use tray_icon::{
-    menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu},
+    menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, MenuItemKind, PredefinedMenuItem, Submenu},
     TrayIconBuilder,
 };
 
@@ -88,7 +88,9 @@ mod menu_ids {
     pub const TOGGLE_ACTIVE_BORDER: &str = "toggle_active_border";
     pub const TOGGLE_FOCUS_NEW_WINDOWS: &str = "toggle_focus_new_windows";
     pub const TOGGLE_FOCUS_FOLLOWS_MOUSE: &str = "toggle_focus_follows_mouse";
-    pub const TOGGLE_HIDE_OFFSCREEN_TASKBAR: &str = "toggle_hide_offscreen_taskbar";
+    pub const TASKBAR_HIDE_OFFSCREEN: &str = "taskbar_hide_offscreen";
+    pub const TASKBAR_HIDE_INACTIVE_WORKSPACES: &str = "taskbar_hide_inactive_workspaces";
+    pub const TASKBAR_SHOW_ALL: &str = "taskbar_show_all";
     pub const TOGGLE_AUTO_START: &str = "toggle_auto_start";
     pub const CENTERING_CENTER: &str = "centering_center";
     pub const CENTERING_JUST_IN_VIEW: &str = "centering_just_in_view";
@@ -125,8 +127,7 @@ pub enum TrayEvent {
     ToggleFocusNewWindows,
     /// User toggled "Focus Follows Mouse" check item.
     ToggleFocusFollowsMouse,
-    /// User toggled "Hide off-screen taskbar buttons" check item.
-    ToggleHideOffscreenTaskbar,
+    SetTaskbarButtons(crate::config::TaskbarButtons),
     /// User toggled "Start with Windows" check item.
     ToggleAutoStart,
     /// User selected "Center" centering mode.
@@ -149,6 +150,9 @@ pub const CENTERING_JUST_IN_VIEW: u8 = 1;
 pub const CENTERING_ON_OVERFLOW: u8 = 2;
 pub const PLACEMENT_NEW_COLUMN: u8 = 0;
 pub const PLACEMENT_IN_COLUMN: u8 = 1;
+pub const TASKBAR_HIDE_OFFSCREEN: u8 = 0;
+pub const TASKBAR_HIDE_INACTIVE_WORKSPACES: u8 = 1;
+pub const TASKBAR_SHOW_ALL: u8 = 2;
 /// Sentinel for `once_placement`: no one-shot override is active.
 const ONCE_INACTIVE: u8 = 255;
 
@@ -158,12 +162,13 @@ const ONCE_INACTIVE: u8 = 255;
 /// message-loop thread. Updates are communicated via these shared atomics
 /// and mutexes, with `PostThreadMessageW` to wake the thread.
 struct SharedState {
+    language: Mutex<String>,
     paused: AtomicBool,
     tooltip_text: Mutex<String>,
     active_border: AtomicBool,
     focus_new_windows: AtomicBool,
     focus_follows_mouse: AtomicBool,
-    hide_offscreen_taskbar: AtomicBool,
+    taskbar_buttons: AtomicU8,
     auto_start: AtomicBool,
     centering_mode: AtomicU8,
     placement_mode: AtomicU8,
@@ -177,11 +182,14 @@ struct SharedState {
 
 /// Items returned by `build_tray` that the message-loop thread needs to update.
 struct TrayItems {
+    menu: Menu,
     pause_item: MenuItem,
     active_border_item: CheckMenuItem,
     focus_new_windows_item: CheckMenuItem,
     focus_follows_mouse_item: CheckMenuItem,
-    hide_offscreen_taskbar_item: CheckMenuItem,
+    taskbar_hide_offscreen_item: CheckMenuItem,
+    taskbar_hide_inactive_workspaces_item: CheckMenuItem,
+    taskbar_show_all_item: CheckMenuItem,
     auto_start_item: CheckMenuItem,
     centering_center_item: CheckMenuItem,
     centering_just_in_view_item: CheckMenuItem,
@@ -193,10 +201,11 @@ struct TrayItems {
 
 /// Initial state for quick-toggle menu items.
 pub struct QuickToggleState {
+    pub language: String,
     pub active_border: bool,
     pub focus_new_windows: bool,
     pub focus_follows_mouse: bool,
-    pub hide_offscreen_taskbar: bool,
+    pub taskbar_buttons: u8,
     pub auto_start: bool,
     /// 0 = Center, 1 = JustInView, 2 = OnOverflow
     pub centering_mode: u8,
@@ -232,12 +241,16 @@ impl TrayManager {
         quit_thread_id: Arc<AtomicU32>,
     ) -> Result<Self, TrayError> {
         let shared = Arc::new(SharedState {
+            language: Mutex::new(initial.language.clone()),
             paused: AtomicBool::new(false),
-            tooltip_text: Mutex::new(String::from("LeopardWM - Tiling Window Manager")),
+            tooltip_text: Mutex::new(crate::locale::text(
+                &initial.language,
+                "tray.tooltip.initial",
+            )),
             active_border: AtomicBool::new(initial.active_border),
             focus_new_windows: AtomicBool::new(initial.focus_new_windows),
             focus_follows_mouse: AtomicBool::new(initial.focus_follows_mouse),
-            hide_offscreen_taskbar: AtomicBool::new(initial.hide_offscreen_taskbar),
+            taskbar_buttons: AtomicU8::new(initial.taskbar_buttons),
             auto_start: AtomicBool::new(initial.auto_start),
             centering_mode: AtomicU8::new(initial.centering_mode),
             placement_mode: AtomicU8::new(initial.placement_mode),
@@ -316,6 +329,9 @@ impl TrayManager {
 
     /// Sync quick-toggle check marks with the current config state.
     pub fn update_quick_toggles(&self, toggles: &QuickToggleState) {
+        if let Ok(mut language) = self.shared.language.lock() {
+            *language = toggles.language.clone();
+        }
         self.shared
             .active_border
             .store(toggles.active_border, Ordering::Relaxed);
@@ -326,8 +342,8 @@ impl TrayManager {
             .focus_follows_mouse
             .store(toggles.focus_follows_mouse, Ordering::Relaxed);
         self.shared
-            .hide_offscreen_taskbar
-            .store(toggles.hide_offscreen_taskbar, Ordering::Relaxed);
+            .taskbar_buttons
+            .store(toggles.taskbar_buttons, Ordering::Relaxed);
         self.shared
             .auto_start
             .store(toggles.auto_start, Ordering::Relaxed);
@@ -359,7 +375,14 @@ impl TrayManager {
         hotkey_mismatch: Option<(usize, usize)>,
         active_workspace: u8,
     ) {
+        let language = self
+            .shared
+            .language
+            .lock()
+            .map(|value| value.clone())
+            .unwrap_or_else(|_| "en".into());
         let tooltip = format_tooltip_text(
+            &language,
             window_count,
             monitor_count,
             paused,
@@ -529,15 +552,34 @@ fn run_tray_thread(
                     }
                     win32_msg::WM_APP_UPDATE_PAUSE => {
                         let paused = shared.paused.load(Ordering::Relaxed);
-                        let label = if paused {
-                            "Resume Tiling\tCtrl+Alt+P"
-                        } else {
-                            "Pause Tiling\tCtrl+Alt+P"
-                        };
+                        let language = shared
+                            .language
+                            .lock()
+                            .map(|value| value.clone())
+                            .unwrap_or_else(|_| "en".into());
+                        let label = pause_label(&language, paused);
                         items.pause_item.set_text(label);
                         continue;
                     }
                     win32_msg::WM_APP_UPDATE_TOGGLES => {
+                        let language = shared
+                            .language
+                            .lock()
+                            .map(|value| value.clone())
+                            .unwrap_or_else(|_| "en".into());
+                        relabel_menu(items.menu.items(), &language);
+                        items.pause_item.set_text(pause_label(
+                            &language,
+                            shared.paused.load(Ordering::Relaxed),
+                        ));
+                        let tag = shared
+                            .available_update
+                            .lock()
+                            .ok()
+                            .and_then(|tag| tag.clone());
+                        items
+                            .update_item
+                            .set_text(update_label(&language, tag.as_deref()));
                         items
                             .active_border_item
                             .set_checked(shared.active_border.load(Ordering::Relaxed));
@@ -547,9 +589,16 @@ fn run_tray_thread(
                         items
                             .focus_follows_mouse_item
                             .set_checked(shared.focus_follows_mouse.load(Ordering::Relaxed));
+                        let tb = shared.taskbar_buttons.load(Ordering::Relaxed);
                         items
-                            .hide_offscreen_taskbar_item
-                            .set_checked(shared.hide_offscreen_taskbar.load(Ordering::Relaxed));
+                            .taskbar_hide_offscreen_item
+                            .set_checked(tb == TASKBAR_HIDE_OFFSCREEN);
+                        items
+                            .taskbar_hide_inactive_workspaces_item
+                            .set_checked(tb == TASKBAR_HIDE_INACTIVE_WORKSPACES);
+                        items
+                            .taskbar_show_all_item
+                            .set_checked(tb == TASKBAR_SHOW_ALL);
                         items
                             .auto_start_item
                             .set_checked(shared.auto_start.load(Ordering::Relaxed));
@@ -571,13 +620,17 @@ fn run_tray_thread(
                         continue;
                     }
                     win32_msg::WM_APP_UPDATE_RELEASE_INFO => {
-                        let label = match shared.available_update.lock() {
-                            Ok(g) => match g.as_ref() {
-                                Some(tag) => format!("Update available: {tag}"),
-                                None => "Check for Updates".to_string(),
-                            },
-                            Err(_) => "Check for Updates".to_string(),
-                        };
+                        let language = shared
+                            .language
+                            .lock()
+                            .map(|value| value.clone())
+                            .unwrap_or_else(|_| "en".into());
+                        let tag = shared
+                            .available_update
+                            .lock()
+                            .ok()
+                            .and_then(|tag| tag.clone());
+                        let label = update_label(&language, tag.as_deref());
                         items.update_item.set_text(label);
                         continue;
                     }
@@ -590,6 +643,78 @@ fn run_tray_thread(
         }
     }
     // `tray` and items are dropped here — on the same thread that created them.
+}
+
+fn menu_label(language: &str, id: &str) -> String {
+    match id {
+        "toggle_pause" => crate::locale::text(language, "tray.toggle_pause"),
+        "toggle_active_border" => crate::locale::text(language, "tray.toggle_active_border"),
+        "toggle_focus_new_windows" => {
+            crate::locale::text(language, "tray.toggle_focus_new_windows")
+        }
+        "toggle_focus_follows_mouse" => {
+            crate::locale::text(language, "tray.toggle_focus_follows_mouse")
+        }
+        "taskbar_hide_offscreen" => crate::locale::text(language, "tray.taskbar_hide_offscreen"),
+        "taskbar_hide_inactive_workspaces" => {
+            crate::locale::text(language, "tray.taskbar_hide_inactive_workspaces")
+        }
+        "taskbar_show_all" => crate::locale::text(language, "tray.taskbar_show_all"),
+        "toggle_auto_start" => crate::locale::text(language, "tray.toggle_auto_start"),
+        "centering_center" => crate::locale::text(language, "tray.centering_center"),
+        "centering_just_in_view" => crate::locale::text(language, "tray.centering_just_in_view"),
+        "centering_on_overflow" => crate::locale::text(language, "tray.centering_on_overflow"),
+        "placement_new_column" => crate::locale::text(language, "tray.placement_new_column"),
+        "placement_in_column" => crate::locale::text(language, "tray.placement_in_column"),
+        "check_updates" => crate::locale::text(language, "tray.check_updates"),
+        "open_config" => crate::locale::text(language, "tray.open_config"),
+        "edit_config" => crate::locale::text(language, "tray.edit_config"),
+        "reload" => crate::locale::text(language, "tray.reload"),
+        "refresh" => crate::locale::text(language, "tray.refresh"),
+        "view_logs" => crate::locale::text(language, "tray.view_logs"),
+        "release_all_windows" => crate::locale::text(language, "tray.release_all_windows"),
+        "exit" => crate::locale::text(language, "tray.exit"),
+        "taskbar" => crate::locale::text(language, "tray.taskbar"),
+        "centering" => crate::locale::text(language, "tray.centering"),
+        "placement" => crate::locale::text(language, "tray.placement"),
+        "troubleshooting" => crate::locale::text(language, "tray.troubleshooting"),
+        "open_about" => crate::locale::format(
+            language,
+            "tray.about",
+            &[("version", env!("CARGO_PKG_VERSION"))],
+        ),
+        _ => id.to_string(),
+    }
+}
+
+fn relabel_menu(items: Vec<MenuItemKind>, language: &str) {
+    for item in items {
+        let label = menu_label(language, item.id().0.as_str());
+        match item {
+            MenuItemKind::MenuItem(item) => item.set_text(label),
+            MenuItemKind::Check(item) => item.set_text(label),
+            MenuItemKind::Submenu(item) => {
+                item.set_text(label);
+                relabel_menu(item.items(), language);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn pause_label(language: &str, paused: bool) -> String {
+    if paused {
+        crate::locale::text(language, "tray.resume")
+    } else {
+        crate::locale::text(language, "tray.toggle_pause")
+    }
+}
+
+fn update_label(language: &str, tag: Option<&str>) -> String {
+    match tag {
+        Some(tag) => crate::locale::format(language, "tray.update_available", &[("tag", tag)]),
+        None => crate::locale::text(language, "tray.check_updates"),
+    }
 }
 
 /// Build the tray icon with its context menu. Called on the message-loop
@@ -605,7 +730,7 @@ fn build_tray(initial: &QuickToggleState) -> Result<(tray_icon::TrayIcon, TrayIt
     let version = env!("CARGO_PKG_VERSION");
     append(&MenuItem::with_id(
         menu_ids::OPEN_ABOUT,
-        format!("LeopardWM v{version}"),
+        crate::locale::format(&initial.language, "tray.about", &[("version", version)]),
         true,
         None,
     ))?;
@@ -614,7 +739,7 @@ fn build_tray(initial: &QuickToggleState) -> Result<(tray_icon::TrayIcon, TrayIt
     // Toggle Pause (first — most time-sensitive action)
     let toggle_pause = MenuItem::with_id(
         menu_ids::TOGGLE_PAUSE,
-        "Pause Tiling\tCtrl+Alt+P",
+        menu_label(&initial.language, "toggle_pause"),
         true,
         None,
     );
@@ -624,7 +749,7 @@ fn build_tray(initial: &QuickToggleState) -> Result<(tray_icon::TrayIcon, TrayIt
     // Quick toggles
     let active_border_item = CheckMenuItem::with_id(
         menu_ids::TOGGLE_ACTIVE_BORDER,
-        "Active Border",
+        menu_label(&initial.language, "toggle_active_border"),
         true,
         initial.active_border,
         None,
@@ -633,7 +758,7 @@ fn build_tray(initial: &QuickToggleState) -> Result<(tray_icon::TrayIcon, TrayIt
 
     let focus_new_windows_item = CheckMenuItem::with_id(
         menu_ids::TOGGLE_FOCUS_NEW_WINDOWS,
-        "Focus New Windows",
+        menu_label(&initial.language, "toggle_focus_new_windows"),
         true,
         initial.focus_new_windows,
         None,
@@ -642,25 +767,49 @@ fn build_tray(initial: &QuickToggleState) -> Result<(tray_icon::TrayIcon, TrayIt
 
     let focus_follows_mouse_item = CheckMenuItem::with_id(
         menu_ids::TOGGLE_FOCUS_FOLLOWS_MOUSE,
-        "Focus Follows Mouse",
+        menu_label(&initial.language, "toggle_focus_follows_mouse"),
         true,
         initial.focus_follows_mouse,
         None,
     );
     append(&focus_follows_mouse_item)?;
 
-    let hide_offscreen_taskbar_item = CheckMenuItem::with_id(
-        menu_ids::TOGGLE_HIDE_OFFSCREEN_TASKBAR,
-        "Hide Off-Screen Taskbar Buttons",
+    let taskbar_sub = Submenu::with_id("taskbar", menu_label(&initial.language, "taskbar"), true);
+    let taskbar_hide_offscreen_item = CheckMenuItem::with_id(
+        menu_ids::TASKBAR_HIDE_OFFSCREEN,
+        menu_label(&initial.language, "taskbar_hide_offscreen"),
         true,
-        initial.hide_offscreen_taskbar,
+        initial.taskbar_buttons == TASKBAR_HIDE_OFFSCREEN,
         None,
     );
-    append(&hide_offscreen_taskbar_item)?;
+    taskbar_sub
+        .append(&taskbar_hide_offscreen_item)
+        .map_err(|e| TrayError::Menu(e.to_string()))?;
+    let taskbar_hide_inactive_workspaces_item = CheckMenuItem::with_id(
+        menu_ids::TASKBAR_HIDE_INACTIVE_WORKSPACES,
+        menu_label(&initial.language, "taskbar_hide_inactive_workspaces"),
+        true,
+        initial.taskbar_buttons == TASKBAR_HIDE_INACTIVE_WORKSPACES,
+        None,
+    );
+    taskbar_sub
+        .append(&taskbar_hide_inactive_workspaces_item)
+        .map_err(|e| TrayError::Menu(e.to_string()))?;
+    let taskbar_show_all_item = CheckMenuItem::with_id(
+        menu_ids::TASKBAR_SHOW_ALL,
+        menu_label(&initial.language, "taskbar_show_all"),
+        true,
+        initial.taskbar_buttons == TASKBAR_SHOW_ALL,
+        None,
+    );
+    taskbar_sub
+        .append(&taskbar_show_all_item)
+        .map_err(|e| TrayError::Menu(e.to_string()))?;
+    append(&taskbar_sub)?;
 
     let auto_start_item = CheckMenuItem::with_id(
         menu_ids::TOGGLE_AUTO_START,
-        "Start with Windows",
+        menu_label(&initial.language, "toggle_auto_start"),
         true,
         initial.auto_start,
         None,
@@ -668,24 +817,28 @@ fn build_tray(initial: &QuickToggleState) -> Result<(tray_icon::TrayIcon, TrayIt
     append(&auto_start_item)?;
 
     // Centering Mode submenu
-    let centering_sub = Submenu::new("Centering Mode", true);
+    let centering_sub = Submenu::with_id(
+        "centering",
+        menu_label(&initial.language, "centering"),
+        true,
+    );
     let centering_center_item = CheckMenuItem::with_id(
         menu_ids::CENTERING_CENTER,
-        "Center",
+        menu_label(&initial.language, "centering_center"),
         true,
         initial.centering_mode == CENTERING_CENTER,
         None,
     );
     let centering_just_in_view_item = CheckMenuItem::with_id(
         menu_ids::CENTERING_JUST_IN_VIEW,
-        "Just in View",
+        menu_label(&initial.language, "centering_just_in_view"),
         true,
         initial.centering_mode == CENTERING_JUST_IN_VIEW,
         None,
     );
     let centering_on_overflow_item = CheckMenuItem::with_id(
         menu_ids::CENTERING_ON_OVERFLOW,
-        "On Overflow",
+        menu_label(&initial.language, "centering_on_overflow"),
         true,
         initial.centering_mode == CENTERING_ON_OVERFLOW,
         None,
@@ -702,17 +855,21 @@ fn build_tray(initial: &QuickToggleState) -> Result<(tray_icon::TrayIcon, TrayIt
     append(&centering_sub)?;
 
     // New Window Placement submenu
-    let placement_sub = Submenu::new("New Window Placement", true);
+    let placement_sub = Submenu::with_id(
+        "placement",
+        menu_label(&initial.language, "placement"),
+        true,
+    );
     let placement_new_column_item = CheckMenuItem::with_id(
         menu_ids::PLACEMENT_NEW_COLUMN,
-        "New Column",
+        menu_label(&initial.language, "placement_new_column"),
         true,
         initial.placement_mode == PLACEMENT_NEW_COLUMN,
         None,
     );
     let placement_in_column_item = CheckMenuItem::with_id(
         menu_ids::PLACEMENT_IN_COLUMN,
-        "In Focused Column",
+        menu_label(&initial.language, "placement_in_column"),
         true,
         initial.placement_mode == PLACEMENT_IN_COLUMN,
         None,
@@ -727,37 +884,46 @@ fn build_tray(initial: &QuickToggleState) -> Result<(tray_icon::TrayIcon, TrayIt
     append(&PredefinedMenuItem::separator())?;
 
     // Update checker — relabels itself when a newer release is detected.
-    let update_item = MenuItem::with_id(menu_ids::CHECK_UPDATES, "Check for Updates", true, None);
+    let update_item = MenuItem::with_id(
+        menu_ids::CHECK_UPDATES,
+        menu_label(&initial.language, "check_updates"),
+        true,
+        None,
+    );
     append(&update_item)?;
     append(&PredefinedMenuItem::separator())?;
 
     // Configuration group
     append(&MenuItem::with_id(
         menu_ids::OPEN_CONFIG,
-        "Settings...",
+        menu_label(&initial.language, "open_config"),
         true,
         None,
     ))?;
     append(&MenuItem::with_id(
         menu_ids::EDIT_CONFIG,
-        "Edit Config",
+        menu_label(&initial.language, "edit_config"),
         true,
         None,
     ))?;
     append(&MenuItem::with_id(
         menu_ids::RELOAD,
-        "Reload Config\tCtrl+Alt+Shift+R",
+        menu_label(&initial.language, "reload"),
         true,
         None,
     ))?;
     append(&PredefinedMenuItem::separator())?;
 
     // Troubleshooting submenu
-    let troubleshoot = Submenu::new("Troubleshooting", true);
+    let troubleshoot = Submenu::with_id(
+        "troubleshooting",
+        menu_label(&initial.language, "troubleshooting"),
+        true,
+    );
     troubleshoot
         .append(&MenuItem::with_id(
             menu_ids::REFRESH,
-            "Refresh Windows\tCtrl+Alt+R",
+            menu_label(&initial.language, "refresh"),
             true,
             None,
         ))
@@ -765,7 +931,7 @@ fn build_tray(initial: &QuickToggleState) -> Result<(tray_icon::TrayIcon, TrayIt
     troubleshoot
         .append(&MenuItem::with_id(
             menu_ids::VIEW_LOGS,
-            "View Logs",
+            menu_label(&initial.language, "view_logs"),
             true,
             None,
         ))
@@ -773,7 +939,7 @@ fn build_tray(initial: &QuickToggleState) -> Result<(tray_icon::TrayIcon, TrayIt
     troubleshoot
         .append(&MenuItem::with_id(
             menu_ids::RELEASE_ALL_WINDOWS,
-            "Release All Windows",
+            menu_label(&initial.language, "release_all_windows"),
             true,
             None,
         ))
@@ -782,7 +948,12 @@ fn build_tray(initial: &QuickToggleState) -> Result<(tray_icon::TrayIcon, TrayIt
     append(&PredefinedMenuItem::separator())?;
 
     // Exit
-    append(&MenuItem::with_id(menu_ids::EXIT, "Exit", true, None))?;
+    append(&MenuItem::with_id(
+        menu_ids::EXIT,
+        menu_label(&initial.language, "exit"),
+        true,
+        None,
+    ))?;
 
     // Create the tray icon with a simple embedded icon. Never starts with
     // the once-active badge: the one-shot placement override never survives
@@ -790,18 +961,24 @@ fn build_tray(initial: &QuickToggleState) -> Result<(tray_icon::TrayIcon, TrayIt
     let icon = create_icon(None, initial.placement_mode == PLACEMENT_IN_COLUMN)?;
 
     let tray = TrayIconBuilder::new()
-        .with_menu(Box::new(menu))
-        .with_tooltip("LeopardWM - Tiling Window Manager")
+        .with_menu(Box::new(menu.clone()))
+        .with_tooltip(crate::locale::text(
+            &initial.language,
+            "tray.tooltip.initial",
+        ))
         .with_icon(icon)
         .build()
         .map_err(|e| TrayError::Build(e.to_string()))?;
 
     let items = TrayItems {
+        menu,
         pause_item: toggle_pause,
         active_border_item,
         focus_new_windows_item,
         focus_follows_mouse_item,
-        hide_offscreen_taskbar_item,
+        taskbar_hide_offscreen_item,
+        taskbar_hide_inactive_workspaces_item,
+        taskbar_show_all_item,
         auto_start_item,
         centering_center_item,
         centering_just_in_view_item,
@@ -851,7 +1028,15 @@ fn map_menu_id_to_event(menu_id: &str) -> Option<TrayEvent> {
         menu_ids::TOGGLE_ACTIVE_BORDER => Some(TrayEvent::ToggleActiveBorder),
         menu_ids::TOGGLE_FOCUS_NEW_WINDOWS => Some(TrayEvent::ToggleFocusNewWindows),
         menu_ids::TOGGLE_FOCUS_FOLLOWS_MOUSE => Some(TrayEvent::ToggleFocusFollowsMouse),
-        menu_ids::TOGGLE_HIDE_OFFSCREEN_TASKBAR => Some(TrayEvent::ToggleHideOffscreenTaskbar),
+        menu_ids::TASKBAR_HIDE_OFFSCREEN => Some(TrayEvent::SetTaskbarButtons(
+            crate::config::TaskbarButtons::HideOffscreen,
+        )),
+        menu_ids::TASKBAR_HIDE_INACTIVE_WORKSPACES => Some(TrayEvent::SetTaskbarButtons(
+            crate::config::TaskbarButtons::HideInactiveWorkspaces,
+        )),
+        menu_ids::TASKBAR_SHOW_ALL => Some(TrayEvent::SetTaskbarButtons(
+            crate::config::TaskbarButtons::ShowAll,
+        )),
         menu_ids::TOGGLE_AUTO_START => Some(TrayEvent::ToggleAutoStart),
         menu_ids::CENTERING_CENTER => Some(TrayEvent::SetCenteringCenter),
         menu_ids::CENTERING_JUST_IN_VIEW => Some(TrayEvent::SetCenteringJustInView),
@@ -865,24 +1050,38 @@ fn map_menu_id_to_event(menu_id: &str) -> Option<TrayEvent> {
 
 /// Format the tray tooltip text (testable without requiring a real tray icon).
 pub fn format_tooltip_text(
+    language: &str,
     window_count: usize,
     monitor_count: usize,
     paused: bool,
     hotkey_mismatch: Option<(usize, usize)>,
     active_workspace: u8,
 ) -> String {
-    let status = if paused { "Paused" } else { "Active" };
-    let mut tooltip = format!(
-        "LeopardWM - {} (WS {}, {} windows, {} monitors)",
-        status, active_workspace, window_count, monitor_count
+    let status = if paused {
+        crate::locale::text(language, "tray.status.paused")
+    } else {
+        crate::locale::text(language, "tray.status.active")
+    };
+    let mut tooltip = crate::locale::format(
+        language,
+        "tray.tooltip.status",
+        &[
+            ("status", &status),
+            ("workspace", &active_workspace.to_string()),
+            ("windows", &window_count.to_string()),
+            ("monitors", &monitor_count.to_string()),
+        ],
     );
     if let Some((registered, requested)) = hotkey_mismatch {
         if registered < requested {
-            tooltip.push_str(&format!(
-                "\nHotkeys: {}/{} ({} failed)",
-                registered,
-                requested,
-                requested - registered
+            tooltip.push_str(&crate::locale::format(
+                language,
+                "tray.tooltip.hotkeys",
+                &[
+                    ("registered", &registered.to_string()),
+                    ("requested", &requested.to_string()),
+                    ("failed", &(requested - registered).to_string()),
+                ],
             ));
         }
     }
@@ -1073,12 +1272,13 @@ mod tests {
     #[test]
     fn test_load_once_placement_roundtrip() {
         let shared = SharedState {
+            language: Mutex::new(String::new()),
             paused: AtomicBool::new(false),
             tooltip_text: Mutex::new(String::new()),
             active_border: AtomicBool::new(false),
             focus_new_windows: AtomicBool::new(false),
             focus_follows_mouse: AtomicBool::new(false),
-            hide_offscreen_taskbar: AtomicBool::new(false),
+            taskbar_buttons: AtomicU8::new(TASKBAR_HIDE_OFFSCREEN),
             auto_start: AtomicBool::new(false),
             centering_mode: AtomicU8::new(CENTERING_CENTER),
             placement_mode: AtomicU8::new(PLACEMENT_NEW_COLUMN),
@@ -1101,12 +1301,13 @@ mod tests {
     #[test]
     fn test_effective_placement_in_column_multiplexes_once_over_persistent() {
         let shared = SharedState {
+            language: Mutex::new(String::new()),
             paused: AtomicBool::new(false),
             tooltip_text: Mutex::new(String::new()),
             active_border: AtomicBool::new(false),
             focus_new_windows: AtomicBool::new(false),
             focus_follows_mouse: AtomicBool::new(false),
-            hide_offscreen_taskbar: AtomicBool::new(false),
+            taskbar_buttons: AtomicU8::new(TASKBAR_HIDE_OFFSCREEN),
             auto_start: AtomicBool::new(false),
             centering_mode: AtomicU8::new(CENTERING_CENTER),
             placement_mode: AtomicU8::new(PLACEMENT_NEW_COLUMN),
@@ -1263,21 +1464,39 @@ mod tests {
             map_menu_id_to_event(menu_ids::CENTERING_JUST_IN_VIEW),
             Some(TrayEvent::SetCenteringJustInView)
         ));
+        for (id, expected) in [
+            (
+                menu_ids::TASKBAR_HIDE_OFFSCREEN,
+                crate::config::TaskbarButtons::HideOffscreen,
+            ),
+            (
+                menu_ids::TASKBAR_HIDE_INACTIVE_WORKSPACES,
+                crate::config::TaskbarButtons::HideInactiveWorkspaces,
+            ),
+            (
+                menu_ids::TASKBAR_SHOW_ALL,
+                crate::config::TaskbarButtons::ShowAll,
+            ),
+        ] {
+            assert!(
+                matches!(map_menu_id_to_event(id), Some(TrayEvent::SetTaskbarButtons(mode)) if mode == expected)
+            );
+        }
         assert!(map_menu_id_to_event("unknown").is_none());
     }
 
     #[test]
     fn test_tooltip_format() {
-        let active = format_tooltip_text(14, 2, false, None, 1);
+        let active = format_tooltip_text("en", 14, 2, false, None, 1);
         assert_eq!(active, "LeopardWM - Active (WS 1, 14 windows, 2 monitors)");
 
-        let paused = format_tooltip_text(3, 1, true, None, 1);
+        let paused = format_tooltip_text("en", 3, 1, true, None, 1);
         assert_eq!(paused, "LeopardWM - Paused (WS 1, 3 windows, 1 monitors)");
     }
 
     #[test]
     fn test_tooltip_format_with_hotkey_mismatch() {
-        let tooltip = format_tooltip_text(10, 2, false, Some((7, 10)), 1);
+        let tooltip = format_tooltip_text("en", 10, 2, false, Some((7, 10)), 1);
         assert_eq!(
             tooltip,
             "LeopardWM - Active (WS 1, 10 windows, 2 monitors)\nHotkeys: 7/10 (3 failed)"
@@ -1287,13 +1506,13 @@ mod tests {
     #[test]
     fn test_tooltip_format_no_hotkey_mismatch() {
         // When registered == requested, no mismatch line
-        let tooltip = format_tooltip_text(10, 2, false, Some((10, 10)), 1);
+        let tooltip = format_tooltip_text("en", 10, 2, false, Some((10, 10)), 1);
         assert_eq!(tooltip, "LeopardWM - Active (WS 1, 10 windows, 2 monitors)");
     }
 
     #[test]
     fn test_tooltip_format_paused_with_mismatch() {
-        let tooltip = format_tooltip_text(5, 1, true, Some((3, 8)), 1);
+        let tooltip = format_tooltip_text("en", 5, 1, true, Some((3, 8)), 1);
         assert!(tooltip.contains("Paused"));
         assert!(tooltip.contains("3/8 (5 failed)"));
     }
