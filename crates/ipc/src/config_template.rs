@@ -236,6 +236,13 @@ corner_style = "square"
 # [[window_rules]]
 # match_executable = "slack.exe"
 # sticky = true
+
+# Launchers: when a launcher closes, Windows activates the most recently used
+# window, even one on a hidden workspace. Marking the launcher keeps LeopardWM on
+# the current workspace instead of switching to that window.
+# [[window_rules]]
+# match_class = "^HwndWrapper\\[PowerToys\\.PowerLauncher"
+# launcher = true
 "#
     )
 }

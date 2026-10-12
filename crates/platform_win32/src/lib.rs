@@ -16,6 +16,7 @@ pub mod gestures;
 pub mod hotkeys;
 pub mod ipc_security;
 pub mod keyboard_hook;
+pub mod last_input;
 pub mod mouse_hook;
 pub mod overlay;
 pub mod overview;
@@ -62,7 +63,11 @@ pub use enumeration::{
     monitor_above, monitor_below, monitor_to_left, monitor_to_right, monitors_by_position,
     TopLevelWindowIdCollection,
 };
-pub use event_hooks::{install_event_hooks, EventHookHandle, WindowEvent};
+pub use event_hooks::{
+    foreground_predecessor, install_event_hooks, EventHookHandle, ForegroundPredecessor,
+    WindowEvent,
+};
+pub use last_input::{last_input, LastInput};
 pub use focus::{
     can_raise_normal_window, close_window, current_event_time_ms, get_foreground_window,
     ms_since_last_user_input, raise_normal_window_no_activate, raise_window_no_activate,

@@ -563,6 +563,9 @@ unsafe fn keyboard_ll_hook_inner(ncode: i32, wparam: WPARAM, lparam: LPARAM) -> 
     };
     let kb = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
     let vk = kb.vkCode;
+    if msg == KeyMsg::Down {
+        crate::last_input::record_key_down(vk, kb.time);
+    }
     let recording = HOOK_RECORDING.load(Ordering::SeqCst);
     if crate::overview::input_target().is_none() {
         clear_overview_press_ownership();

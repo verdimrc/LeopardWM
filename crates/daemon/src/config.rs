@@ -809,6 +809,12 @@ pub struct WindowRule {
     /// that manages its own monitor placement land where it asked to open.
     #[serde(default)]
     pub new_window_monitor: Option<NewWindowMonitor>,
+
+    /// Mark the matching window as a launcher (e.g. PowerToys Run). When it
+    /// closes and Windows activates a window on a hidden workspace, LeopardWM
+    /// stays on the current workspace instead of switching to that window.
+    #[serde(default)]
+    pub launcher: bool,
 }
 
 /// Action to take for a matching window.
@@ -1212,6 +1218,8 @@ pub struct CompiledWindowRule {
     pub sticky: bool,
     /// Per-rule override of `behavior.new_window_monitor`.
     pub new_window_monitor: Option<NewWindowMonitor>,
+    /// The matching window is a launcher; see `WindowRule::launcher`.
+    pub launcher: bool,
 }
 
 fn matches_window_size(
@@ -1745,6 +1753,7 @@ impl Config {
                 open_in_column,
                 sticky: rule.sticky,
                 new_window_monitor: rule.new_window_monitor,
+                launcher: rule.launcher,
             });
         }
 
@@ -1766,6 +1775,7 @@ impl Config {
                 open_in_column: None,
                 sticky: false,
                 new_window_monitor: None,
+                launcher: false,
             });
         }
 
@@ -2396,6 +2406,7 @@ default_width_preset_monitor_overrides = { "01" = 2, "0" = 2, "main" = 2, "2" = 
             open_in_column: None,
             sticky: false,
             new_window_monitor: None,
+            launcher: false,
             match_max_width: None,
             match_max_height: None,
         };
@@ -2420,6 +2431,7 @@ default_width_preset_monitor_overrides = { "01" = 2, "0" = 2, "main" = 2, "2" = 
             open_in_column: None,
             sticky: false,
             new_window_monitor: None,
+            launcher: false,
             match_max_width: None,
             match_max_height: None,
         };
@@ -2450,6 +2462,7 @@ default_width_preset_monitor_overrides = { "01" = 2, "0" = 2, "main" = 2, "2" = 
             open_in_column: None,
             sticky: false,
             new_window_monitor: None,
+            launcher: false,
             match_max_width: None,
             match_max_height: None,
         };
@@ -2475,6 +2488,7 @@ default_width_preset_monitor_overrides = { "01" = 2, "0" = 2, "main" = 2, "2" = 
             open_in_column: None,
             sticky: false,
             new_window_monitor: None,
+            launcher: false,
             match_max_width: None,
             match_max_height: None,
         };
@@ -2507,6 +2521,7 @@ default_width_preset_monitor_overrides = { "01" = 2, "0" = 2, "main" = 2, "2" = 
             open_in_column: None,
             sticky: false,
             new_window_monitor: None,
+            launcher: false,
             match_max_width: None,
             match_max_height: None,
         };
@@ -2624,6 +2639,7 @@ default_width_preset_monitor_overrides = { "01" = 2, "0" = 2, "main" = 2, "2" = 
                 open_in_column: None,
                 sticky: false,
                 new_window_monitor: None,
+                launcher: false,
                 match_max_width: None,
                 match_max_height: None,
             },
@@ -2641,6 +2657,7 @@ default_width_preset_monitor_overrides = { "01" = 2, "0" = 2, "main" = 2, "2" = 
                 open_in_column: None,
                 sticky: false,
                 new_window_monitor: None,
+                launcher: false,
                 match_max_width: None,
                 match_max_height: None,
             },
@@ -2674,6 +2691,7 @@ default_width_preset_monitor_overrides = { "01" = 2, "0" = 2, "main" = 2, "2" = 
             open_in_column: None,
             sticky: false,
             new_window_monitor: None,
+            launcher: false,
             match_max_width: None,
             match_max_height: None,
         };
@@ -2699,6 +2717,7 @@ default_width_preset_monitor_overrides = { "01" = 2, "0" = 2, "main" = 2, "2" = 
             open_in_column: None,
             sticky: false,
             new_window_monitor: None,
+            launcher: false,
             match_max_width: None,
             match_max_height: None,
         };
@@ -2724,6 +2743,7 @@ default_width_preset_monitor_overrides = { "01" = 2, "0" = 2, "main" = 2, "2" = 
             open_in_column: None,
             sticky: false,
             new_window_monitor: None,
+            launcher: false,
             match_max_width: None,
             match_max_height: None,
         };
@@ -2750,6 +2770,7 @@ default_width_preset_monitor_overrides = { "01" = 2, "0" = 2, "main" = 2, "2" = 
             open_in_column: None,
             sticky: false,
             new_window_monitor: None,
+            launcher: false,
             match_max_width: None,
             match_max_height: None,
         };
@@ -2776,6 +2797,7 @@ default_width_preset_monitor_overrides = { "01" = 2, "0" = 2, "main" = 2, "2" = 
             open_in_column: None,
             sticky: false,
             new_window_monitor: None,
+            launcher: false,
             match_max_width: None,
             match_max_height: None,
         };
@@ -2802,6 +2824,7 @@ default_width_preset_monitor_overrides = { "01" = 2, "0" = 2, "main" = 2, "2" = 
             open_in_column: None,
             sticky: false,
             new_window_monitor: None,
+            launcher: false,
             match_max_width: None,
             match_max_height: None,
         };
@@ -2828,6 +2851,7 @@ default_width_preset_monitor_overrides = { "01" = 2, "0" = 2, "main" = 2, "2" = 
             open_in_column: None,
             sticky: false,
             new_window_monitor: None,
+            launcher: false,
             match_max_width: None,
             match_max_height: None,
         };
@@ -2853,6 +2877,7 @@ default_width_preset_monitor_overrides = { "01" = 2, "0" = 2, "main" = 2, "2" = 
             open_in_column: None,
             sticky: false,
             new_window_monitor: None,
+            launcher: false,
             match_max_width: None,
             match_max_height: None,
         };
@@ -3328,6 +3353,7 @@ default_width_preset_monitor_overrides = { "01" = 2, "0" = 2, "main" = 2, "2" = 
                     open_in_column: None,
                     sticky: false,
                     new_window_monitor: None,
+                    launcher: false,
                     match_max_width: None,
                     match_max_height: None,
                 },
@@ -3345,6 +3371,7 @@ default_width_preset_monitor_overrides = { "01" = 2, "0" = 2, "main" = 2, "2" = 
                     open_in_column: None,
                     sticky: false,
                     new_window_monitor: None,
+                    launcher: false,
                     match_max_width: None,
                     match_max_height: None,
                 },
@@ -3389,6 +3416,7 @@ default_width_preset_monitor_overrides = { "01" = 2, "0" = 2, "main" = 2, "2" = 
                     open_in_column: None,
                     sticky: false,
                     new_window_monitor: None,
+                    launcher: false,
                     match_max_width: None,
                     match_max_height: None,
                 },
@@ -3406,6 +3434,7 @@ default_width_preset_monitor_overrides = { "01" = 2, "0" = 2, "main" = 2, "2" = 
                     open_in_column: None,
                     sticky: false,
                     new_window_monitor: None,
+                    launcher: false,
                     match_max_width: None,
                     match_max_height: None,
                 },

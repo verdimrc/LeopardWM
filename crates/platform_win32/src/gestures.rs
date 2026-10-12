@@ -13,7 +13,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, GetMessageW, PeekMessageW, PostThreadMessageW,
     SetWindowsHookExW, UnhookWindowsHookEx, MSG, MSLLHOOKSTRUCT, PM_NOREMOVE, WH_MOUSE_LL,
-    WM_INPUT,
+    WM_INPUT, WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_RBUTTONDOWN,
 };
 
 /// Gesture events detected from touchpad/pointer input.
@@ -831,6 +831,10 @@ unsafe extern "system" fn gesture_mouse_hook_proc(
 ) -> windows::Win32::Foundation::LRESULT {
     if ncode >= 0 {
         let msg = wparam.0 as u32;
+        if matches!(msg, WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN) {
+            let mouse_struct = &*(lparam.0 as *const MSLLHOOKSTRUCT);
+            crate::last_input::record_click(mouse_struct.time);
+        }
         let axis = match msg {
             WM_MOUSEHWHEEL => Some(WheelAxis::Horizontal),
             WM_MOUSEWHEEL => Some(WheelAxis::Vertical),

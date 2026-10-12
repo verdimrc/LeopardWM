@@ -11,8 +11,8 @@ use windows::Win32::Foundation::HWND;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, GetForegroundWindow, GetMessageW, PeekMessageW, PostThreadMessageW, MSG,
-    PM_NOREMOVE, WM_USER,
+    DispatchMessageW, GetForegroundWindow, GetMessageW, GetWindowTextW, PeekMessageW,
+    PostThreadMessageW, MSG, PM_NOREMOVE, WM_USER,
 };
 
 // WinEvent constants (not all are exposed by windows-rs)
@@ -303,6 +303,70 @@ unsafe extern "system" fn win_event_callback(
     }
 }
 
+/// The window that was foreground right before another window became
+/// foreground, as seen by the WinEvent hook. Unlike daemon events, this covers
+/// every window, including launchers and shell UI the daemon never hears about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForegroundPredecessor {
+    pub hwnd: WindowId,
+    pub class: String,
+    pub title: String,
+    /// 0 when the owning process could not be read.
+    pub process_id: u32,
+}
+
+fn window_title(hwnd: HWND) -> String {
+    let mut buf = [0u16; 256];
+    let len = unsafe { GetWindowTextW(hwnd, &mut buf) };
+    String::from_utf16_lossy(&buf[..len.max(0) as usize])
+}
+
+/// How many recent foreground changes keep their predecessor.
+const FOREGROUND_HISTORY_LEN: usize = 16;
+
+/// The current foreground window, and (activated window, predecessor) pairs
+/// for recent foreground changes, newest last.
+static CURRENT_FOREGROUND: std::sync::Mutex<Option<ForegroundPredecessor>> =
+    std::sync::Mutex::new(None);
+static FOREGROUND_HISTORY: std::sync::Mutex<Vec<(WindowId, ForegroundPredecessor)>> =
+    std::sync::Mutex::new(Vec::new());
+
+fn record_foreground(hwnd: WindowId, class: String) {
+    let title = window_title(HWND(hwnd as *mut core::ffi::c_void));
+    let process_id = crate::elevation::window_process_id(hwnd).unwrap_or(0);
+    let mut current = CURRENT_FOREGROUND
+        .lock()
+        .unwrap_or_else(recover_poisoned_mutex);
+    let previous = current.replace(ForegroundPredecessor {
+        hwnd,
+        class,
+        title,
+        process_id,
+    });
+    drop(current);
+    if let Some(previous) = previous.filter(|previous| previous.hwnd != hwnd) {
+        let mut history = FOREGROUND_HISTORY
+            .lock()
+            .unwrap_or_else(recover_poisoned_mutex);
+        if history.len() == FOREGROUND_HISTORY_LEN {
+            history.remove(0);
+        }
+        history.push((hwnd, previous));
+    }
+}
+
+/// The window that was foreground right before `activated` last became
+/// foreground, if the hook saw that change recently.
+pub fn foreground_predecessor(activated: WindowId) -> Option<ForegroundPredecessor> {
+    FOREGROUND_HISTORY
+        .lock()
+        .unwrap_or_else(recover_poisoned_mutex)
+        .iter()
+        .rev()
+        .find(|(hwnd, _)| *hwnd == activated)
+        .map(|(_, previous)| previous.clone())
+}
+
 /// Inner implementation of WinEvent callback.
 fn win_event_callback_inner(
     _hook: HWINEVENTHOOK,
@@ -339,9 +403,16 @@ fn win_event_callback_inner(
         normalize_to_root_window(hwnd)
     };
 
-    if should_filter_window_event_by_manageability(event)
-        && !should_emit_window_event_for(event, hwnd)
-    {
+    let forwarded = !should_filter_window_event_by_manageability(event)
+        || should_emit_window_event_for(event, hwnd);
+    // Every foreground change, including windows not forwarded to the daemon
+    // (launchers, tool windows), is recorded so the daemon can tell what had
+    // focus before Windows activated a window on a hidden workspace.
+    if event == EVENT_SYSTEM_FOREGROUND {
+        let class = crate::thumbnail::class_name(hwnd.0 as WindowId);
+        record_foreground(hwnd.0 as WindowId, class);
+    }
+    if !forwarded {
         return;
     }
 

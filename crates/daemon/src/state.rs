@@ -515,6 +515,14 @@ pub(crate) struct AppState {
     /// monitor's selected workspace becomes genuinely empty. Distinct from
     /// `pending_workspace_switch_focus`.
     pub(crate) pending_last_window_departure: Option<PendingLastWindowDeparture>,
+    /// A window picked from a launcher that may only be Windows filling the gap
+    /// (see `launcher_activation`), with when it became active. Followed once
+    /// `LAUNCHER_PICK_WAIT` passes without a new window opening.
+    pub(crate) pending_launcher_follow: Option<(u64, std::time::Instant)>,
+    /// Set while re-dispatching a pending launcher pick, so it is followed.
+    pub(crate) launcher_follow_bypass: Option<u64>,
+    /// When a window was last admitted to the layout.
+    pub(crate) last_window_admitted_at: Option<std::time::Instant>,
     pub(crate) recently_restored_managed_windows: HashMap<u64, std::time::Instant>,
     /// `(monitor, hwnd)` of the most-recently-broadcast
     /// `FocusedWindowChanged` event. Independent from
@@ -837,6 +845,11 @@ pub(crate) struct AppState {
     pub(crate) injected_visible_hwnds: HashSet<u64>,
     #[cfg(test)]
     pub(crate) injected_foreground_hwnd: Option<Option<u64>>,
+    #[cfg(test)]
+    pub(crate) injected_foreground_predecessors:
+        HashMap<u64, leopardwm_platform_win32::ForegroundPredecessor>,
+    #[cfg(test)]
+    pub(crate) injected_last_input: leopardwm_platform_win32::LastInput,
     #[cfg(test)]
     pub(crate) foreground_release_requests: Vec<(u64, Rect)>,
     #[cfg(test)]
@@ -1188,6 +1201,9 @@ impl AppState {
             previous_focused_hwnd: None,
             pending_workspace_switch_focus: None,
             pending_last_window_departure: None,
+            pending_launcher_follow: None,
+            launcher_follow_bypass: None,
+            last_window_admitted_at: None,
             recently_restored_managed_windows: HashMap::new(),
             last_broadcast_focused: None,
             last_focus_change_at: None,
@@ -1308,6 +1324,10 @@ impl AppState {
             injected_visible_hwnds: HashSet::new(),
             #[cfg(test)]
             injected_foreground_hwnd: None,
+            #[cfg(test)]
+            injected_foreground_predecessors: HashMap::new(),
+            #[cfg(test)]
+            injected_last_input: leopardwm_platform_win32::LastInput::None,
             #[cfg(test)]
             foreground_release_requests: Vec::new(),
             #[cfg(test)]

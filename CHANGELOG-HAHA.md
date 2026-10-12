@@ -25,6 +25,8 @@
   `behavior.new_window_monitor` per app. E.g. `"opening"` for PowerPoint presentation mode: respects
   where PowerPoint places both the slide show and the presenter view windows, while still tiling the
   presenter view.
+- Window rules support `launcher = true`: closing that launcher no longer switches to a window on a
+  hidden workspace (e.g. `match_class = "^HwndWrapper\\[PowerToys\\.PowerLauncher"` for PowerToys Run).
 - Vertical monitor support:
   - Automatically detected from portrait orientation (height > width) — no configuration required; rotate
     the monitor in Windows Display Settings.
@@ -81,6 +83,7 @@
 | `hotkeys.toggle_desktop_peek_anchored` | `string` | `"Ctrl+Alt+'"` | Reveal desktop; focused window stays in place. |
 | `hotkeys.toggle_desktop_peek` | `string` | `"Ctrl+Alt+Shift+'"` | Reveal desktop; focused window moves to the minimum-width mark. |
 | Window rule: `new_window_monitor` | `"opening" \| "focused" \| "cursor"` | (none) | Overrides `behavior.new_window_monitor` for matching windows. |
+| Window rule: `launcher` | `bool` | `false` | Closing the matching launcher doesn't switch to a window on a hidden workspace. |
 | `layout.default_width_preset_monitor_overrides` | `{ "N" = u32 }` | `{}` | Per-display-index override of `layout.default_width_preset`. ⚠️ [Known issue with GUI settings](#known-issues-with-gui-settings) |
 | Window rule: `column_width` (extended) | `f64 \| u32 \| { "N" = f64\|u32 }` | (none) | Now accepts a preset index or a per-display-index map in addition to a viewport fraction. ⚠️ [Known issue with GUI settings](#known-issues-with-gui-settings) |
 | `hotkeys.toggle_new_window_placement_once` | `string` | `"Ctrl+Alt+Shift+N"` | Activate a one-shot new-window-placement override for the next window only. |

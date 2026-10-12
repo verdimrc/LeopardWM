@@ -2723,7 +2723,8 @@ async fn handle_periodic_check(ctx: &mut EventLoopCtx<'_>) {
     let mut state = ctx.state.lock().await;
     let focus_changed = state.check_tracked_focus_liveness();
     let moves_checked = state.recheck_deferred_window_moves();
-    if !focus_changed && !moves_checked {
+    let launcher_followed = state.resolve_pending_launcher_follow();
+    if !focus_changed && !moves_checked && !launcher_followed {
         return;
     }
     if state.overview_open {
