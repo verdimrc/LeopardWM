@@ -6124,6 +6124,71 @@ fn test_last_window_stale_duplicate_replacement_cannot_undo_selection() {
     assert_eq!(state.pending_last_window_departure, Some(intent));
 }
 
+/// Activations elsewhere right after the last window closes are ignored for
+/// `MINIMIZE_HANDOFF_WINDOW_MS`; age the guard past that so the next activation
+/// is judged by the timestamp rules.
+fn age_past_close_handoff_window(state: &mut AppState) {
+    if let Some(intent) = state.pending_last_window_departure.as_mut() {
+        intent.set_at = std::time::Instant::now()
+            - std::time::Duration::from_millis(u64::from(
+                crate::event_handler::MINIMIZE_HANDOFF_WINDOW_MS,
+            ));
+    }
+}
+
+#[test]
+fn test_last_window_close_keeps_empty_workspace_for_late_handoff() {
+    // Windows activates a window on another workspace slightly after the
+    // close was handled: within the handoff window, the empty workspace stays.
+    let mut state = last_window_cross_workspace_state();
+    let mon = state.focused_monitor;
+    state.handle_window_event(WindowEvent::Destroyed(100));
+    let armed_at = state
+        .pending_last_window_departure
+        .unwrap()
+        .armed_at_event_time_ms;
+    state.handle_window_event(WindowEvent::Focused(200, armed_at.wrapping_add(50)));
+    assert_eq!(state.active_workspace_idx(mon), 0);
+    assert_eq!(state.previous_focused_hwnd, None);
+    assert!(
+        state.pending_last_window_departure.is_some(),
+        "the guard stays armed for the rest of the handoff window"
+    );
+
+    // After the handoff window, a later activation switches as usual.
+    age_past_close_handoff_window(&mut state);
+    state.handle_window_event(WindowEvent::Focused(200, armed_at.wrapping_add(600)));
+    assert_eq!(state.active_workspace_idx(mon), 1);
+    assert_eq!(state.previous_focused_hwnd, Some(200));
+}
+
+#[test]
+fn test_last_window_close_keeps_empty_workspace_against_other_monitor_handoff() {
+    let mut state = AppState::new_with_config(test_config(), two_monitors());
+    state.reduce_motion = false;
+    state.last_prune_at = Some(std::time::Instant::now());
+    state.injected_event_time_ms = Some(1_000);
+    for hwnd in [100, 200] {
+        state
+            .injected_window_info
+            .insert(hwnd, make_test_window_info(hwnd));
+    }
+    state.handle_window_event(WindowEvent::Created(100, 0));
+    state.workspaces.get_mut(&2).unwrap()[0]
+        .insert_window(200, Some(800))
+        .unwrap();
+    state
+        .window_managed_at
+        .insert(200, std::time::Instant::now());
+    state.previous_focused_hwnd = Some(100);
+    state.injected_foreground_hwnd = Some(Some(100));
+
+    state.handle_window_event(WindowEvent::Destroyed(100));
+    state.handle_window_event(WindowEvent::Focused(200, 1_000));
+    assert_eq!(state.focused_monitor, 1);
+    assert_eq!(state.previous_focused_hwnd, None);
+}
+
 #[test]
 fn test_last_window_newer_same_or_different_replacement_activation_wins() {
     let mut same = last_window_cross_workspace_state();
@@ -6133,6 +6198,7 @@ fn test_last_window_newer_same_or_different_replacement_activation_wins() {
         .pending_last_window_departure
         .unwrap()
         .armed_at_event_time_ms;
+    age_past_close_handoff_window(&mut same);
     same.handle_window_event(WindowEvent::Focused(200, armed_at.wrapping_add(1)));
     assert_eq!(same.active_workspace_idx(mon), 1);
     assert_eq!(same.previous_focused_hwnd, Some(200));
@@ -6146,6 +6212,7 @@ fn test_last_window_newer_same_or_different_replacement_activation_wins() {
         .insert_window(300, Some(800))
         .unwrap();
     different.handle_window_event(WindowEvent::Destroyed(100));
+    age_past_close_handoff_window(&mut different);
     different.handle_window_event(WindowEvent::Focused(300, 1_000));
     assert_eq!(different.active_workspace_idx(mon), 1);
     assert_eq!(different.previous_focused_hwnd, Some(300));
@@ -6226,6 +6293,7 @@ fn test_last_window_stale_tracking_still_allows_newer_activation() {
     state.handle_window_event(WindowEvent::Destroyed(100));
     assert_eq!(state.previous_focused_hwnd, None);
 
+    age_past_close_handoff_window(&mut state);
     state.handle_window_event(WindowEvent::Focused(200, 1_001));
     assert_eq!(state.active_workspace_idx(mon), 1);
     assert_eq!(state.previous_focused_hwnd, Some(200));
@@ -6333,6 +6401,7 @@ fn test_last_window_empty_reconciles_tab_strips_without_global_hide() {
         );
 
         if matches!(departure, Departure::DirectWithReplacement) {
+            age_past_close_handoff_window(&mut state);
             state.handle_window_event(WindowEvent::Focused(200, 1_001));
             assert_eq!(state.focused_monitor, 2);
             assert_eq!(state.previous_focused_hwnd, Some(200));
@@ -6451,6 +6520,7 @@ fn test_last_window_departure_guard_equality_wrap_and_expiry() {
     wrap.handle_window_event(WindowEvent::Destroyed(100));
     wrap.handle_window_event(WindowEvent::Focused(200, u32::MAX));
     assert_eq!(wrap.active_workspace_idx(mon), 0);
+    age_past_close_handoff_window(&mut wrap);
     wrap.handle_window_event(WindowEvent::Focused(200, 0));
     assert_eq!(wrap.active_workspace_idx(mon), 1);
     assert_eq!(wrap.previous_focused_hwnd, Some(200));
@@ -6560,6 +6630,7 @@ fn test_last_window_unsampled_newer_tick_activation_wins() {
         .unwrap()
         .armed_at_event_time_ms;
 
+    age_past_close_handoff_window(&mut state);
     state.handle_window_event(WindowEvent::Focused(200, armed_at.wrapping_add(1)));
     assert_eq!(state.active_workspace_idx(mon), 3);
     assert_eq!(state.previous_focused_hwnd, Some(200));
@@ -6611,6 +6682,7 @@ fn test_last_window_unsampled_different_hwnd_after_binding_wins() {
         Some(200)
     );
 
+    age_past_close_handoff_window(&mut state);
     state.handle_window_event(WindowEvent::Focused(300, armed_at));
     assert_eq!(state.active_workspace_idx(mon), 3);
     assert_eq!(state.previous_focused_hwnd, Some(300));
@@ -6648,6 +6720,7 @@ fn test_last_window_unsampled_different_monitor_activation_follows() {
         None
     );
 
+    age_past_close_handoff_window(&mut state);
     state.handle_window_event(WindowEvent::Focused(200, 1_000));
     assert_eq!(state.focused_monitor, 2);
     assert_eq!(state.active_workspace_idx(2), 0);
@@ -6707,6 +6780,7 @@ fn test_last_window_sampled_different_hwnd_still_follows() {
         Some(200)
     );
 
+    age_past_close_handoff_window(&mut state);
     state.handle_window_event(WindowEvent::Focused(300, 1_000));
     assert_eq!(state.active_workspace_idx(mon), 1);
     assert_eq!(state.previous_focused_hwnd, Some(300));

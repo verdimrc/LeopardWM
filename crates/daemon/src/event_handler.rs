@@ -2372,7 +2372,25 @@ impl AppState {
             self.pending_last_window_departure = None;
             "not_inferable"
         };
-        let suppressed = matches!(outcome, "exact_replacement" | "bound_inferred");
+        // Closing the last window keeps its empty workspace: whatever Windows
+        // activates elsewhere right after the close is ignored, however its
+        // timestamp compares. The guard is re-armed so later events are judged
+        // again.
+        let outcome = if matches!(outcome, "later_than_arm" | "not_inferable")
+            && intent.origin == LastWindowDepartureOrigin::DirectDestroyedOrHidden
+            && intent.set_at.elapsed()
+                < std::time::Duration::from_millis(u64::from(MINIMIZE_HANDOFF_WINDOW_MS))
+            && (monitor_id, ws_idx) != (intent.monitor, intent.workspace)
+        {
+            self.pending_last_window_departure = Some(intent);
+            "within_close_handoff_window"
+        } else {
+            outcome
+        };
+        let suppressed = matches!(
+            outcome,
+            "exact_replacement" | "bound_inferred" | "within_close_handoff_window"
+        );
         debug!(
             target: "leopardwm::event_handler",
             hwnd,

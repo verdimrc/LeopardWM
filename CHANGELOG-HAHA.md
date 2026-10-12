@@ -88,6 +88,7 @@
 
 ### Fixes
 
+- Closing the last window on a workspace no longer switches away from it.
 - Tray-menu and hotkey/IPC-triggered config changes no longer silently overwrite `config.toml`.
 - A vacated column stays visible on the source monitor after moving a window away.
 - Wrong window targeted by commands after layout animation completes (briefly tested; no consistent repro
