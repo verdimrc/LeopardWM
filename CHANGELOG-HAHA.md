@@ -1,6 +1,6 @@
 # Changelog — haha branch
 
-## [Unreleased] — diff between `b2a6bf5` .. HEAD
+## [Unreleased] — diff between `c673836` .. HEAD
 
 ### Features
 
@@ -27,6 +27,8 @@
   presenter view.
 - Window rules support `launcher = true`: closing that launcher no longer switches to a window on a
   hidden workspace (e.g. `match_class = "^HwndWrapper\\[PowerToys\\.PowerLauncher"` for PowerToys Run).
+  - 📝 TODO: main's `4b50f58` ("keep apps launched on an empty workspace there") may make this
+    workaround unnecessary. Needs testing without the `launcher` rule before removing it.
 - Vertical monitor support:
   - Automatically detected from portrait orientation (height > width) — no configuration required; rotate
     the monitor in Windows Display Settings.

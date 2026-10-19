@@ -1223,8 +1223,6 @@ impl OverviewOverlay {
         panic!("OverviewOverlay::new spawns a top-level interactive window; gate the call behind cfg(test)");
         #[allow(unreachable_code)]
         {
-            state().event_tx = Some(event_tx);
-
             let (tx, rx) = mpsc::channel::<Result<(isize, u32), Win32Error>>();
             let thread = std::thread::Builder::new()
                 .name("overview-overlay".into())
@@ -1328,6 +1326,7 @@ impl OverviewOverlay {
                 }
             };
 
+            state().event_tx = Some(event_tx);
             Ok(Self {
                 hwnd: HWND(hwnd_raw as *mut c_void),
                 thread_id,
@@ -1808,6 +1807,7 @@ impl Drop for OverviewOverlay {
         if let Some(thread) = self._thread.take() {
             let _ = thread.join();
         }
+        state().event_tx.take();
     }
 }
 
