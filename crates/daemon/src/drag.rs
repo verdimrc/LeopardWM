@@ -1145,7 +1145,7 @@ impl AppState {
                 let vw = self
                     .monitors
                     .get(&target_monitor)
-                    .map(|m| m.work_area.width)
+                    .map(crate::monitors::monitor_viewport_width)
                     .unwrap_or(FALLBACK_VIEWPORT_WIDTH);
                 ws.ensure_focused_visible_animated(vw);
             }

@@ -1318,7 +1318,7 @@ impl AppState {
             };
             for workspace in workspaces {
                 if workspace.center_single_column() && workspace.fullscreen_window_id().is_none() {
-                    workspace.reconcile_scroll_bounds(monitor.work_area.width);
+                    workspace.reconcile_scroll_bounds(crate::monitors::monitor_viewport_width(monitor));
                 }
             }
         }

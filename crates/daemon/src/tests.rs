@@ -19927,6 +19927,87 @@ fn test_restore_center_single_column_runtime_setting() {
 }
 
 #[test]
+fn test_center_single_column_centers_along_the_height_on_portrait_monitors() {
+    let mut config = test_config();
+    config.layout.center_single_column = true;
+    let mut monitors = test_monitors();
+    monitors[0].rect = Rect::new(0, 0, 1080, 1920);
+    monitors[0].work_area = Rect::new(0, 0, 1080, 1920);
+    let mut state = AppState::new_with_config(config, monitors);
+    state.paused = false;
+    state.injected_apply_placements_behavior = Some(TestApplyPlacementsBehavior::SleepAndSucceed(
+        std::time::Duration::ZERO,
+    ));
+    let ws = &mut state.workspaces.get_mut(&1).unwrap()[0];
+    ws.insert_window(100, Some(960)).unwrap();
+    ws.set_reduce_motion(false);
+    state.apply_layout().unwrap();
+
+    let rect = state.last_placed_layout_rects[&100];
+    assert_eq!(rect.height, 960, "the column runs along the height");
+    let space_above = rect.y;
+    let space_below = 1920 - (rect.y + rect.height);
+    assert_eq!(space_above, space_below, "centered top to bottom: {rect:?}");
+}
+
+/// Layout code must measure a monitor along its scroll axis with
+/// `monitor_viewport_width` / `viewport_width_for`: on a portrait monitor that
+/// is its height. Reading `work_area.width` directly is only right where the
+/// physical width is meant (drawing, logging, floating windows). Upstream code
+/// does not know about portrait monitors, so a new read fails here until it is
+/// reviewed and either switched to the scroll-axis helpers or added below.
+#[test]
+fn test_raw_work_area_width_reads_are_reviewed() {
+    const REVIEWED: &[(&str, usize)] = &[
+        ("drag.rs", 1),
+        ("event_handler.rs", 1),
+        ("main.rs", 1),
+        ("monitors.rs", 4),
+        ("overview.rs", 4),
+        ("scratchpad.rs", 1),
+        ("state.rs", 1),
+    ];
+    fn collect(dir: &std::path::Path, counts: &mut std::collections::BTreeMap<String, usize>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                collect(&path, counts);
+                continue;
+            }
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            let is_test_file = name == "tests.rs"
+                || name.ends_with("_tests.rs")
+                || name.ends_with("_regression.rs");
+            if !name.ends_with(".rs") || is_test_file {
+                continue;
+            }
+            let reads = std::fs::read_to_string(&path)
+                .unwrap()
+                .matches("work_area.width")
+                .count();
+            if reads > 0 {
+                counts.insert(name, reads);
+            }
+        }
+    }
+    let mut counts = std::collections::BTreeMap::new();
+    collect(
+        std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src")),
+        &mut counts,
+    );
+    let reviewed: std::collections::BTreeMap<String, usize> = REVIEWED
+        .iter()
+        .map(|(name, count)| (name.to_string(), *count))
+        .collect();
+    assert_eq!(
+        counts, reviewed,
+        "raw work_area.width reads changed: on a portrait monitor the scroll axis is the \
+         height, so use monitor_viewport_width / viewport_width_for unless the physical \
+         width is really meant, then update REVIEWED"
+    );
+}
+
+#[test]
 fn test_center_single_column_toggle_off_repairs_first_placement() {
     let mut config = test_config();
     config.layout.center_single_column = true;
