@@ -6168,162 +6168,6 @@ fn age_past_close_handoff_window(state: &mut AppState) {
     }
 }
 
-/// Empty workspace 1 shown; window 200 on hidden workspace 2. Optionally a
-/// `launcher = true` rule for windows of class `LauncherClass`.
-fn launcher_rule_state(launcher_rule: bool) -> AppState {
-    let mut config = test_config();
-    if launcher_rule {
-        config.window_rules = vec![crate::config::WindowRule {
-            match_class: Some("^LauncherClass$".into()),
-            launcher: true,
-            ..Default::default()
-        }];
-    }
-    let mut state = AppState::new_with_config(config, test_monitors());
-    state.reduce_motion = false;
-    state.last_prune_at = Some(std::time::Instant::now());
-    state.injected_event_time_ms = Some(1_000);
-    state
-        .injected_window_info
-        .insert(200, make_test_window_info(200));
-    let mon = state.focused_monitor;
-    state.ensure_workspace_exists(mon, 1);
-    state.workspaces.get_mut(&mon).unwrap()[1]
-        .insert_window(200, Some(800))
-        .unwrap();
-    state
-        .window_managed_at
-        .insert(200, std::time::Instant::now());
-    state.injected_foreground_hwnd = Some(Some(200));
-    state
-}
-
-#[test]
-fn test_launcher_rule_keeps_workspace_when_launcher_closes() {
-    // (has launcher rule, window active before 200, still shown, stays on workspace 1)
-    for (rule, previous_class, previous_shown, stays) in [
-        (true, Some("LauncherClass"), false, true),
-        (true, Some("LauncherClass"), true, false),
-        (true, Some("OtherClass"), false, false),
-        (true, None, false, false),
-        (false, Some("LauncherClass"), false, false),
-    ] {
-        let mut state = launcher_rule_state(rule);
-        let mon = state.focused_monitor;
-        if let Some(class) = previous_class {
-            state.injected_foreground_predecessors.insert(
-                200,
-                leopardwm_platform_win32::ForegroundPredecessor {
-                    hwnd: 900,
-                    class: class.into(),
-                    title: String::new(),
-                    process_id: 0,
-                },
-            );
-            if previous_shown {
-                state.injected_visible_hwnds.insert(900);
-            }
-        }
-        state.handle_window_event(WindowEvent::Focused(200, 1_000));
-        let case = format!(
-            "rule={rule}, previous={previous_class:?}, previous_shown={previous_shown}"
-        );
-        assert_eq!(
-            state.active_workspace_idx(mon),
-            if stays { 0 } else { 1 },
-            "{case}"
-        );
-        assert_eq!(
-            state
-                .foreground_release_requests
-                .iter()
-                .any(|(hwnd, _)| *hwnd == 200),
-            stays,
-            "focus goes to the placeholder only when staying: {case}"
-        );
-    }
-}
-
-#[test]
-fn test_launcher_pick_versus_windows_filling_the_gap() {
-    use leopardwm_platform_win32::{ForegroundPredecessor, LastInput};
-    let predecessor = |hwnd: u64, class: &str| ForegroundPredecessor {
-        hwnd,
-        class: class.into(),
-        title: String::new(),
-        process_id: 0,
-    };
-    // Window 200 (hidden workspace 2) becomes active after launcher 900 closed;
-    // `before` was active before the launcher opened.
-    let state_with = |before: u64, input: LastInput| {
-        let mut state = launcher_rule_state(true);
-        state
-            .injected_foreground_predecessors
-            .insert(200, predecessor(900, "LauncherClass"));
-        state
-            .injected_foreground_predecessors
-            .insert(900, predecessor(before, "Notepad"));
-        state.injected_last_input = input;
-        state
-    };
-    const ESC: u32 = 0x1B;
-    const ENTER: u32 = 0x0D;
-
-    // A different window than before the launcher: the user's pick, follow now.
-    let mut state = state_with(300, LastInput::Key(ENTER));
-    let mon = state.focused_monitor;
-    state.handle_window_event(WindowEvent::Focused(200, 1_000));
-    assert_eq!(state.active_workspace_idx(mon), 1);
-
-    // The window from before the launcher after Esc: Windows filling the gap.
-    let mut state = state_with(200, LastInput::Key(ESC));
-    state.handle_window_event(WindowEvent::Focused(200, 1_000));
-    assert_eq!(state.active_workspace_idx(mon), 0);
-    assert_eq!(state.pending_launcher_follow, None);
-
-    // Clicking the desktop before opening the launcher: Windows skips the
-    // desktop and brings back 200, so it is still Windows filling the gap.
-    let mut state = state_with(800, LastInput::Key(ESC));
-    state
-        .injected_foreground_predecessors
-        .insert(900, predecessor(800, "Progman"));
-    state
-        .injected_foreground_predecessors
-        .insert(800, predecessor(200, "Notepad"));
-    state.handle_window_event(WindowEvent::Focused(200, 1_000));
-    assert_eq!(state.active_workspace_idx(mon), 0, "desktop is skipped");
-
-    // The window from before the launcher after Enter or a click: wait, then
-    // follow if no new window opened, or stay if one did.
-    for input in [LastInput::Key(ENTER), LastInput::Click] {
-        for new_window_opened in [false, true] {
-            let mut state = state_with(200, input);
-            state.handle_window_event(WindowEvent::Focused(200, 1_000));
-            assert_eq!(state.active_workspace_idx(mon), 0, "waits first");
-            assert!(state.pending_launcher_follow.is_some());
-            assert!(
-                !state.resolve_pending_launcher_follow(),
-                "not before the wait"
-            );
-
-            let picked_at = std::time::Instant::now() - crate::event_handler::LAUNCHER_PICK_WAIT;
-            state.pending_launcher_follow = Some((200, picked_at));
-            if new_window_opened {
-                state.last_window_admitted_at = Some(std::time::Instant::now());
-            }
-            let switched = state.resolve_pending_launcher_follow();
-            let case = format!("input={input:?}, new_window_opened={new_window_opened}");
-            assert_eq!(switched, !new_window_opened, "{case}");
-            assert_eq!(
-                state.active_workspace_idx(mon),
-                if new_window_opened { 0 } else { 1 },
-                "{case}"
-            );
-            assert_eq!(state.pending_launcher_follow, None, "{case}");
-        }
-    }
-}
-
 #[test]
 fn test_last_window_close_keeps_empty_workspace_for_late_handoff() {
     // Windows activates a window on another workspace slightly after the
@@ -8658,7 +8502,6 @@ fn test_window_rule_matching_class() {
             open_in_column: None,
             sticky: false,
             new_window_monitor: None,
-            launcher: false,
             match_max_width: None,
             match_max_height: None,
         }],
@@ -8686,7 +8529,6 @@ fn test_window_rule_matching_title() {
             open_in_column: None,
             sticky: false,
             new_window_monitor: None,
-            launcher: false,
             match_max_width: None,
             match_max_height: None,
         }],
@@ -8715,7 +8557,6 @@ fn test_window_rule_matching_executable() {
             open_in_column: None,
             sticky: false,
             new_window_monitor: None,
-            launcher: false,
             match_max_width: None,
             match_max_height: None,
         }],
@@ -8750,7 +8591,6 @@ fn test_floating_rect_uses_rule_dimensions() {
             open_in_column: None,
             sticky: false,
             new_window_monitor: None,
-            launcher: false,
             match_max_width: None,
             match_max_height: None,
         }],
@@ -8781,7 +8621,6 @@ fn test_floating_rect_preserves_original_if_no_dimensions() {
             open_in_column: None,
             sticky: false,
             new_window_monitor: None,
-            launcher: false,
             match_max_width: None,
             match_max_height: None,
         }],

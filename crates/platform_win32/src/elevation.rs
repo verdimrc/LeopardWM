@@ -156,7 +156,7 @@ pub fn window_manage_block(hwnd: u64) -> ManageBlock {
     }
 }
 
-pub(crate) fn window_process_id(hwnd: u64) -> Option<u32> {
+fn window_process_id(hwnd: u64) -> Option<u32> {
     let mut pid = 0u32;
     unsafe {
         GetWindowThreadProcessId(HWND(hwnd as *mut core::ffi::c_void), Some(&mut pid));

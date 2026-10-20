@@ -18,23 +18,6 @@ use leopardwm_platform_win32::{
 use tracing::{debug, info, warn};
 
 pub(crate) const MINIMIZE_HANDOFF_WINDOW_MS: u32 = 500; // Windows timestamps post-minimize focus handoff events after the minimize.
-/// How long to wait before following a window picked from a launcher that is
-/// also the window from before it. When the launcher starts a new app, Windows
-/// first brings back the previous window; the new app's window appeared up to
-/// 0.47 s later in tests.
-pub(crate) const LAUNCHER_PICK_WAIT: std::time::Duration = std::time::Duration::from_millis(600);
-const VK_RETURN: u32 = 0x0D;
-
-/// How to treat a window becoming active right after a launcher closed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum LauncherActivation {
-    Follow,
-    /// Windows filling the gap after the launcher closed: don't switch.
-    Stay,
-    /// Possibly the user's pick: follow after `LAUNCHER_PICK_WAIT` unless a
-    /// new window opens meanwhile.
-    FollowUnlessNewWindow,
-}
 
 /// How long after a window is first managed to treat it as still settling its
 /// initial geometry.
@@ -1425,7 +1408,6 @@ impl AppState {
                             }
                         }
                     }
-                    self.last_window_admitted_at = Some(std::time::Instant::now());
                     return if layout_failed {
                         AdmitOutcome::AdmittedPlacementFailed
                     } else {
@@ -1971,123 +1953,6 @@ impl AppState {
             hwnd
         );
         true
-    }
-
-    fn foreground_predecessor(
-        &self,
-        hwnd: u64,
-    ) -> Option<leopardwm_platform_win32::ForegroundPredecessor> {
-        #[cfg(test)]
-        return self.injected_foreground_predecessors.get(&hwnd).cloned();
-        #[cfg(not(test))]
-        leopardwm_platform_win32::foreground_predecessor(hwnd)
-    }
-
-    /// How to treat `hwnd` becoming active, given what was active before it.
-    ///
-    /// When a `launcher = true` window closes or hides itself, Windows
-    /// activates the window that was active before the launcher opened. If
-    /// `hwnd` is a different window, the user picked it from the launcher. If
-    /// it is that same window, it is Windows filling the gap after Esc (or any
-    /// key but Enter); after Enter or a click it may be the user's pick, or the
-    /// gap before a newly launched app's window appears.
-    fn launcher_activation(&self, hwnd: u64) -> LauncherActivation {
-        if !self.compiled_rules.iter().any(|rule| rule.launcher) {
-            return LauncherActivation::Follow;
-        }
-        let Some(launcher) = self.foreground_predecessor(hwnd) else {
-            return LauncherActivation::Follow;
-        };
-        #[cfg(test)]
-        let still_shown = self.injected_visible_hwnds.contains(&launcher.hwnd);
-        #[cfg(not(test))]
-        let still_shown = leopardwm_platform_win32::is_window_visible(launcher.hwnd)
-            && !leopardwm_platform_win32::is_window_shell_cloaked(launcher.hwnd);
-        if still_shown {
-            return LauncherActivation::Follow;
-        }
-        let executable = if launcher.process_id == 0 {
-            String::new()
-        } else {
-            get_process_executable(launcher.process_id).unwrap_or_default()
-        };
-        let is_launcher = self.compiled_rules.iter().any(|rule| {
-            rule.launcher && rule.matches(&launcher.class, &launcher.title, &executable, None)
-        });
-        if !is_launcher {
-            return LauncherActivation::Follow;
-        }
-        if self
-            .window_windows_returns_to(launcher.hwnd)
-            .is_some_and(|before| before != hwnd)
-        {
-            return LauncherActivation::Follow;
-        }
-        #[cfg(test)]
-        let last_input = self.injected_last_input;
-        #[cfg(not(test))]
-        let last_input = leopardwm_platform_win32::last_input();
-        match last_input {
-            leopardwm_platform_win32::LastInput::Key(VK_RETURN)
-            | leopardwm_platform_win32::LastInput::Click => {
-                LauncherActivation::FollowUnlessNewWindow
-            }
-            _ => LauncherActivation::Stay,
-        }
-    }
-
-    /// The window Windows brings back when `launcher` closes: the last window
-    /// active before it, skipping the desktop and taskbar, which Windows never
-    /// returns focus to.
-    fn window_windows_returns_to(&self, launcher: u64) -> Option<u64> {
-        const SHELL_CLASSES: [&str; 4] = [
-            "Progman",
-            "WorkerW",
-            "Shell_TrayWnd",
-            "Shell_SecondaryTrayWnd",
-        ];
-        let mut hwnd = launcher;
-        for _ in 0..8 {
-            let before = self.foreground_predecessor(hwnd)?;
-            if !SHELL_CLASSES.contains(&before.class.as_str()) {
-                return Some(before.hwnd);
-            }
-            hwnd = before.hwnd;
-        }
-        None
-    }
-
-    /// Follow a window picked from a launcher once `LAUNCHER_PICK_WAIT` has
-    /// passed, unless a new window opened meanwhile (then it was only Windows
-    /// filling the gap before that window appeared). Returns whether it
-    /// switched workspaces.
-    pub(crate) fn resolve_pending_launcher_follow(&mut self) -> bool {
-        let Some((hwnd, picked_at)) = self.pending_launcher_follow else {
-            return false;
-        };
-        if picked_at.elapsed() < LAUNCHER_PICK_WAIT {
-            return false;
-        }
-        self.pending_launcher_follow = None;
-        if self
-            .last_window_admitted_at
-            .is_some_and(|admitted_at| admitted_at >= picked_at)
-        {
-            return false;
-        }
-        #[cfg(test)]
-        let foreground = self.injected_foreground_hwnd.flatten();
-        #[cfg(not(test))]
-        let foreground = leopardwm_platform_win32::get_foreground_window();
-        if foreground != Some(hwnd) {
-            return false;
-        }
-        let before = self.find_window_workspace(hwnd);
-        self.launcher_follow_bypass = Some(hwnd);
-        let event_time_ms = self.event_time_now_ms();
-        self.handle_window_event(WindowEvent::Focused(hwnd, event_time_ms));
-        self.launcher_follow_bypass = None;
-        before.is_some_and(|(monitor, ws_idx)| self.active_workspace_idx(monitor) == ws_idx)
     }
 
     fn follow_workspace_without_stealing_focus(
@@ -2845,29 +2710,6 @@ impl AppState {
                 ws_idx,
             ) {
                 return;
-            }
-            if ws_idx != self.active_workspace_idx(monitor_id)
-                && self.launcher_follow_bypass != Some(hwnd)
-            {
-                match self.launcher_activation(hwnd) {
-                    LauncherActivation::Follow => {}
-                    LauncherActivation::Stay => {
-                        debug!(
-                            "Not following window {} to a hidden workspace: Windows activated it after a launcher closed",
-                            hwnd
-                        );
-                        self.release_parked_foreground();
-                        return;
-                    }
-                    LauncherActivation::FollowUnlessNewWindow => {
-                        debug!(
-                            "Window {} picked from a launcher is the window from before it; following unless a new window opens",
-                            hwnd
-                        );
-                        self.pending_launcher_follow = Some((hwnd, std::time::Instant::now()));
-                        return;
-                    }
-                }
             }
             self.follow_workspace_without_stealing_focus(
                 monitor_id,
