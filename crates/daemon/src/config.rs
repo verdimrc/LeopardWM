@@ -442,6 +442,9 @@ pub struct BehaviorConfig {
 
     pub new_window_monitor: NewWindowMonitor,
 
+    /// Width a tiled window gets when it moves to another monitor.
+    pub new_width_on_monitor_move: NewWidthOnMonitorMove,
+
     /// Whether to track window focus changes from Windows.
     #[serde(default = "default_true")]
     pub track_focus_changes: bool,
@@ -536,6 +539,21 @@ pub struct BehaviorConfig {
     pub skip_empty_workspaces: bool,
 }
 
+/// Width a tiled window gets when it moves to another monitor.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NewWidthOnMonitorMove {
+    /// The target monitor's default width, as upstream does.
+    #[default]
+    Upstream,
+    /// The same share of the screen as on the source monitor (move-to-monitor
+    /// hotkey; a window dragged onto another monitor gets the default width).
+    SameProportionAsSourceMonitor,
+    /// The width a newly opened window would get there: its window rule's
+    /// `column_width` for that monitor, else the monitor's default width.
+    WindowRuleWidthOrDefaultWidth,
+}
+
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum NewWindowMonitor {
@@ -563,6 +581,7 @@ impl Default for BehaviorConfig {
         Self {
             focus_new_windows: true,
             new_window_monitor: NewWindowMonitor::default(),
+            new_width_on_monitor_move: NewWidthOnMonitorMove::default(),
             track_focus_changes: true,
             log_level: default_log_level(),
             focus_follows_mouse: false,
@@ -3539,6 +3558,36 @@ default_width_preset_monitor_overrides = { "01" = 2, "0" = 2, "main" = 2, "2" = 
         assert_eq!(config.window_rules[0].new_window_monitor, None);
         assert_eq!(compiled[0].new_window_monitor, None);
         assert_eq!(compiled[1].new_window_monitor, Some(NewWindowMonitor::Cursor));
+    }
+
+    #[test]
+    fn test_new_width_on_monitor_move_defaults_and_roundtrips() {
+        assert_eq!(
+            Config::default().behavior.new_width_on_monitor_move,
+            NewWidthOnMonitorMove::Upstream
+        );
+        for (value, expected) in [
+            ("upstream", NewWidthOnMonitorMove::Upstream),
+            (
+                "same_proportion_as_source_monitor",
+                NewWidthOnMonitorMove::SameProportionAsSourceMonitor,
+            ),
+            (
+                "window_rule_width_or_default_width",
+                NewWidthOnMonitorMove::WindowRuleWidthOrDefaultWidth,
+            ),
+        ] {
+            let text = format!("[behavior]\nnew_width_on_monitor_move = \"{value}\"\n");
+            let config: Config = toml::from_str(&text).unwrap();
+            assert_eq!(config.behavior.new_width_on_monitor_move, expected);
+            let saved = toml::to_string_pretty(&config).unwrap();
+            let reloaded: Config = toml::from_str(&saved).unwrap();
+            assert_eq!(reloaded.behavior.new_width_on_monitor_move, expected);
+        }
+        assert!(toml::from_str::<Config>(
+            "[behavior]\nnew_width_on_monitor_move = \"proportional\"\n"
+        )
+        .is_err());
     }
 
     #[test]

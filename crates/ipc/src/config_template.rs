@@ -78,6 +78,15 @@ focus_new_windows = true
 # Sticky windows keep their existing placement.
 new_window_monitor = "opening"
 
+# Width of a tiled window that becomes a new column on another monitor (moved
+# with the hotkey, Shift+dragged, or dragged onto a monitor with no windows):
+# - "upstream" (default): the target monitor's default width (Shift+drag keeps
+#   the column's width). Window rules' column_width is not used.
+# - "same_proportion_as_source_monitor": the same share of the screen as before.
+# - "window_rule_width_or_default_width": the width a newly opened window would
+#   get there, i.e. its window rule's column_width, else the default width.
+new_width_on_monitor_move = "upstream"
+
 # Track focus changes from Windows (sync with Alt-Tab, etc.)
 # Changes to focus tracking hooks take effect the next time LeopardWM starts.
 track_focus_changes = true

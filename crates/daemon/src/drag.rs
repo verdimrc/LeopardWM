@@ -4,7 +4,8 @@ use crate::state::{
     AppState, DragHintAction, DragPreviewMode, DragState, DropTarget, DRAG_PLACEHOLDER_HWND,
     FALLBACK_VIEWPORT_WIDTH,
 };
-use leopardwm_core_layout::{Rect, Visibility};
+use crate::window_rules::MovedColumnWidth;
+use leopardwm_core_layout::{Rect, Visibility, Workspace};
 use leopardwm_platform_win32::{find_monitor_for_rect, is_shift_key_pressed, MonitorId};
 use tracing::{debug, info, warn};
 
@@ -934,6 +935,13 @@ impl AppState {
 
         // Snapshot AFTER all early returns, right before structural changes.
         let snapshot = self.snapshot_layout();
+        let new_width = self.moved_column_width(
+            hwnd,
+            source_monitor,
+            src_ws_idx,
+            &drag.source_column_peers,
+            target_monitor,
+        );
 
         // Remove the window from its source column (skip if already removed during drag).
         if !already_removed {
@@ -964,6 +972,7 @@ impl AppState {
         };
 
         // Add window to the target column at the computed slot.
+        let target_vw = self.viewport_width_for(target_monitor);
         let tgt_mut_idx = self.active_workspace_idx(target_monitor);
         if let Some(workspace) = self
             .workspaces
@@ -971,7 +980,7 @@ impl AppState {
             .and_then(|v| v.get_mut(tgt_mut_idx))
         {
             if workspace.column_count() == 0 {
-                let _ = workspace.insert_window(hwnd, None);
+                insert_moved_column(workspace, hwnd, new_width, target_vw);
             } else {
                 // Chrome semantics: drops into a Tabbed column always
                 // append at the rightmost position, even when the drop
@@ -997,7 +1006,7 @@ impl AppState {
                         "Failed to merge window {} into column {} at slot {}: {}",
                         hwnd, effective_target_col, effective_slot, e
                     );
-                    let _ = workspace.insert_window(hwnd, None);
+                    insert_moved_column(workspace, hwnd, new_width, target_vw);
                 }
             }
             // Drop activates the inserted window in both Vertical and
@@ -1057,6 +1066,13 @@ impl AppState {
         if let Some((ph_col, ph_slot)) = placeholder_location {
             // Capture source column info BEFORE any removals.
             let src_ws_idx = drag.source_workspace_idx;
+            let new_width = self.moved_column_width(
+                hwnd,
+                source_monitor,
+                src_ws_idx,
+                &drag.source_column_peers,
+                target_monitor,
+            );
             let src_info = if !drag.removed_from_source && target_monitor == source_monitor {
                 self.workspaces
                     .get(&source_monitor)
@@ -1108,13 +1124,14 @@ impl AppState {
             };
 
             // Insert real window at the placeholder's former position.
+            let target_vw = self.viewport_width_for(target_monitor);
             if let Some(ws) = self
                 .workspaces
                 .get_mut(&target_monitor)
                 .and_then(|v| v.get_mut(tgt_idx))
             {
                 if ws.column_count() == 0 {
-                    let _ = ws.insert_window(hwnd, None);
+                    insert_moved_column(ws, hwnd, new_width, target_vw);
                 } else {
                     // Chrome semantics: Tabbed drops always append to
                     // the rightmost position. The placeholder slot
@@ -1133,7 +1150,7 @@ impl AppState {
                             "Failed to place window {} at col {} slot {}: {}",
                             hwnd, adj_col, effective_slot, e
                         );
-                        let _ = ws.insert_window(hwnd, None);
+                        insert_moved_column(ws, hwnd, new_width, target_vw);
                     }
                 }
                 // Drop activates the inserted window for both Vertical
@@ -1253,6 +1270,11 @@ impl AppState {
             return;
         }
 
+        // Width of the column on the target monitor, per
+        // `behavior.new_width_on_monitor_move` (same as the move-to-monitor
+        // hotkey). Read before the column leaves the source workspace.
+        let new_width = self.moved_column_width(hwnd, source_monitor, src_idx, &[], target_monitor);
+
         // Remove column from source workspace.
         let column = match self
             .workspaces
@@ -1290,6 +1312,9 @@ impl AppState {
                     "Failed to focus moved window after cross-monitor drag: {}",
                     e
                 );
+            }
+            if let Some(new_width) = new_width {
+                new_width.apply_to_focused_column(target_ws, target_viewport.width);
             }
             target_ws.ensure_focused_visible_animated(target_viewport.width);
         }
@@ -1338,6 +1363,21 @@ struct ColumnBound {
 /// reported `screen_left` to a huge negative number, and the "first
 /// matching bound" pick in `compute_target_column_index` would then claim
 /// any cursor to the left of the tabbed column as belonging to it.
+/// Insert a dropped `hwnd` as a new column of `ws`, sized per
+/// `behavior.new_width_on_monitor_move` (`None`: the default width).
+fn insert_moved_column(
+    ws: &mut Workspace,
+    hwnd: u64,
+    new_width: Option<MovedColumnWidth>,
+    viewport_width: i32,
+) {
+    if ws.insert_window(hwnd, None).is_ok() {
+        if let Some(new_width) = new_width {
+            new_width.apply_to_focused_column(ws, viewport_width);
+        }
+    }
+}
+
 fn column_bounds_from_placements(
     workspace: &leopardwm_core_layout::Workspace,
     viewport: Rect,

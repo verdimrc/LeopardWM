@@ -3,13 +3,38 @@
 use crate::config;
 use crate::state::*;
 use anyhow::Result;
-use leopardwm_core_layout::Rect;
+use leopardwm_core_layout::{Rect, Workspace};
 #[cfg(not(test))]
 use leopardwm_platform_win32::enumerate_windows;
 use leopardwm_platform_win32::{
     find_monitor_for_rect, get_process_executable, scale_px, MonitorId, WindowInfo,
 };
 use tracing::{debug, info, warn};
+
+/// Width of a column moved or dragged onto another monitor, per
+/// `behavior.new_width_on_monitor_move` (see `moved_column_width`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum MovedColumnWidth {
+    /// The same share of the target viewport it had of the source viewport.
+    Fraction(f64),
+    /// The window rule's width in px, or `None` for the target's default width.
+    Px(Option<i32>),
+}
+
+impl MovedColumnWidth {
+    /// Size `workspace`'s focused column (the one just moved in).
+    pub(crate) fn apply_to_focused_column(self, workspace: &mut Workspace, viewport_width: i32) {
+        match self {
+            Self::Fraction(fraction) => {
+                workspace.restore_focused_column_width_fraction(fraction, viewport_width)
+            }
+            Self::Px(px) => {
+                let width = px.unwrap_or(workspace.default_column_width());
+                workspace.set_focused_column_width(width);
+            }
+        }
+    }
+}
 
 impl AppState {
     /// Apply changed rule outcomes to managed windows, preserving manual overrides
@@ -436,6 +461,72 @@ impl AppState {
         self.matched_rule(class_name, title, executable, size)
             .map(|r| r.action)
             .unwrap_or(config::WindowAction::Tile)
+    }
+
+    /// A rule's `column_width` in px on `monitor_id`, or `None` when the rule
+    /// sets none for that monitor (the monitor's default width applies).
+    pub(crate) fn rule_column_width_px(
+        &self,
+        rule_column_width: Option<&config::CompiledColumnWidth>,
+        monitor_id: MonitorId,
+        viewport_width: i32,
+    ) -> Option<i32> {
+        let display_idx = self.display_index_for(monitor_id);
+        rule_column_width
+            .and_then(|cw| cw.resolve(display_idx))
+            .map(|f| ((f * f64::from(viewport_width)).round() as i32).max(100))
+    }
+
+    /// Column width in px for a managed window landing on `monitor_id` (moved
+    /// or dragged there): the same width a newly opened window would get, so
+    /// its matched rule's `column_width`, or `None` for the monitor's default.
+    pub(crate) fn landing_column_width_px(&self, hwnd: u64, monitor_id: MonitorId) -> Option<i32> {
+        let info = self.lookup_window_info(hwnd)?;
+        let executable = get_process_executable(info.process_id).unwrap_or_default();
+        let rule = self.matched_rule(
+            &info.class_name,
+            &info.title,
+            &executable,
+            Some(self.window_rule_size(&info.rect)),
+        )?;
+        self.rule_column_width_px(
+            rule.column_width.as_ref(),
+            monitor_id,
+            self.viewport_width_for(monitor_id),
+        )
+    }
+
+    /// Width of the column `hwnd` gets when moved or dragged onto another
+    /// monitor as a new column, per `behavior.new_width_on_monitor_move`, or
+    /// `None` in `Upstream` mode (and when `target_monitor` is the source
+    /// monitor), where the caller keeps main's behavior. Call it before
+    /// `hwnd` leaves the source workspace; if it already left (a drag that
+    /// took it out of a stacked column), `source_peers` locate that column.
+    pub(crate) fn moved_column_width(
+        &self,
+        hwnd: u64,
+        source_monitor: MonitorId,
+        source_ws_idx: usize,
+        source_peers: &[u64],
+        target_monitor: MonitorId,
+    ) -> Option<MovedColumnWidth> {
+        if target_monitor == source_monitor {
+            return None;
+        }
+        match self.config.behavior.new_width_on_monitor_move {
+            config::NewWidthOnMonitorMove::Upstream => None,
+            config::NewWidthOnMonitorMove::SameProportionAsSourceMonitor => {
+                let ws = self.workspaces.get(&source_monitor)?.get(source_ws_idx)?;
+                let viewport_width = self.viewport_width_for(source_monitor);
+                std::iter::once(&hwnd)
+                    .chain(source_peers)
+                    .find_map(|&w| ws.column_width_fraction_for_window(w, viewport_width))
+                    .map(MovedColumnWidth::Fraction)
+            }
+            config::NewWidthOnMonitorMove::WindowRuleWidthOrDefaultWidth => Some(
+                MovedColumnWidth::Px(self.landing_column_width_px(hwnd, target_monitor)),
+            ),
+        }
     }
 
     /// The first window rule matching this window, if any (first match wins).

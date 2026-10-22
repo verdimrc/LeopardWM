@@ -224,14 +224,23 @@ impl Workspace {
         fraction: f64,
         viewport_width: i32,
     ) -> Result<(), LayoutError> {
+        self.insert_window(window_id, None)?;
+        self.restore_focused_column_width_fraction(fraction, viewport_width);
+        Ok(())
+    }
+
+    /// Size the focused column to `fraction` of this viewport, as returned by
+    /// `column_width_fraction_for_window`, and cache the exact fraction on the
+    /// column. A fraction above 1.0 is capped so the column fits the viewport.
+    pub fn restore_focused_column_width_fraction(&mut self, fraction: f64, viewport_width: i32) {
         let fraction = fraction.min(1.0);
         let base = self.width_base(viewport_width).max(1);
         let gap = self.gap.max(0);
         let width = (base as f64 * fraction - gap as f64)
             .round()
             .clamp(MIN_COLUMN_WIDTH as f64, i32::MAX as f64) as i32;
-        self.insert_window(window_id, Some(width))?;
         if let Some(column) = self.columns.get_mut(self.focused_column) {
+            column.set_width(width);
             column.width_fraction_cache = Some(crate::column::WidthFractionCache {
                 fraction,
                 width: column.width,
@@ -239,7 +248,13 @@ impl Workspace {
                 gap,
             });
         }
-        Ok(())
+    }
+
+    /// Set the focused column's width in pixels (at least `MIN_COLUMN_WIDTH`).
+    pub fn set_focused_column_width(&mut self, width: i32) {
+        if let Some(column) = self.columns.get_mut(self.focused_column) {
+            column.set_width(width);
+        }
     }
 
     /// Equalize all column widths to share the viewport equally.

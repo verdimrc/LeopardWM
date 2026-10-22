@@ -52,6 +52,16 @@
   (e.g. `column_width = { "1" = 0.5, "2" = 2 }`) in addition to the existing viewport
   fraction. Map keys are quoted Windows display indices (`"1"` = `\\.\DISPLAY1`). Useful
   when the same app needs a different initial width on each monitor.
+- `behavior.new_width_on_monitor_move` sets the width a tiled window gets when it becomes a new column
+  on another monitor, whether moved with the hotkey or dragged (Shift+drag, or a drag onto a monitor
+  with no windows):
+  - `"upstream"` (default): main's behavior. The window gets the target monitor's default width
+    (Shift+drag keeps the column's width). It does not use the window rule's `column_width`.
+  - `"same_proportion_as_source_monitor"`: the same share of the screen as on the source monitor.
+  - `"window_rule_width_or_default_width"`: the width it would get if opened there: the window rule's
+    `column_width`, else the default width.
+
+  A window dragged into an existing column takes that column's width, in every mode.
 - `layout.default_width_preset_monitor_overrides` lets each monitor open new columns at its
   own width preset (e.g. `default_width_preset_monitor_overrides = { "2" = 3 }`). Keys are
   Windows display numbers; monitors not listed use `layout.default_width_preset`.
@@ -85,6 +95,7 @@
 | Window rule: `column_width` (extended) | `f64 \| u32 \| { "N" = f64\|u32 }` | (none) | Now accepts a preset index or a per-display-index map in addition to a viewport fraction. ⚠️ [Known issue with GUI settings](#known-issues-with-gui-settings) |
 | `hotkeys.toggle_new_window_placement_once` | `string` | `"Ctrl+Alt+Shift+N"` | Activate a one-shot new-window-placement override for the next window only. |
 | `behavior.new_window_monitor` (extended) | `"opening" \| "focused" \| "cursor"` | `"opening"` | Adds `"cursor"`: open new windows on the monitor under the mouse cursor. |
+| `behavior.new_width_on_monitor_move` | `"upstream" \| "same_proportion_as_source_monitor" \| "window_rule_width_or_default_width"` | `"upstream"` | Width of a tiled window moved to another monitor. ⚠️ [Known issue with GUI settings](#known-issues-with-gui-settings) |
 
 ### Fixes
 
@@ -94,14 +105,10 @@
 - Wrong window targeted by commands after layout animation completes (briefly tested; no consistent repro
   trigger).
 - Window resizing after opening a new window now targets the focused window.
-- Moving a window to another monitor now scales its column width proportionally to the target monitor's
-  viewport width, instead of resetting to a default width.
 - Cross-monitor window moves:
   - Fixed: after moving a window to a new monitor, monitor-focus shortcuts must also focus the new monitor.
   - Fixed apps never joining the tiled layout when they don't report their initial window position.
   - Fixed incorrect sizing when moving to a monitor with different DPI scaling.
-  - Fixed a window appearing wider than the target monitor (off-screen on both edges) when moving to a
-    narrower monitor.
 
   Note: main's `ed2f51f` and `00e9b66` fix DPI rescaling on display-settings changes and floating/monitor-removal
   edge cases; these are different bugs than the ones above.
@@ -117,5 +124,6 @@ doesn't show are reset or removed:
 | `layout.desktop_peek_min_width` | Reset to `0.25`. |
 | `behavior.notify_elevation_blocked` | Reset to `true`. |
 | `behavior.symmetric_modifiers` | Reset to `false`. |
+| `behavior.new_width_on_monitor_move` | Reset to `"upstream"`. |
 | `layout.default_width_preset_monitor_overrides` | Removed. |
 | Window rule: `column_width` (extended) | Fractions and preset index `1` are kept; preset index `2` or higher and per-display maps are removed. |

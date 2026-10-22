@@ -561,25 +561,22 @@ impl AppState {
                 .add_floating(window_id, translated_rect)
                 .map_err(|e| format!("Failed to add floating window to target: {}", e))?;
         } else {
-            // Carry the column's width as a fraction of the viewport, so the
-            // window keeps its proportion on the target monitor. The exact
-            // fraction stays cached, so moving back and forth doesn't drift.
-            let fraction = source_workspace.column_width_fraction_for_window(
-                window_id,
-                self.viewport_width_for(source_monitor),
-            );
+            // In "same proportion" mode the exact fraction stays cached on
+            // the column, so moving back and forth doesn't drift.
+            let new_width =
+                self.moved_column_width(window_id, source_monitor, src_idx, &[], target_monitor);
             source_workspace
                 .remove_window(window_id)
                 .map_err(|e| format!("Failed to remove window: {}", e))?;
-            let inserted = match fraction {
-                Some(fraction) => target_workspace.insert_window_with_width_fraction(
-                    window_id,
-                    fraction,
+            target_workspace
+                .insert_window(window_id, None)
+                .map_err(|e| format!("Failed to add window to target: {}", e))?;
+            if let Some(new_width) = new_width {
+                new_width.apply_to_focused_column(
+                    &mut target_workspace,
                     self.viewport_width_for(target_monitor),
-                ),
-                None => target_workspace.insert_window(window_id, None),
-            };
-            inserted.map_err(|e| format!("Failed to add window to target: {}", e))?;
+                );
+            }
         }
 
         let target_viewport = self.viewport_width_for(target_monitor);

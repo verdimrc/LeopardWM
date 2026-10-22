@@ -772,16 +772,11 @@ impl AppState {
         monitor_id: leopardwm_platform_win32::MonitorId,
         viewport_width: i32,
     ) -> Option<i32> {
-        let display_idx = self.display_index_for(monitor_id);
-        let rule_px = || {
-            rule_column_width
-                .and_then(|cw| cw.resolve(display_idx))
-                .map(|f| ((f * f64::from(viewport_width)).round() as i32).max(100))
-        };
+        let rule_px = self.rule_column_width_px(rule_column_width, monitor_id, viewport_width);
         if kind == AdmissionKind::ExplicitReadmit {
-            rule_px()
+            rule_px
         } else {
-            self.take_remembered_column_width(hwnd).or_else(rule_px)
+            self.take_remembered_column_width(hwnd).or(rule_px)
         }
     }
 

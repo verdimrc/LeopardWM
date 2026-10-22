@@ -10166,6 +10166,142 @@ fn test_cmd_move_to_monitor_right_single() {
     assert_eq!(resp, IpcResponse::Ok); // no-op: no monitor to the right
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum MoveBy {
+    Hotkey,
+    /// Shift+drag: the whole column moves.
+    ShiftDrag,
+    /// Plain drag onto a monitor with no windows.
+    Drag,
+}
+
+#[test]
+fn test_move_to_monitor_width_follows_new_width_on_monitor_move() {
+    use crate::config::NewWidthOnMonitorMove::*;
+    for (mode, move_by) in [
+        Upstream,
+        SameProportionAsSourceMonitor,
+        WindowRuleWidthOrDefaultWidth,
+    ]
+    .into_iter()
+    .flat_map(|mode| [MoveBy::Hotkey, MoveBy::ShiftDrag, MoveBy::Drag].map(|by| (mode, by)))
+    {
+        // (target work area, rule column_width fraction)
+        for (target_area, rule_fraction) in [
+            (Rect::new(1920, 0, 3440, 1440), None),
+            (Rect::new(1920, 0, 3440, 1440), Some(0.5)),
+            // Portrait: the width runs along the height (1920).
+            (Rect::new(1920, 0, 1080, 1920), None),
+            (Rect::new(1920, 0, 1080, 1920), Some(0.5)),
+        ] {
+            let width =
+                move_full_width_window_to_wider_monitor(mode, move_by, target_area, rule_fraction);
+            let case = format!(
+                "mode={mode:?}, by={move_by:?}, target={target_area:?}, rule={rule_fraction:?}"
+            );
+            match mode {
+                // Main's behavior: Shift+drag keeps the column's pixels.
+                Upstream if move_by == MoveBy::ShiftDrag => {
+                    assert_eq!(width.landed, 1920, "{case}")
+                }
+                Upstream => assert_eq!(width.landed, width.target_default, "{case}"),
+                SameProportionAsSourceMonitor => assert!(
+                    width.landed as f64 >= 0.95 * width.target_viewport as f64,
+                    "keeps 100% of the screen: {case}, landed={}",
+                    width.landed
+                ),
+                WindowRuleWidthOrDefaultWidth => {
+                    let expected = match rule_fraction {
+                        Some(fraction) => {
+                            (fraction * f64::from(width.target_viewport)).round() as i32
+                        }
+                        None => width.target_default,
+                    };
+                    assert_eq!(width.landed, expected, "{case}");
+                }
+            }
+        }
+    }
+}
+
+struct LandedWidth {
+    landed: i32,
+    target_default: i32,
+    target_viewport: i32,
+}
+
+/// Move a window filling a 1920-wide monitor to `target_area`, empty, as a
+/// new column, optionally with a `column_width` rule.
+fn move_full_width_window_to_wider_monitor(
+    mode: crate::config::NewWidthOnMonitorMove,
+    move_by: MoveBy,
+    target_area: Rect,
+    rule_fraction: Option<f64>,
+) -> LandedWidth {
+    let mut config = test_config();
+    config.behavior.new_width_on_monitor_move = mode;
+    if let Some(fraction) = rule_fraction {
+        config.window_rules = vec![crate::config::WindowRule {
+            match_class: Some("^TestWindowClass$".into()),
+            column_width: Some(config::ColumnWidthSpec::Uniform(
+                config::ColumnWidthValue::Fraction(fraction),
+            )),
+            ..Default::default()
+        }];
+    }
+    let mut monitors = two_monitors();
+    monitors[1].rect = target_area;
+    monitors[1].work_area = target_area;
+    let mut state = AppState::new_with_config(config, monitors);
+    state
+        .injected_window_info
+        .insert(100, make_test_window_info(100));
+    state.focused_monitor = 1;
+    // 100% of the 1920-wide source monitor.
+    state.workspaces.get_mut(&1).unwrap()[0]
+        .insert_window(100, Some(1920))
+        .unwrap();
+
+    let drop_rect = Rect::new(target_area.x + 100, target_area.y + 100, 800, 600);
+    let drag = DragState {
+        hwnd: 100,
+        is_tiled: true,
+        source_monitor: 1,
+        source_workspace_idx: 0,
+        source_window_slot: 0,
+        current_column_index: 0,
+        last_drop_target: None,
+        last_hint_update: None,
+        removed_from_source: false,
+        preview_mode: crate::state::DragPreviewMode::None,
+        target_column_peers: Vec::new(),
+        source_column_peers: Vec::new(),
+    };
+    match move_by {
+        MoveBy::Hotkey => {
+            let resp = state.handle_command(IpcCommand::MoveWindowToMonitorRight);
+            assert!(matches!(resp, IpcResponse::Ok), "{resp:?}");
+        }
+        MoveBy::ShiftDrag => state.execute_cross_monitor_drag(100, &drag, 2, &drop_rect),
+        MoveBy::Drag => {
+            // Dragging over the empty monitor previews the drop as a
+            // placeholder column there.
+            state.workspaces.get_mut(&2).unwrap()[0]
+                .insert_window(DRAG_PLACEHOLDER_HWND, None)
+                .unwrap();
+            state.finalize_drag_merge(100, &drag, 2, &drop_rect);
+        }
+    }
+
+    let target = &state.workspaces[&2][0];
+    assert!(target.contains_window(100), "{move_by:?} moved the window");
+    LandedWidth {
+        landed: target.columns()[0].width(),
+        target_default: target.default_column_width(),
+        target_viewport: state.viewport_width_for(2),
+    }
+}
+
 #[test]
 fn test_cmd_move_to_monitor_right_rollback_on_insert_failure() {
     let mut state = AppState::new_with_config(test_config(), two_monitors());
