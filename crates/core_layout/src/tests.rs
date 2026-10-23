@@ -139,6 +139,24 @@ mod tests {
                     .map(|i| (start + 300 * i, order[i as usize]))
                     .collect();
                 assert_eq!(placed, expected, "{case}");
+
+                // Without center_past_edges, Ctrl+Alt+C can't center columns
+                // that fit, so it leaves them where they sit.
+                for reduce_motion in [true, false] {
+                    ws.set_reduce_motion(reduce_motion);
+                    for id in 1..=3 {
+                        ws.focus_window(id).unwrap();
+                        ws.center_focused_column_animated(viewport.width);
+                        ws.stop_animation();
+                        let mut after: Vec<_> = ws
+                            .compute_placements(viewport)
+                            .iter()
+                            .map(|p| (p.rect.x, p.window_id))
+                            .collect();
+                        after.sort();
+                        assert_eq!(after, expected, "Ctrl+Alt+C on {id}: {case}");
+                    }
+                }
             }
         }
     }

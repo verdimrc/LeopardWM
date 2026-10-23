@@ -761,12 +761,13 @@ impl Workspace {
 
             self.animate_scroll_to(target, None, None);
         } else {
-            // Clamped — use the standard scroll animation path
+            // Clamped to the content edges, as when moving focus: columns that
+            // fit stay where they sit (left, or right when pinned right).
+            let (min_scroll, max_scroll) = self.edge_scroll_bounds(vis_w);
+            let target = self.clamp_scroll_offset(target, viewport_width, min_scroll, max_scroll);
             if self.reduce_motion {
                 self.stop_animation();
-                let max_scroll = (self.total_width() - vis_w).max(0);
-                self.scroll_offset =
-                    self.clamp_scroll_offset(target, viewport_width, 0.0, max_scroll as f64);
+                self.scroll_offset = target;
                 return;
             }
 

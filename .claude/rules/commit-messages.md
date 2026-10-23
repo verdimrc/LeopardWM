@@ -24,6 +24,12 @@ plain and humane: every word should carry what the user gets, or how they turn i
 ## Subject (one-liner)
 
 - Describe what the user experiences, in plain language. Not mechanics.
+- Humane AND complete. The trade-off is never humane vs complete — it's humane vs mechanical,
+  and humane always wins. Carry a condition in words a person would use, not as a stack of
+  qualifiers: `Ctrl+Alt+C no longer moves right-aligned windows to the left edge` ("right-aligned"
+  already says the windows fit), not `Ctrl+Alt+C no longer pulls windows that fit to the left edge
+  on RTL and right-aligned monitors`. Last check: read it aloud as if telling a teammate; if it
+  sounds like a spec, rewrite it.
 - No internal names: struct/function names, config keys, IPC variants, or internal concepts
   ("placeholder", "sentinel", "override", "fraction cache").
 - Exception: a new feature the user turns on with a config key. The subject names the key and
