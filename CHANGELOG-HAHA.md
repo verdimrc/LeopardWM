@@ -109,6 +109,8 @@
 - Wrong window targeted by commands after layout animation completes (briefly tested; no consistent repro
   trigger).
 - Window resizing after opening a new window now targets the focused window.
+- After Ctrl+Alt+C centers a window with `center_past_edges = true`, moving focus to a window that is
+  already fully visible no longer scrolls the screen back to the edge.
 - Cross-monitor window moves:
   - Fixed: after moving a window to a new monitor, monitor-focus shortcuts must also focus the new monitor.
   - Fixed apps never joining the tiled layout when they don't report their initial window position.

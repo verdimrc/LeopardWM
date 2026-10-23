@@ -74,22 +74,23 @@ mod tests {
                     if rtl {
                         continue;
                     }
-                    // A third column makes them overflow: start at the left
-                    // edge, then scroll only as far as needed.
+                    // A third column opened at the end makes them overflow,
+                    // 300 + 10 + 300 + 10 + 400 = 1020 wide, 60px over: it
+                    // touches the right edge, then the screen scrolls only as
+                    // far as needed.
+                    ws.focus_right();
                     ws.insert_window(3, Some(400)).unwrap();
-                    for _ in 0..3 {
-                        ws.focus_left();
+                    let mut offsets = vec![];
+                    for step in 0..3 {
+                        if step > 0 {
+                            ws.focus_left();
+                        }
+                        ws.ensure_focused_visible_animated(viewport.width);
+                        ws.stop_animation();
+                        offsets.push(ws.scroll_offset());
                     }
-                    ws.ensure_focused_visible_animated(viewport.width);
-                    ws.stop_animation();
-                    assert_eq!(ws.scroll_offset(), 0.0, "first column: {case}");
-                    for _ in 0..3 {
-                        ws.focus_right();
-                    }
-                    ws.ensure_focused_visible_animated(viewport.width);
-                    ws.stop_animation();
-                    // 300 + 10 + 300 + 10 + 400 = 1020 wide, 60px over.
-                    assert_eq!(ws.scroll_offset(), 60.0, "last column: {case}");
+                    // Third column, B (fully visible: no scroll), A.
+                    assert_eq!(offsets, vec![60.0, 60.0, 0.0], "{case}");
 
                     // Back to two columns: centered again.
                     ws.remove_window(3).unwrap();
@@ -97,6 +98,55 @@ mod tests {
                     ws.stop_animation();
                     assert_eq!(xs(&ws), centered_xs, "after removal: {case}");
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn test_focus_after_center_command_keeps_past_edge_scroll_when_visible() {
+        // Four 300px columns on a 1000px screen, no gaps: A 0-300, B 300-600,
+        // C 600-900, D 900-1200 (200px over).
+        for mode in [
+            CenteringMode::JustInView,
+            CenteringMode::OnOverflow,
+            CenteringMode::CenterColumnsWhenNarrower,
+        ] {
+            for reduce_motion in [false, true] {
+                let case = format!("mode={mode:?}, reduce_motion={reduce_motion}");
+                let mut ws = Workspace::new();
+                ws.set_gap(0);
+                ws.set_outer_gaps(0, 0, 0, 0);
+                ws.set_centering_mode(mode);
+                ws.set_center_past_edges(true);
+                ws.set_reduce_motion(reduce_motion);
+                for id in 1..=4 {
+                    ws.insert_window(id, Some(300)).unwrap();
+                }
+                let offset_after = |ws: &mut Workspace, focus: fn(&mut Workspace)| {
+                    focus(ws);
+                    ws.ensure_focused_visible_animated(1000);
+                    ws.stop_animation();
+                    ws.scroll_offset()
+                };
+
+                // Ctrl+Alt+C on D: D centered, 1050 - 500.
+                ws.center_focused_column_animated(1000);
+                ws.stop_animation();
+                assert_eq!(ws.scroll_offset(), 550.0, "{case}");
+                // C fully visible: no move. B cut off: scroll as far as needed.
+                let c = offset_after(&mut ws, Workspace::focus_left);
+                let b = offset_after(&mut ws, Workspace::focus_left);
+                assert_eq!((c, b), (550.0, 300.0), "{case}");
+
+                // Ctrl+Alt+C on A: A centered, 150 - 500.
+                ws.focus_left();
+                ws.center_focused_column_animated(1000);
+                ws.stop_animation();
+                assert_eq!(ws.scroll_offset(), -350.0, "{case}");
+                // B fully visible: no move. C cut off: scroll as far as needed.
+                let b = offset_after(&mut ws, Workspace::focus_right);
+                let c = offset_after(&mut ws, Workspace::focus_right);
+                assert_eq!((b, c), (-350.0, -100.0), "{case}");
             }
         }
     }
