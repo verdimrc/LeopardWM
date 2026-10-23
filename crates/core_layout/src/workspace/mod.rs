@@ -150,12 +150,15 @@ pub struct Workspace {
     /// off-screen above the work area.
     #[serde(skip)]
     pub(crate) tab_strip_reserve_px: i32,
-    /// Right-anchor mode: when content is narrower than the viewport, pin
-    /// it to the right edge instead of the left. New columns still insert
-    /// LTR (to the right of focused), so the strip accumulates rightward
-    /// while appearing anchored to the right screen edge.
+    /// RTL mode: new columns insert to the left of the focused column, and
+    /// content narrower than the viewport pins to the right edge.
     #[serde(skip)]
     pub(crate) rtl: bool,
+    /// Right-aligned LTR: new columns insert to the right of the focused
+    /// column as usual, but content narrower than the viewport pins to the
+    /// right edge (as with `rtl`).
+    #[serde(skip)]
+    pub(crate) right_aligned: bool,
 }
 
 /// State saved when a column is maximized to fill the viewport width.
@@ -198,6 +201,7 @@ impl Default for Workspace {
             maximized_column: None,
             tab_strip_reserve_px: 0,
             rtl: false,
+            right_aligned: false,
         }
     }
 }
@@ -551,15 +555,27 @@ impl Workspace {
         self.center_past_edges = allow;
     }
 
-    /// Get whether right-anchor mode is active.
+    /// Get whether RTL mode is active.
     pub fn rtl(&self) -> bool {
         self.rtl
     }
 
-    /// Set right-anchor mode: content pins to the right edge when it fits
-    /// in the viewport, and accumulates leftward as columns are added.
+    /// Set RTL mode: new columns insert to the left of the focused column,
+    /// and content pins to the right edge when it fits in the viewport.
     pub fn set_rtl(&mut self, rtl: bool) {
         self.rtl = rtl;
+    }
+
+    /// Set right-aligned LTR: content pins to the right edge when it fits
+    /// in the viewport, while new columns still insert to the right.
+    pub fn set_right_aligned(&mut self, right_aligned: bool) {
+        self.right_aligned = right_aligned;
+    }
+
+    /// Whether content narrower than the viewport pins to the right edge
+    /// (RTL or right-aligned LTR).
+    pub fn pins_right(&self) -> bool {
+        self.rtl || self.right_aligned
     }
 
     /// Calculate the x-coordinate of a column's left edge on the strip.

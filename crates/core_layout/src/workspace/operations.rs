@@ -106,6 +106,11 @@ impl Workspace {
     /// to the offsets that center the first and last active columns (where
     /// the center-column command can put them).
     fn edge_scroll_bounds(&self, vis_w: i32) -> (f64, f64) {
+        let raw_max = (self.total_width() - vis_w) as f64;
+        if self.pins_right() && raw_max <= 0.0 {
+            // Content fits: pinned to the right edge (see ensure_focused_visible).
+            return (raw_max, raw_max);
+        }
         let mut min_scroll = 0.0_f64;
         let mut max_scroll = (self.total_width() - vis_w).max(0) as f64;
         if self.center_past_edges {
@@ -160,7 +165,7 @@ impl Workspace {
         }
 
         let raw_max = (self.total_width() - vis_w) as f64;
-        let (min_scroll, max_scroll) = if self.rtl && raw_max <= 0.0 {
+        let (min_scroll, max_scroll) = if self.pins_right() && raw_max <= 0.0 {
             // Content fits — right-anchor by allowing negative scroll_offset.
             // Negative viewport_left shifts all columns right on screen, so
             // the strip's right edge aligns with the viewport's right edge.
@@ -580,7 +585,7 @@ impl Workspace {
         let raw_max = self.total_width() - vis_w;
         // RTL right-anchor: when content fits, allow negative scroll_offset so
         // the strip's right edge aligns with the viewport's right edge.
-        let min_scroll = if self.rtl { raw_max.min(0) as f64 } else { 0.0 };
+        let min_scroll = if self.pins_right() { raw_max.min(0) as f64 } else { 0.0 };
         let max_scroll = raw_max.max(0);
         let clamped_target =
             self.clamp_scroll_offset(target, viewport_width, min_scroll, max_scroll as f64);
@@ -661,7 +666,7 @@ impl Workspace {
         let raw_max = self.total_width() - vis_w;
         let centered = self.should_center(col_width, vis_w);
 
-        let target_offset = if self.rtl && raw_max <= 0 {
+        let target_offset = if self.pins_right() && raw_max <= 0 {
             // Content fits — right-anchor target (may be negative).
             let target = raw_max as f64;
             let current = self.effective_scroll_offset();
@@ -700,7 +705,7 @@ impl Workspace {
                 }
             } else {
                 let max_scroll = raw_max.max(0) as f64;
-                if current < -0.5 && !self.rtl {
+                if current < -0.5 && !self.pins_right() {
                     0.0
                 } else if current > max_scroll + 0.5 {
                     max_scroll

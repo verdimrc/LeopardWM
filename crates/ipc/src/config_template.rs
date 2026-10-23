@@ -207,11 +207,15 @@ reduce_motion_on_battery = true
 # ("") to keep that workspace's number. Omit the list to name nothing.
 # names = ["web", "code", "chat", "media"]
 
-# Per-monitor centering: override centering_mode, center_past_edges, or
-# center_single_column for one Windows display number ("3" = \\.\DISPLAY3).
-# Options left out keep the [layout] value; the first rule for a display wins.
+# Per-monitor settings for one Windows display number (3 = \\.\DISPLAY3):
+# - direction: "ltr" (default), "rtl" (new columns open to the left and fit
+#   against the right edge), or "ltr_right_aligned" (new columns open to the
+#   right but fit against the right edge).
+# - centering_mode, center_past_edges, center_single_column: override [layout].
+# Options left out keep their default; the first rule for a display wins.
 # [[monitor_rules]]
 # display = 3
+# direction = "ltr"
 # centering_mode = "center"
 # center_past_edges = false
 # center_single_column = false

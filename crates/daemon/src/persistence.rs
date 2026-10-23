@@ -295,7 +295,7 @@ impl AppState {
                 self.config.animation.scroll_duration_ms,
                 self.config.animation.easing,
             );
-            ws.set_rtl(self.config.layout.is_rtl_monitor(device_name));
+            self.config.direction_for(device_name).apply_to(&mut ws);
             ws.set_scroll_offset(ws_snapshot.workspace.scroll_offset());
             ws.reconcile_scroll_bounds(vw);
 
@@ -318,7 +318,7 @@ impl AppState {
                     self.config.animation.scroll_duration_ms,
                     self.config.animation.easing,
                 );
-                empty.set_rtl(self.config.layout.is_rtl_monitor(device_name));
+                self.config.direction_for(device_name).apply_to(&mut empty);
                 entry.push(empty);
             }
             entry[ws_idx] = ws;
@@ -391,7 +391,7 @@ impl AppState {
                             self.config.animation.scroll_duration_ms,
                             self.config.animation.easing,
                         );
-                        ws.set_rtl(self.config.layout.is_rtl_monitor(&device_name));
+                        self.config.direction_for(&device_name).apply_to(&mut ws);
                         ws_vec.push(ws);
                     }
                     // Restore scroll offset from saved workspace

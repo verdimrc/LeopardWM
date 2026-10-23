@@ -58,12 +58,14 @@ pub struct Config {
     pub overview: OverviewConfig,
 }
 
-/// Per-monitor override of `[layout]` centering settings. Unset fields keep
-/// the `[layout]` value; the first rule for a display wins.
+/// Per-monitor settings: column direction, and overrides of `[layout]`
+/// centering settings. Unset fields keep the default (`"ltr"`) or the
+/// `[layout]` value; the first rule for a display wins.
 ///
 /// ```toml
 /// [[monitor_rules]]
 /// display = 3  # \\.\DISPLAY3
+/// direction = "rtl"
 /// centering_mode = "center_columns_when_narrower"
 /// center_past_edges = true
 /// ```
@@ -71,6 +73,8 @@ pub struct Config {
 pub struct MonitorRule {
     /// Windows display number (`3` = `\\.\DISPLAY3`).
     pub display: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direction: Option<MonitorDirection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub centering_mode: Option<CenteringModeConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -96,11 +100,25 @@ impl MonitorCentering {
 }
 
 impl Config {
+    /// The first `[[monitor_rules]]` entry for the monitor with this device
+    /// name (e.g. `\\.\DISPLAY3`).
+    fn monitor_rule(&self, device_name: &str) -> Option<&MonitorRule> {
+        display_index(device_name)
+            .and_then(|n| self.monitor_rules.iter().find(|rule| rule.display == n))
+    }
+
+    /// Column direction of the monitor with this device name, from its
+    /// `[[monitor_rules]]`; `Ltr` when not set.
+    pub fn direction_for(&self, device_name: &str) -> MonitorDirection {
+        self.monitor_rule(device_name)
+            .and_then(|r| r.direction)
+            .unwrap_or_default()
+    }
+
     /// Centering settings for the monitor with this device name (e.g.
     /// `\\.\DISPLAY3`): `[layout]`, overridden by its first `[[monitor_rules]]`.
     pub fn centering_for(&self, device_name: &str) -> MonitorCentering {
-        let rule = display_index(device_name)
-            .and_then(|n| self.monitor_rules.iter().find(|rule| rule.display == n));
+        let rule = self.monitor_rule(device_name);
         MonitorCentering {
             centering_mode: rule
                 .and_then(|r| r.centering_mode)
@@ -225,12 +243,6 @@ pub struct LayoutConfig {
     #[serde(default = "default_height_presets")]
     pub height_presets: Vec<f64>,
 
-    /// Windows display indices (1-based, matching \\.\DISPLAY{N}) that use
-    /// right-anchor column fill: new columns insert LTR but content pins to
-    /// the right edge when it fits in the viewport.
-    /// Example: `rtl_monitor_indices = [2]` enables this on \\.\DISPLAY2.
-    #[serde(default)]
-    pub rtl_monitor_indices: Vec<u32>,
     /// Minimum width of the ghost column inserted by the desktop-peek toggle,
     /// as a fraction of the monitor viewport width. Default: 0.25 (25%).
     #[serde(default = "default_desktop_peek_min_width")]
@@ -281,7 +293,6 @@ impl Default for LayoutConfig {
             default_width_preset: default_width_preset(),
             default_width_preset_monitor_overrides: std::collections::BTreeMap::new(),
             height_presets: default_height_presets(),
-            rtl_monitor_indices: Vec::new(),
             desktop_peek_min_width: default_desktop_peek_min_width(),
             outer_gap: None,
             default_column_width: None,
@@ -302,13 +313,27 @@ pub(crate) fn display_index(device_name: &str) -> Option<u32> {
         .filter(|&n| n > 0)
 }
 
-impl LayoutConfig {
-    /// Returns true if the monitor with the given device name (e.g. `\\.\DISPLAY2`)
-    /// should use right-anchor column fill.
-    pub fn is_rtl_monitor(&self, device_name: &str) -> bool {
-        display_index(device_name).is_some_and(|n| self.rtl_monitor_indices.contains(&n))
-    }
+/// Column direction of a monitor (`direction` in `[[monitor_rules]]`).
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MonitorDirection {
+    /// New columns open to the right; content fits against the left edge.
+    #[default]
+    Ltr,
+    /// New columns open to the left; content fits against the right edge.
+    Rtl,
+    /// New columns open to the right; content fits against the right edge.
+    LtrRightAligned,
+}
 
+impl MonitorDirection {
+    pub fn apply_to(self, workspace: &mut leopardwm_core_layout::Workspace) {
+        workspace.set_rtl(self == Self::Rtl);
+        workspace.set_right_aligned(self == Self::LtrRightAligned);
+    }
+}
+
+impl LayoutConfig {
     /// The width fraction new columns open at on the monitor with the given
     /// device name (e.g. `\\.\DISPLAY2`): the preset (1-based) from its entry in
     /// `default_width_preset_monitor_overrides`, else `default_width_preset`,
@@ -2082,6 +2107,47 @@ mod tests {
 
         assert_eq!(mode_center, CenteringMode::Center);
         assert_eq!(mode_just_in_view, CenteringMode::JustInView);
+    }
+
+    #[test]
+    fn test_monitor_rules_direction_per_display() {
+        let config: Config = toml::from_str(
+            r#"
+            [[monitor_rules]]
+            display = 2
+            direction = "rtl"
+
+            [[monitor_rules]]
+            display = 3
+            direction = "ltr_right_aligned"
+
+            [[monitor_rules]]
+            display = 4
+            centering_mode = "center"
+            "#,
+        )
+        .unwrap();
+        let direction = |n: u32| config.direction_for(&format!(r"\\.\DISPLAY{n}"));
+        assert_eq!(direction(1), MonitorDirection::Ltr);
+        assert_eq!(direction(2), MonitorDirection::Rtl);
+        assert_eq!(direction(3), MonitorDirection::LtrRightAligned);
+        // A rule without direction keeps the default.
+        assert_eq!(direction(4), MonitorDirection::Ltr);
+
+        let saved = toml::to_string_pretty(&config).unwrap();
+        let parsed: Config = toml::from_str(&saved).unwrap();
+        assert_eq!(parsed.monitor_rules, config.monitor_rules, "{saved}");
+        assert!(
+            toml::from_str::<Config>("[[monitor_rules]]\ndisplay = 2\ndirection = \"left\"\n")
+                .is_err()
+        );
+
+        // The old keys are ignored.
+        let old: Config = toml::from_str(
+            "[layout]\nrtl_monitor_indices = [2]\ndirection = { \"2\" = \"rtl\" }\n",
+        )
+        .unwrap();
+        assert_eq!(old.direction_for(r"\\.\DISPLAY2"), MonitorDirection::Ltr);
     }
 
     #[test]

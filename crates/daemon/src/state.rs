@@ -1148,7 +1148,7 @@ impl AppState {
             workspace.set_reduce_motion(initial_reduce_motion);
             workspace
                 .set_scroll_animation(config.animation.scroll_duration_ms, config.animation.easing);
-            workspace.set_rtl(config.layout.is_rtl_monitor(&monitor.device_name));
+            config.direction_for(&monitor.device_name).apply_to(&mut workspace);
 
             if monitor.is_primary {
                 focused_monitor = monitor.id;
@@ -1736,7 +1736,7 @@ impl AppState {
             config.centering_for(device_name).apply_to(&mut ws);
             ws.set_reduce_motion(self.reduce_motion);
             ws.set_scroll_animation(config.animation.scroll_duration_ms, config.animation.easing);
-            ws.set_rtl(self.config.layout.is_rtl_monitor(device_name));
+            self.config.direction_for(device_name).apply_to(&mut ws);
             ws_vec.push(ws);
         }
         ws_vec.get_mut(idx)
@@ -1759,7 +1759,7 @@ impl AppState {
     /// Get the viewport width for a specific monitor. For vertical monitors,
     /// returns the work area height (the layout engine's primary axis).
     /// Returns the 1-based display index (N in `\\.\DISPLAY{N}`) for the given
-    /// monitor, or 0 if it cannot be determined. Mirrors `is_rtl_monitor`.
+    /// monitor, or 0 if it cannot be determined. Mirrors `direction_for`.
     pub(crate) fn display_index_for(&self, monitor_id: MonitorId) -> u32 {
         self.monitors
             .get(&monitor_id)

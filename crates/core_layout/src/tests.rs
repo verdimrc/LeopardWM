@@ -103,6 +103,47 @@ mod tests {
     }
 
     #[test]
+    fn test_rtl_and_right_aligned_pin_fitting_columns_right() {
+        // Three 300px columns on a 1000px screen, no gaps: 900px, so pinned
+        // right they start at x = 100.
+        let viewport = Rect::new(0, 0, 1000, 600);
+        for (rtl, right_aligned, order) in [
+            (false, false, [1, 2, 3]),
+            (true, false, [3, 2, 1]),
+            (false, true, [1, 2, 3]),
+        ] {
+            for center_single_column in [false, true] {
+                let case = format!("rtl={rtl}, right_aligned={right_aligned}, center_single_column={center_single_column}");
+                let mut ws = Workspace::new();
+                ws.set_gap(0);
+                ws.set_outer_gaps(0, 0, 0, 0);
+                ws.set_centering_mode(CenteringMode::JustInView);
+                ws.set_rtl(rtl);
+                ws.set_right_aligned(right_aligned);
+                ws.set_center_single_column(center_single_column);
+                ws.set_reduce_motion(true);
+                for id in 1..=3 {
+                    ws.insert_window(id, Some(300)).unwrap();
+                    ws.ensure_focused_visible_animated(viewport.width);
+                    // Redrawing the layout re-checks the scroll bounds.
+                    ws.reconcile_scroll_bounds(viewport.width);
+                }
+                let mut placed: Vec<_> = ws
+                    .compute_placements(viewport)
+                    .iter()
+                    .map(|p| (p.rect.x, p.window_id))
+                    .collect();
+                placed.sort();
+                let start = if rtl || right_aligned { 100 } else { 0 };
+                let expected: Vec<_> = (0..3)
+                    .map(|i| (start + 300 * i, order[i as usize]))
+                    .collect();
+                assert_eq!(placed, expected, "{case}");
+            }
+        }
+    }
+
+    #[test]
     fn test_focus_after_center_command_keeps_past_edge_scroll_when_visible() {
         // Four 300px columns on a 1000px screen, no gaps: A 0-300, B 300-600,
         // C 600-900, D 900-1200 (200px over).

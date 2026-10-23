@@ -10167,6 +10167,29 @@ fn test_cmd_move_to_monitor_right_single() {
 }
 
 #[test]
+fn test_monitor_rules_direction_applies_to_its_monitor_only() {
+    let rule = |direction| config::MonitorRule {
+        display: 2,
+        direction: Some(direction),
+        ..Default::default()
+    };
+    let mut config = test_config();
+    config.monitor_rules = vec![rule(config::MonitorDirection::LtrRightAligned)];
+    let mut state = AppState::new_with_config(config, two_monitors());
+    let flags = |state: &AppState, monitor| {
+        let ws = &state.workspaces[&monitor][0];
+        (ws.rtl(), ws.pins_right())
+    };
+    assert_eq!(flags(&state, 1), (false, false));
+    assert_eq!(flags(&state, 2), (false, true));
+
+    let mut reloaded = state.config.clone();
+    reloaded.monitor_rules = vec![rule(config::MonitorDirection::Rtl)];
+    state.apply_config(reloaded);
+    assert_eq!(flags(&state, 2), (true, true));
+}
+
+#[test]
 fn test_monitor_rules_set_centering_on_their_monitor_only() {
     use leopardwm_core_layout::CenteringMode;
     let mut config = test_config();

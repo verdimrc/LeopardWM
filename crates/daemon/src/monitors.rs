@@ -127,9 +127,9 @@ impl AppState {
                         viewport_width,
                     );
                     let device_name = self.monitors.get(&monitor_id).map(|m| m.device_name.clone()).unwrap_or_default();
-                    let is_rtl = self.config.layout.is_rtl_monitor(&device_name);
+                    let direction = self.config.direction_for(&device_name);
                     for workspace in ws_vec.iter_mut() {
-                        workspace.set_rtl(is_rtl);
+                        direction.apply_to(workspace);
                     }
                 }
                 return;
@@ -239,7 +239,7 @@ impl AppState {
                     self.config.animation.scroll_duration_ms,
                     self.config.animation.easing,
                 );
-                workspace.set_rtl(self.config.layout.is_rtl_monitor(&monitor.device_name));
+                self.config.direction_for(&monitor.device_name).apply_to(&mut workspace);
                 self.workspaces.insert(monitor.id, vec![workspace]);
                 self.active_workspace.insert(monitor.id, 0);
                 info!("Created workspace for new monitor {}", monitor.id);
@@ -372,9 +372,9 @@ impl AppState {
                 .unwrap_or(viewport_width);
             apply_reconciled_geometry(ws_vec, &params, source_viewport_width, viewport_width);
             let device_name = self.monitors.get(&monitor_id).map(|m| m.device_name.clone()).unwrap_or_default();
-            let is_rtl = self.config.layout.is_rtl_monitor(&device_name);
+            let direction = self.config.direction_for(&device_name);
             for workspace in ws_vec.iter_mut() {
-                workspace.set_rtl(is_rtl);
+                direction.apply_to(workspace);
             }
         }
 

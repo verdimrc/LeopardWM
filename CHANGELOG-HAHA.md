@@ -9,9 +9,19 @@
 - `behavior.notify_elevation_blocked` silences the toast when a privilege-elevated window is excluded from tiling.
 - Right Ctrl and Right Alt are interchangeable with their left counterparts in hotkeys.
   Opt in with `behavior.symmetric_modifiers = true` in the config. Useful for one-handed operation.
-- RTL layout mode: columns accumulate from the right edge of the viewport instead of the left, and new
-  columns open to the left of the focused column. Enable with `[layout] rtl_monitor_indices = [N]` where N
-  is the Windows display number (e.g. `\\.\DISPLAY2` → `2`).
+- Per-monitor column direction, set by `direction` in `[[monitor_rules]]`:
+
+  ```toml
+  [[monitor_rules]]
+  display = 2  # \\.\DISPLAY2
+  direction = "rtl"
+  ```
+
+  - `"rtl"`: columns accumulate from the right edge of the viewport instead of the left, and new columns
+    open to the left of the focused column.
+  - `"ltr_right_aligned"`: new columns open to the right of the focused column as usual, but columns
+    narrower than the screen sit against the right edge.
+  - `"ltr"` (default): the usual direction.
 
   The motivating setup: a wide external monitor sitting to the left of a center main display. LTR places
   new windows at the far left of that monitor — far from the center display, forcing a wide eye sweep.
@@ -46,7 +56,7 @@
   - Peek is monitor-local — operations on other monitors leave it intact. Any window operation on the
     peeked monitor (focus change, move, close, minimize, maximize, fullscreen) exits peek and restores
     the previous scroll position.
-  - Only available on LTR horizontal monitors.
+  - Only available on horizontal monitors with the usual `"ltr"` direction.
 - Window rules: `column_width` now accepts a 1-based preset index (e.g. `column_width = 2`,
   same convention as `layout.default_width_preset`) or a per-display map
   (e.g. `column_width = { "1" = 0.5, "2" = 2 }`) in addition to the existing viewport
@@ -65,12 +75,14 @@
 - `layout.centering_mode = "center_columns_when_narrower"` centers all columns together when they are
   narrower than the screen. When they are wider, they start at the left edge (right edge with RTL) and
   the screen scrolls like `"just_in_view"`.
-- `[[monitor_rules]]` sets `centering_mode`, `center_past_edges`, or `center_single_column` for one monitor,
-  by Windows display number. Options left out keep the `[layout]` value:
+- `[[monitor_rules]]` sets `direction`, `centering_mode`, `center_past_edges`, or `center_single_column`
+  for one monitor, by Windows display number. Options left out keep the default (`direction`) or the
+  `[layout]` value:
 
   ```toml
   [[monitor_rules]]
   display = 3  # \\.\DISPLAY3
+  direction = "ltr"
   centering_mode = "center"
   center_past_edges = false
   center_single_column = false
@@ -100,7 +112,6 @@
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `layout.rtl_monitor_indices` | `[u32]` | `[]` | Monitor display numbers that use RTL layout. ⚠️ [Known issue with GUI settings](#known-issues-with-gui-settings) |
 | `layout.desktop_peek_min_width` | `f64` | `0.25` | Minimum ghost column width as a fraction of monitor width. ⚠️ [Known issue with GUI settings](#known-issues-with-gui-settings) |
 | `behavior.notify_elevation_blocked` | `bool` | `true` | Show a toast when a privilege-elevated window is excluded from tiling. Set to `false` to silence it. ⚠️ [Known issue with GUI settings](#known-issues-with-gui-settings) |
 | `behavior.symmetric_modifiers` | `bool` | `false` | Treat Right Ctrl / Right Alt as interchangeable with their left counterparts in hotkeys. ⚠️ [Known issue with GUI settings](#known-issues-with-gui-settings) |
@@ -113,7 +124,7 @@
 | `hotkeys.toggle_new_window_placement_once` | `string` | `"Ctrl+Alt+Shift+N"` | Activate a one-shot new-window-placement override for the next window only. |
 | `behavior.new_window_monitor` (extended) | `"opening"` \| `"focused"` \| ✨`"cursor"` | `"opening"` | Adds `"cursor"`: open new windows on the monitor under the mouse cursor. |
 | `behavior.new_width_on_monitor_move` | `"upstream" \| "same_proportion_as_source_monitor" \| "window_rule_width_or_default_width"` | `"upstream"` | Width of a tiled window moved to another monitor. ⚠️ [Known issue with GUI settings](#known-issues-with-gui-settings) |
-| `[[monitor_rules]]` | `display = u32`, plus optional `centering_mode`, `center_past_edges`, `center_single_column` | (none) | Per-monitor centering settings. ⚠️ [Known issue with GUI settings](#known-issues-with-gui-settings) |
+| `[[monitor_rules]]` | `display = u32`, plus optional `direction`, `centering_mode`, `center_past_edges`, `center_single_column` | (none) | Per-monitor column direction and centering settings. ⚠️ [Known issue with GUI settings](#known-issues-with-gui-settings) |
 | `layout.centering_mode` (extended) | `"center"` \| `"just_in_view"` \| `"on_overflow"` \| ✨`"center_columns_when_narrower"` | `"center"` | Adds `"center_columns_when_narrower"`: center all columns together when they are narrower than the screen. ⚠️ [Known issue with GUI settings](#known-issues-with-gui-settings) |
 
 ### Fixes
@@ -141,7 +152,6 @@ doesn't show are reset or removed:
 
 | Field | After saving from the settings window |
 |---|---|
-| `layout.rtl_monitor_indices` | Reset to `[]`. |
 | `layout.desktop_peek_min_width` | Reset to `0.25`. |
 | `behavior.notify_elevation_blocked` | Reset to `true`. |
 | `behavior.symmetric_modifiers` | Reset to `false`. |

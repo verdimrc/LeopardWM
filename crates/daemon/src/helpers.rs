@@ -230,7 +230,7 @@ impl AppState {
 
                 params.apply_to(workspace);
                 self.config.centering_for(&device_name).apply_to(workspace);
-                workspace.set_rtl(self.config.layout.is_rtl_monitor(&device_name));
+                self.config.direction_for(&device_name).apply_to(workspace);
 
                 // Rescale column widths to preserve fractions under new gap values
                 workspace.rescale_column_widths(

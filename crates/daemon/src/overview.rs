@@ -324,7 +324,8 @@ impl AppState {
             .get(&monitor)
             .map(|m| m.device_name.as_str())
             .unwrap_or("");
-        let rtl = self.config.layout.is_rtl_monitor(device_name);
+        let rtl =
+            self.config.direction_for(device_name) != crate::config::MonitorDirection::Ltr;
 
         let mut rows = Vec::with_capacity(ws_vec.len());
         for (ws_idx, ws) in ws_vec.iter().enumerate() {
