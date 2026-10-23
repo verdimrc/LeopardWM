@@ -1209,7 +1209,8 @@ fn init_workspace_state(state: &mut AppState) {
         .iter()
         .map(|(&id, m)| {
             let vw = crate::monitors::monitor_viewport_width(m);
-            (id, state.config.layout.default_column_width_px(vw, &m.device_name))
+            let preset = state.config.default_width_preset_for(&m.device_name);
+            (id, state.config.layout.default_column_width_px(vw, preset))
         })
         .collect();
     // Restored slots keep their saved per-column widths; only freshly-enumerated

@@ -47,10 +47,6 @@ width_presets = [0.333, 0.5, 0.667]
 # 1 = first preset. Out-of-range values fall back to the first preset.
 default_width_preset = 1
 
-# Per-monitor overrides of default_width_preset. Keys are Windows display
-# numbers ("2" = \\.\DISPLAY2); unlisted monitors use default_width_preset.
-# default_width_preset_monitor_overrides = {{ "2" = 3 }}
-
 # Height presets (fractions of column height / weight).
 height_presets = [0.333, 0.5, 0.667]
 
@@ -211,11 +207,13 @@ reduce_motion_on_battery = true
 # - direction: "ltr" (default), "rtl" (new columns open to the left and fit
 #   against the right edge), or "ltr_right_aligned" (new columns open to the
 #   right but fit against the right edge).
-# - centering_mode, center_past_edges, center_single_column: override [layout].
+# - default_width_preset, centering_mode, center_past_edges,
+#   center_single_column: override [layout].
 # Options left out keep their default; the first rule for a display wins.
 # [[monitor_rules]]
 # display = 3
 # direction = "ltr"
+# default_width_preset = 1
 # centering_mode = "center"
 # center_past_edges = false
 # center_single_column = false

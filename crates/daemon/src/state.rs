@@ -1129,8 +1129,7 @@ impl AppState {
 
         for monitor in monitors {
             let params = ScaledLayoutParams::from_config(
-                &config.layout,
-                &config.appearance,
+                &config,
                 monitor.scale_factor,
                 crate::monitors::monitor_viewport_width(&monitor),
                 &monitor.device_name,
@@ -1713,8 +1712,7 @@ impl AppState {
             .map(crate::monitors::monitor_viewport_width)
             .unwrap_or(FALLBACK_VIEWPORT_WIDTH);
         let params = ScaledLayoutParams::from_config(
-            &self.config.layout,
-            &self.config.appearance,
+            &self.config,
             scale,
             vw,
             self.monitors.get(&monitor_id).map_or("", |m| m.device_name.as_str()),

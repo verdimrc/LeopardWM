@@ -110,8 +110,7 @@ impl AppState {
                         .map(monitor_viewport_width)
                         .unwrap_or(FALLBACK_VIEWPORT_WIDTH);
                     let params = ScaledLayoutParams::from_config(
-                        &self.config.layout,
-                        &self.config.appearance,
+                        &self.config,
                         scale,
                         viewport_width,
                         self.monitors.get(&monitor_id).map_or("", |m| m.device_name.as_str()),
@@ -218,8 +217,7 @@ impl AppState {
                 let mvw = monitor_viewport_width(monitor);
                 source_viewport_widths.insert(monitor.id, mvw);
                 let params = ScaledLayoutParams::from_config(
-                    &self.config.layout,
-                    &self.config.appearance,
+                    &self.config,
                     monitor.scale_factor,
                     mvw,
                     &monitor.device_name,
@@ -359,8 +357,7 @@ impl AppState {
                 .map(monitor_viewport_width)
                 .unwrap_or(FALLBACK_VIEWPORT_WIDTH);
             let params = ScaledLayoutParams::from_config(
-                &self.config.layout,
-                &self.config.appearance,
+                &self.config,
                 scale,
                 viewport_width,
                 self.monitors.get(&monitor_id).map_or("", |m| m.device_name.as_str()),
