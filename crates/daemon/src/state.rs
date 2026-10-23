@@ -1143,11 +1143,10 @@ impl AppState {
             );
             workspace.set_default_column_width(params.default_column_width);
             workspace.set_tab_strip_reserve_px(params.tab_strip_reserve_px);
-            config.centering_for(&monitor.device_name).apply_to(&mut workspace);
+            config.apply_monitor_rules(&monitor.device_name, &mut workspace);
             workspace.set_reduce_motion(initial_reduce_motion);
             workspace
                 .set_scroll_animation(config.animation.scroll_duration_ms, config.animation.easing);
-            config.direction_for(&monitor.device_name).apply_to(&mut workspace);
 
             if monitor.is_primary {
                 focused_monitor = monitor.id;
@@ -1711,11 +1710,12 @@ impl AppState {
             .get(&monitor_id)
             .map(crate::monitors::monitor_viewport_width)
             .unwrap_or(FALLBACK_VIEWPORT_WIDTH);
+        let device_name = crate::monitors::monitor_device_name(&self.monitors, monitor_id);
         let params = ScaledLayoutParams::from_config(
             &self.config,
             scale,
             vw,
-            self.monitors.get(&monitor_id).map_or("", |m| m.device_name.as_str()),
+            device_name,
         );
 
         let config = &self.config;
@@ -1730,11 +1730,9 @@ impl AppState {
             );
             ws.set_default_column_width(params.default_column_width);
             ws.set_tab_strip_reserve_px(params.tab_strip_reserve_px);
-            let device_name = self.monitors.get(&monitor_id).map(|m| m.device_name.as_str()).unwrap_or("");
-            config.centering_for(device_name).apply_to(&mut ws);
+            config.apply_monitor_rules(device_name, &mut ws);
             ws.set_reduce_motion(self.reduce_motion);
             ws.set_scroll_animation(config.animation.scroll_duration_ms, config.animation.easing);
-            self.config.direction_for(device_name).apply_to(&mut ws);
             ws_vec.push(ws);
         }
         ws_vec.get_mut(idx)

@@ -550,6 +550,11 @@ impl Workspace {
         self.center_single_column || self.centering_mode == CenteringMode::CenterColumnsWhenNarrower
     }
 
+    /// `centers_fitting_columns`, outside fullscreen (where it doesn't apply).
+    pub fn holds_fitting_columns(&self) -> bool {
+        self.centers_fitting_columns() && self.fullscreen_window.is_none()
+    }
+
     /// Set whether center-column can scroll past content edges.
     pub fn set_center_past_edges(&mut self, allow: bool) {
         self.center_past_edges = allow;

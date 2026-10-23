@@ -280,21 +280,20 @@ impl AppState {
                 .get(&monitor_id)
                 .map(crate::monitors::monitor_viewport_width)
                 .unwrap_or(FALLBACK_VIEWPORT_WIDTH);
+            let device_name = crate::monitors::monitor_device_name(&self.monitors, monitor_id);
             let params = ScaledLayoutParams::from_config(
                 &self.config,
                 scale,
                 vw,
-                self.monitors.get(&monitor_id).map_or("", |m| m.device_name.as_str()),
+                device_name,
             );
             params.apply_to(&mut ws);
-            let device_name = self.monitors.get(&monitor_id).map(|m| m.device_name.as_str()).unwrap_or("");
-            self.config.centering_for(device_name).apply_to(&mut ws);
+            self.config.apply_monitor_rules(device_name, &mut ws);
             ws.set_reduce_motion(self.reduce_motion);
             ws.set_scroll_animation(
                 self.config.animation.scroll_duration_ms,
                 self.config.animation.easing,
             );
-            self.config.direction_for(device_name).apply_to(&mut ws);
             ws.set_scroll_offset(ws_snapshot.workspace.scroll_offset());
             ws.reconcile_scroll_bounds(vw);
 
@@ -311,13 +310,12 @@ impl AppState {
                 );
                 empty.set_default_column_width(params.default_column_width);
                 empty.set_tab_strip_reserve_px(params.tab_strip_reserve_px);
-                self.config.centering_for(device_name).apply_to(&mut empty);
+                self.config.apply_monitor_rules(device_name, &mut empty);
                 empty.set_reduce_motion(self.reduce_motion);
                 empty.set_scroll_animation(
                     self.config.animation.scroll_duration_ms,
                     self.config.animation.easing,
                 );
-                self.config.direction_for(device_name).apply_to(&mut empty);
                 entry.push(empty);
             }
             entry[ws_idx] = ws;
@@ -366,13 +364,13 @@ impl AppState {
                         .get(&id)
                         .map(crate::monitors::monitor_viewport_width)
                         .unwrap_or(FALLBACK_VIEWPORT_WIDTH);
+                    let device_name = crate::monitors::monitor_device_name(&self.monitors, id);
                     let params = ScaledLayoutParams::from_config(
                         &self.config,
                         scale,
                         vw,
-                        self.monitors.get(&id).map_or("", |m| m.device_name.as_str()),
+                        device_name,
                     );
-                    let device_name = self.monitors.get(&id).map(|m| m.device_name.clone()).unwrap_or_default();
                     while ws_vec.len() <= ws_idx {
                         let mut ws = Workspace::with_directional_gaps(
                             params.gap,
@@ -383,18 +381,18 @@ impl AppState {
                         );
                         ws.set_default_column_width(params.default_column_width);
                         ws.set_tab_strip_reserve_px(params.tab_strip_reserve_px);
-                        self.config.centering_for(&device_name).apply_to(&mut ws);
+                        self.config.apply_monitor_rules(device_name, &mut ws);
                         ws.set_reduce_motion(self.reduce_motion);
                         ws.set_scroll_animation(
                             self.config.animation.scroll_duration_ms,
                             self.config.animation.easing,
                         );
-                        self.config.direction_for(&device_name).apply_to(&mut ws);
                         ws_vec.push(ws);
                     }
                     // Restore scroll offset from saved workspace
                     let saved_offset = ws_snapshot.workspace.scroll_offset();
-                    self.config.centering_for(&device_name).apply_to(&mut ws_vec[ws_idx]);
+                    self.config
+                        .apply_monitor_rules(device_name, &mut ws_vec[ws_idx]);
                     ws_vec[ws_idx].set_scroll_offset(saved_offset);
                     ws_vec[ws_idx].reconcile_scroll_bounds(vw);
                     restored_monitors.insert(id);

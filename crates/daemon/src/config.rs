@@ -38,7 +38,7 @@ pub struct Config {
     /// Window rules for per-window behavior.
     #[serde(default)]
     pub window_rules: Vec<WindowRule>,
-    /// Per-monitor overrides of `[layout]` centering settings.
+    /// Per-monitor settings (see `MonitorRule`).
     #[serde(default)]
     pub monitor_rules: Vec<MonitorRule>,
     /// Gesture bindings for touchpad support.
@@ -135,6 +135,17 @@ impl Config {
         self.monitor_rule(device_name)
             .and_then(|r| r.direction)
             .unwrap_or_default()
+    }
+
+    /// Apply the monitor's direction and centering settings (see
+    /// `direction_for` and `centering_for`) to one of its workspaces.
+    pub fn apply_monitor_rules(
+        &self,
+        device_name: &str,
+        workspace: &mut leopardwm_core_layout::Workspace,
+    ) {
+        self.centering_for(device_name).apply_to(workspace);
+        self.direction_for(device_name).apply_to(workspace);
     }
 
     /// Centering settings for the monitor with this device name (e.g.
@@ -341,6 +352,12 @@ pub enum MonitorDirection {
 }
 
 impl MonitorDirection {
+    /// Whether columns that fit sit against the right edge (`Rtl` or
+    /// `LtrRightAligned`), as `Workspace::pins_right`.
+    pub fn pins_right(self) -> bool {
+        self != Self::Ltr
+    }
+
     pub fn apply_to(self, workspace: &mut leopardwm_core_layout::Workspace) {
         workspace.set_rtl(self == Self::Rtl);
         workspace.set_right_aligned(self == Self::LtrRightAligned);
@@ -649,8 +666,7 @@ pub enum NewWidthOnMonitorMove {
     /// The target monitor's default width, as upstream does.
     #[default]
     Upstream,
-    /// The same share of the screen as on the source monitor (move-to-monitor
-    /// hotkey; a window dragged onto another monitor gets the default width).
+    /// The same share of the screen as on the source monitor.
     SameProportionAsSourceMonitor,
     /// The width a newly opened window would get there: its window rule's
     /// `column_width` for that monitor, else the monitor's default width.

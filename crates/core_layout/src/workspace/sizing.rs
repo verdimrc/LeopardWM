@@ -211,24 +211,6 @@ impl Workspace {
         })
     }
 
-    /// Insert `window_id` as a new column (see `insert_window`) sized to
-    /// `fraction` of this viewport, and cache the exact fraction on the new
-    /// column. A fraction above 1.0 is capped so the column fits the viewport.
-    ///
-    /// # Errors
-    ///
-    /// Returns `LayoutError::DuplicateWindow` if the window ID already exists.
-    pub fn insert_window_with_width_fraction(
-        &mut self,
-        window_id: WindowId,
-        fraction: f64,
-        viewport_width: i32,
-    ) -> Result<(), LayoutError> {
-        self.insert_window(window_id, None)?;
-        self.restore_focused_column_width_fraction(fraction, viewport_width);
-        Ok(())
-    }
-
     /// Size the focused column to `fraction` of this viewport, as returned by
     /// `column_width_fraction_for_window`, and cache the exact fraction on the
     /// column. A fraction above 1.0 is capped so the column fits the viewport.

@@ -109,11 +109,12 @@ impl AppState {
                         .get(&monitor_id)
                         .map(monitor_viewport_width)
                         .unwrap_or(FALLBACK_VIEWPORT_WIDTH);
+                    let device_name = monitor_device_name(&self.monitors, monitor_id);
                     let params = ScaledLayoutParams::from_config(
                         &self.config,
                         scale,
                         viewport_width,
-                        self.monitors.get(&monitor_id).map_or("", |m| m.device_name.as_str()),
+                        device_name,
                     );
                     let source_viewport_width = source_viewport_widths
                         .get(&monitor_id)
@@ -125,10 +126,8 @@ impl AppState {
                         source_viewport_width,
                         viewport_width,
                     );
-                    let device_name = self.monitors.get(&monitor_id).map(|m| m.device_name.clone()).unwrap_or_default();
-                    let direction = self.config.direction_for(&device_name);
                     for workspace in ws_vec.iter_mut() {
-                        direction.apply_to(workspace);
+                        self.config.apply_monitor_rules(device_name, workspace);
                     }
                 }
                 return;
@@ -158,7 +157,8 @@ impl AppState {
                 {
                     source_viewport_widths.insert(monitor.id, source_viewport_width);
                     for workspace in &mut stashed_ws {
-                        self.config.centering_for(&monitor.device_name).apply_to(workspace);
+                        self.config
+                            .apply_monitor_rules(&monitor.device_name, workspace);
                         workspace.ensure_focused_visible(source_viewport_width);
                     }
                     let returning: HashSet<u64> =
@@ -231,13 +231,13 @@ impl AppState {
                 );
                 workspace.set_default_column_width(params.default_column_width);
                 workspace.set_tab_strip_reserve_px(params.tab_strip_reserve_px);
-                self.config.centering_for(&monitor.device_name).apply_to(&mut workspace);
+                self.config
+                    .apply_monitor_rules(&monitor.device_name, &mut workspace);
                 workspace.set_reduce_motion(self.reduce_motion);
                 workspace.set_scroll_animation(
                     self.config.animation.scroll_duration_ms,
                     self.config.animation.easing,
                 );
-                self.config.direction_for(&monitor.device_name).apply_to(&mut workspace);
                 self.workspaces.insert(monitor.id, vec![workspace]);
                 self.active_workspace.insert(monitor.id, 0);
                 info!("Created workspace for new monitor {}", monitor.id);
@@ -356,11 +356,12 @@ impl AppState {
                 .get(&monitor_id)
                 .map(monitor_viewport_width)
                 .unwrap_or(FALLBACK_VIEWPORT_WIDTH);
+            let device_name = monitor_device_name(&self.monitors, monitor_id);
             let params = ScaledLayoutParams::from_config(
                 &self.config,
                 scale,
                 viewport_width,
-                self.monitors.get(&monitor_id).map_or("", |m| m.device_name.as_str()),
+                device_name,
             );
 
             let source_viewport_width = source_viewport_widths
@@ -368,10 +369,8 @@ impl AppState {
                 .copied()
                 .unwrap_or(viewport_width);
             apply_reconciled_geometry(ws_vec, &params, source_viewport_width, viewport_width);
-            let device_name = self.monitors.get(&monitor_id).map(|m| m.device_name.clone()).unwrap_or_default();
-            let direction = self.config.direction_for(&device_name);
             for workspace in ws_vec.iter_mut() {
-                direction.apply_to(workspace);
+                self.config.apply_monitor_rules(device_name, workspace);
             }
         }
 
@@ -694,6 +693,15 @@ impl Orientation {
 /// For vertical monitors this is `work_area.height`; for horizontal, `work_area.width`.
 pub(crate) fn monitor_viewport_width(m: &leopardwm_platform_win32::MonitorInfo) -> i32 {
     Orientation::of(m.work_area).primary_size(m.work_area)
+}
+
+/// A monitor's device name (e.g. `\\.\DISPLAY2`), or `""` if it's unknown.
+/// Borrows only the monitor map, so callers can still mutate workspaces.
+pub(crate) fn monitor_device_name(
+    monitors: &HashMap<MonitorId, MonitorInfo>,
+    monitor_id: MonitorId,
+) -> &str {
+    monitors.get(&monitor_id).map_or("", |m| m.device_name.as_str())
 }
 
 /// Rotate a layout-space rect to physical screen coordinates for a vertical

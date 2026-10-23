@@ -102,6 +102,14 @@ mod tests {
         }
     }
 
+    /// A workspace with no gaps, so column x positions are plain sums of widths.
+    fn gapless_workspace() -> Workspace {
+        let mut ws = Workspace::new();
+        ws.set_gap(0);
+        ws.set_outer_gaps(0, 0, 0, 0);
+        ws
+    }
+
     #[test]
     fn test_rtl_and_right_aligned_pin_fitting_columns_right() {
         // Three 300px columns on a 1000px screen, no gaps: 900px, so pinned
@@ -112,19 +120,20 @@ mod tests {
             (true, false, [3, 2, 1]),
             (false, true, [1, 2, 3]),
         ] {
-            for center_single_column in [false, true] {
-                let case = format!("rtl={rtl}, right_aligned={right_aligned}, center_single_column={center_single_column}");
-                let mut ws = Workspace::new();
-                ws.set_gap(0);
-                ws.set_outer_gaps(0, 0, 0, 0);
+            for (center_single_column, animate) in
+                [(false, false), (false, true), (true, false), (true, true)]
+            {
+                let case = format!("rtl={rtl}, right_aligned={right_aligned}, center_single_column={center_single_column}, animate={animate}");
+                let mut ws = gapless_workspace();
                 ws.set_centering_mode(CenteringMode::JustInView);
                 ws.set_rtl(rtl);
                 ws.set_right_aligned(right_aligned);
                 ws.set_center_single_column(center_single_column);
-                ws.set_reduce_motion(true);
+                ws.set_reduce_motion(!animate);
                 for id in 1..=3 {
                     ws.insert_window(id, Some(300)).unwrap();
                     ws.ensure_focused_visible_animated(viewport.width);
+                    ws.stop_animation();
                     // Redrawing the layout re-checks the scroll bounds.
                     ws.reconcile_scroll_bounds(viewport.width);
                 }
@@ -172,9 +181,7 @@ mod tests {
         ] {
             for reduce_motion in [false, true] {
                 let case = format!("mode={mode:?}, reduce_motion={reduce_motion}");
-                let mut ws = Workspace::new();
-                ws.set_gap(0);
-                ws.set_outer_gaps(0, 0, 0, 0);
+                let mut ws = gapless_workspace();
                 ws.set_centering_mode(mode);
                 ws.set_center_past_edges(true);
                 ws.set_reduce_motion(reduce_motion);
@@ -3632,20 +3639,23 @@ mod tests {
         a.remove_window(1).unwrap();
 
         let mut b = Workspace::with_gaps(10, 10);
-        b.insert_window_with_width_fraction(1, fraction, 1366).unwrap();
+        b.insert_window(1, None).unwrap();
+        b.restore_focused_column_width_fraction(fraction, 1366);
         let back = b.column_width_fraction_for_window(1, 1366).unwrap();
         assert_eq!(back, fraction, "cached fraction survives the move");
         b.remove_window(1).unwrap();
 
-        a.insert_window_with_width_fraction(1, back, 1920).unwrap();
+        a.insert_window(1, None).unwrap();
+        a.restore_focused_column_width_fraction(back, 1920);
         assert_eq!(a.column_width_for_window(1), Some(613));
     }
 
     #[test]
-    fn test_insert_window_with_width_fraction_caps_at_viewport() {
+    fn test_restore_focused_column_width_fraction_caps_at_viewport() {
         // base = 1000 - 10 - 10 + 10 = 990; full width = base - gap = 980.
         let mut ws = Workspace::with_gaps(10, 10);
-        ws.insert_window_with_width_fraction(1, 1.5, 1000).unwrap();
+        ws.insert_window(1, None).unwrap();
+        ws.restore_focused_column_width_fraction(1.5, 1000);
         assert_eq!(ws.column_width_for_window(1), Some(980));
     }
 

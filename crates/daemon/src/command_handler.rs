@@ -1982,9 +1982,7 @@ impl AppState {
                 );
                 return;
             }
-            if self.config.direction_for(&m.device_name)
-                != crate::config::MonitorDirection::Ltr
-            {
+            if self.config.direction_for(&m.device_name).pins_right() {
                 tracing::info!(
                     "desktop_peek: not supported on RTL or right-aligned monitor {} — skipping",
                     m.device_name

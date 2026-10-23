@@ -1355,14 +1355,6 @@ struct ColumnBound {
     screen_right: i32,
 }
 
-/// Derive column screen boundaries from animated placements.
-///
-/// Tabbed columns emit off-screen placements for inactive tabs (positioned
-/// at `viewport.x - viewport.width`, size 0×0). Those must be excluded
-/// from the bounds aggregation: including them would stretch the column's
-/// reported `screen_left` to a huge negative number, and the "first
-/// matching bound" pick in `compute_target_column_index` would then claim
-/// any cursor to the left of the tabbed column as belonging to it.
 /// Insert a dropped `hwnd` as a new column of `ws`, sized per
 /// `behavior.new_width_on_monitor_move` (`None`: the default width).
 fn insert_moved_column(
@@ -1378,6 +1370,14 @@ fn insert_moved_column(
     }
 }
 
+/// Derive column screen boundaries from animated placements.
+///
+/// Tabbed columns emit off-screen placements for inactive tabs (positioned
+/// at `viewport.x - viewport.width`, size 0×0). Those must be excluded
+/// from the bounds aggregation: including them would stretch the column's
+/// reported `screen_left` to a huge negative number, and the "first
+/// matching bound" pick in `compute_target_column_index` would then claim
+/// any cursor to the left of the tabbed column as belonging to it.
 fn column_bounds_from_placements(
     workspace: &leopardwm_core_layout::Workspace,
     viewport: Rect,

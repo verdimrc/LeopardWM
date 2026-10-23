@@ -212,14 +212,14 @@ impl AppState {
                 .get(&monitor_id)
                 .map(crate::monitors::monitor_viewport_width)
                 .unwrap_or(FALLBACK_VIEWPORT_WIDTH);
+            let device_name = crate::monitors::monitor_device_name(&self.monitors, monitor_id);
             let params = ScaledLayoutParams::from_config(
                 &self.config,
                 scale,
                 viewport_width,
-                self.monitors.get(&monitor_id).map_or("", |m| m.device_name.as_str()),
+                device_name,
             );
 
-            let device_name = self.monitors.get(&monitor_id).map(|m| m.device_name.clone()).unwrap_or_default();
             for workspace in ws_vec.iter_mut() {
                 // Read the previously-applied scaled gap values from the workspace
                 // (not the raw config values) so rescale_column_widths works correctly.
@@ -228,8 +228,7 @@ impl AppState {
                 let was_centering_fitting_columns = workspace.centers_fitting_columns();
 
                 params.apply_to(workspace);
-                self.config.centering_for(&device_name).apply_to(workspace);
-                self.config.direction_for(&device_name).apply_to(workspace);
+                self.config.apply_monitor_rules(device_name, workspace);
 
                 // Rescale column widths to preserve fractions under new gap values
                 workspace.rescale_column_widths(
