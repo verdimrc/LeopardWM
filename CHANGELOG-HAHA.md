@@ -62,6 +62,9 @@
     `column_width`, else the default width.
 
   A window dragged into an existing column takes that column's width, in every mode.
+- `layout.centering_mode = "center_columns_when_narrower"` centers all columns together when they are
+  narrower than the screen. When they are wider, they start at the left edge (right edge with RTL) and
+  the screen scrolls like `"just_in_view"`.
 - `layout.default_width_preset_monitor_overrides` lets each monitor open new columns at its
   own width preset (e.g. `default_width_preset_monitor_overrides = { "2" = 3 }`). Keys are
   Windows display numbers; monitors not listed use `layout.default_width_preset`.
@@ -96,6 +99,7 @@
 | `hotkeys.toggle_new_window_placement_once` | `string` | `"Ctrl+Alt+Shift+N"` | Activate a one-shot new-window-placement override for the next window only. |
 | `behavior.new_window_monitor` (extended) | `"opening" \| "focused" \| "cursor"` | `"opening"` | Adds `"cursor"`: open new windows on the monitor under the mouse cursor. |
 | `behavior.new_width_on_monitor_move` | `"upstream" \| "same_proportion_as_source_monitor" \| "window_rule_width_or_default_width"` | `"upstream"` | Width of a tiled window moved to another monitor. ⚠️ [Known issue with GUI settings](#known-issues-with-gui-settings) |
+| `layout.centering_mode` (extended) | `"center" \| "just_in_view" \| "on_overflow" \| "center_columns_when_narrower"` | `"center"` | Adds `"center_columns_when_narrower"`: center all columns together when they are narrower than the screen. ⚠️ [Known issue with GUI settings](#known-issues-with-gui-settings) |
 
 ### Fixes
 
@@ -125,5 +129,6 @@ doesn't show are reset or removed:
 | `behavior.notify_elevation_blocked` | Reset to `true`. |
 | `behavior.symmetric_modifiers` | Reset to `false`. |
 | `behavior.new_width_on_monitor_move` | Reset to `"upstream"`. |
+| `layout.centering_mode = "center_columns_when_narrower"` | Kept, but the settings window shows "Center" and the tray menu checks no centering mode. Picking another mode in either replaces it. |
 | `layout.default_width_preset_monitor_overrides` | Removed. |
 | Window rule: `column_width` (extended) | Fractions and preset index `1` are kept; preset index `2` or higher and per-display maps are removed. |

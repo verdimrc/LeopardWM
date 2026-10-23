@@ -8,6 +8,7 @@ whether centering may leave **empty space** next to the first or last column.
 | The focused window always in the middle, screen moves a lot | `"center"` |
 | The screen moves as little as possible | `"just_in_view"` |
 | Like `"just_in_view"`, but a window wider than the screen is shown from its middle | `"on_overflow"` |
+| All columns centered together while they're narrower than the screen, otherwise like `"just_in_view"` | `"center_columns_when_narrower"` |
 | With `"center"`: the first column in the middle too, even if that leaves empty space | add `center_past_edges = true` |
 
 ## 1. Examples
@@ -67,6 +68,18 @@ just_in_view   W's left 400px hidden, right edge lined up with the screen's righ
 on_overflow    W centered: 200px hidden on each side
 ```
 
+### 2.4. `center_columns_when_narrower`
+
+This setting centers all columns together, as one strip, while they're narrower than the screen.
+With only A and B open:
+
+```
+focus A   [··AAAAAAAABBBBBBBB··]
+focus B   [··AAAAAAAABBBBBBBB··]     no scroll: the strip stays centered
+```
+
+Once the columns are wider than the screen, as with all four, it behaves like `"just_in_view"`.
+
 ## 3. `center_past_edges`
 
 When set to `true`, centering may leave empty space before the first column or after the last one:
@@ -79,8 +92,9 @@ focus A   [······AAAAAAAABBBBBB]BBCCCCCCCCDDDDDDDD     A really in the mid
 Limitations:
 
 1. **Only effective when `centering_mode = "center"`, or with the "center column" hotkey
-   (Ctrl+Alt+C).** When `centering_mode` is `"just_in_view"` or `"on_overflow"`, moving focus never centers a column that fits on the
-   screen, so `center_past_edges` makes no practical difference.
+   (Ctrl+Alt+C).** When `centering_mode` is `"just_in_view"`, `"on_overflow"`, or
+   `"center_columns_when_narrower"`, moving focus never centers a column that fits on the screen,
+   so `center_past_edges` makes no practical difference.
 2. **The last column is not centered when you focus it.** Focusing D still gives
    `AAAAAAAABBBB[BBBBCCCCCCCCDDDDDDDD]`, i.e., D still at the right edge. You need
    Ctrl+Alt+C to center D.

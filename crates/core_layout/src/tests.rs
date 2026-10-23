@@ -27,6 +27,81 @@ mod tests {
     }
 
     #[test]
+    fn test_center_columns_when_narrower_centers_all_columns_until_they_overflow() {
+        let viewport = Rect::new(100, 50, 1000, 600);
+        // Visible width 960; two 300px columns + 10px gap = 610, so 175px of
+        // space on each side: A starts at 100 + 20 + 175, B 310px later.
+        let centered_xs = vec![295, 605];
+        let xs = |ws: &Workspace| -> Vec<i32> {
+            ws.compute_placements(viewport)
+                .iter()
+                .map(|p| p.rect.x)
+                .collect()
+        };
+        for rtl in [false, true] {
+            for past_edges in [false, true] {
+                for reduce_motion in [false, true] {
+                    let case = format!(
+                        "rtl={rtl}, past_edges={past_edges}, reduce_motion={reduce_motion}"
+                    );
+                    let mut ws = Workspace::with_gaps(10, 20);
+                    ws.set_centering_mode(CenteringMode::CenterColumnsWhenNarrower);
+                    ws.set_rtl(rtl);
+                    ws.set_center_past_edges(past_edges);
+                    ws.set_reduce_motion(reduce_motion);
+                    ws.insert_window(1, Some(300)).unwrap();
+                    ws.insert_window(2, Some(300)).unwrap();
+
+                    // Both columns fit: centered together, whichever is focused.
+                    for _ in 0..2 {
+                        ws.ensure_focused_visible_animated(viewport.width);
+                        ws.stop_animation();
+                        let mut got = xs(&ws);
+                        got.sort();
+                        assert_eq!(got, centered_xs, "{case}");
+                        if rtl {
+                            ws.focus_right()
+                        } else {
+                            ws.focus_left()
+                        }
+                    }
+                    ws.set_scroll_offset(0.0);
+                    ws.reconcile_scroll_bounds(viewport.width);
+                    let mut got = xs(&ws);
+                    got.sort();
+                    assert_eq!(got, centered_xs, "reconcile: {case}");
+
+                    if rtl {
+                        continue;
+                    }
+                    // A third column makes them overflow: start at the left
+                    // edge, then scroll only as far as needed.
+                    ws.insert_window(3, Some(400)).unwrap();
+                    for _ in 0..3 {
+                        ws.focus_left();
+                    }
+                    ws.ensure_focused_visible_animated(viewport.width);
+                    ws.stop_animation();
+                    assert_eq!(ws.scroll_offset(), 0.0, "first column: {case}");
+                    for _ in 0..3 {
+                        ws.focus_right();
+                    }
+                    ws.ensure_focused_visible_animated(viewport.width);
+                    ws.stop_animation();
+                    // 300 + 10 + 300 + 10 + 400 = 1020 wide, 60px over.
+                    assert_eq!(ws.scroll_offset(), 60.0, "last column: {case}");
+
+                    // Back to two columns: centered again.
+                    ws.remove_window(3).unwrap();
+                    ws.ensure_focused_visible_animated(viewport.width);
+                    ws.stop_animation();
+                    assert_eq!(xs(&ws), centered_xs, "after removal: {case}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn test_center_single_column_modes_scroll_and_default() {
         let viewport = Rect::new(100, 50, 1000, 600);
         for mode in [

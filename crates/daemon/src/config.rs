@@ -317,6 +317,9 @@ pub enum CenteringModeConfig {
     /// Center only when the focused column is wider than the viewport;
     /// otherwise behave like `JustInView`.
     OnOverflow,
+    /// Center all columns together when they are narrower than the viewport;
+    /// otherwise behave like `JustInView`.
+    CenterColumnsWhenNarrower,
 }
 
 impl From<CenteringModeConfig> for CenteringMode {
@@ -325,6 +328,9 @@ impl From<CenteringModeConfig> for CenteringMode {
             CenteringModeConfig::Center => CenteringMode::Center,
             CenteringModeConfig::JustInView => CenteringMode::JustInView,
             CenteringModeConfig::OnOverflow => CenteringMode::OnOverflow,
+            CenteringModeConfig::CenterColumnsWhenNarrower => {
+                CenteringMode::CenterColumnsWhenNarrower
+            }
         }
     }
 }
@@ -2016,6 +2022,22 @@ mod tests {
 
         assert_eq!(mode_center, CenteringMode::Center);
         assert_eq!(mode_just_in_view, CenteringMode::JustInView);
+    }
+
+    #[test]
+    fn test_center_columns_when_narrower_parses_and_roundtrips() {
+        let config: Config =
+            toml::from_str("[layout]\ncentering_mode = \"center_columns_when_narrower\"\n").unwrap();
+        assert_eq!(
+            config.layout.centering_mode,
+            CenteringModeConfig::CenterColumnsWhenNarrower
+        );
+        assert_eq!(
+            CenteringMode::from(config.layout.centering_mode),
+            CenteringMode::CenterColumnsWhenNarrower
+        );
+        let parsed: Config = toml::from_str(&toml::to_string_pretty(&config).unwrap()).unwrap();
+        assert_eq!(parsed.layout.centering_mode, config.layout.centering_mode);
     }
 
     #[test]

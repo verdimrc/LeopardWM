@@ -54,10 +54,13 @@ default_width_preset = 1
 # Height presets (fractions of column height / weight).
 height_presets = [0.333, 0.5, 0.667]
 
-# Centering mode: "center", "just_in_view", or "on_overflow"
+# Centering mode: "center", "just_in_view", "on_overflow", or
+# "center_columns_when_narrower"
 # - center: Always center the focused column
 # - just_in_view: Only scroll if focused column would be outside viewport
 # - on_overflow: Center only when the column is wider than the viewport
+# - center_columns_when_narrower: Center all columns together when they are
+#   narrower than the viewport; otherwise like just_in_view
 centering_mode = "{centering_mode}"
 
 # Center the only active tiled column when it fits, regardless of centering mode.

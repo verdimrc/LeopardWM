@@ -52,6 +52,16 @@ impl Workspace {
         min_scroll: f64,
         max_scroll: f64,
     ) -> (f64, f64) {
+        if self.centering_mode == CenteringMode::CenterColumnsWhenNarrower
+            && self.fullscreen_window.is_none()
+        {
+            let total_width = self.total_width();
+            let visible_width = self.visible_width(viewport_width);
+            if total_width > 0 && total_width <= visible_width {
+                let offset = (-(visible_width - total_width) / 2) as f64;
+                return (offset, offset);
+            }
+        }
         if self.center_single_column && self.fullscreen_window.is_none() {
             let mut active = self
                 .columns
@@ -88,7 +98,15 @@ impl Workspace {
             CenteringMode::Center => true,
             CenteringMode::JustInView => false,
             CenteringMode::OnOverflow => col_width > vis_w,
+            CenteringMode::CenterColumnsWhenNarrower => false,
         }
+    }
+
+    /// Whether moving focus may leave the scroll past the content edges
+    /// (`center_past_edges`). `CenterColumnsWhenNarrower` starts overflowing
+    /// columns at the edge instead; the center-column command still may.
+    fn focus_scrolls_past_edges(&self) -> bool {
+        self.center_past_edges && self.centering_mode != CenteringMode::CenterColumnsWhenNarrower
     }
 
     /// Ensure the focused column is visible in the viewport.
@@ -129,7 +147,7 @@ impl Workspace {
             // the strip's right edge aligns with the viewport's right edge.
             // center_single_column still wins via clamp_scroll_offset.
             (raw_max, raw_max)
-        } else if self.center_past_edges {
+        } else if self.focus_scrolls_past_edges() {
             (f64::NEG_INFINITY, raw_max.max(0.0))
         } else {
             (0.0, raw_max.max(0.0))
@@ -248,7 +266,7 @@ impl Workspace {
             }
             // Outside fullscreen, centering needs a viewport; defer bounds repair
             // to reveal/reconcile so removal preserves the animation's start.
-            if !self.center_single_column || self.fullscreen_window.is_some() {
+            if !self.centers_fitting_columns() || self.fullscreen_window.is_some() {
                 let max_scroll = self.total_width().max(0) as f64;
                 self.scroll_offset = self.scroll_offset.clamp(0.0, max_scroll);
             }
@@ -514,7 +532,7 @@ impl Workspace {
         let bounds = min_scroll..=max_scroll;
         if bounds.contains(&target)
             && (bounds.contains(&current)
-                || (self.center_single_column
+                || (self.centers_fitting_columns()
                     && self.fullscreen_window.is_none()
                     && self.active_animation.is_some()))
         {
@@ -663,11 +681,11 @@ impl Workspace {
                 col_right.saturating_sub(vis_w) as f64
             } else {
                 let max_scroll = raw_max.max(0) as f64;
-                if current < -0.5 && !self.rtl && !self.center_past_edges {
+                if current < -0.5 && !self.rtl && !self.focus_scrolls_past_edges() {
                     0.0
                 } else if current > max_scroll + 0.5 {
                     max_scroll
-                } else if self.center_single_column {
+                } else if self.centers_fitting_columns() {
                     current
                 } else {
                     return;
@@ -676,7 +694,7 @@ impl Workspace {
         };
 
         let max_scroll = (self.total_width() - vis_w).max(0) as f64;
-        let min_scroll = if self.center_past_edges {
+        let min_scroll = if self.focus_scrolls_past_edges() {
             f64::NEG_INFINITY
         } else {
             0.0

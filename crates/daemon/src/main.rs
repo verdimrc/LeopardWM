@@ -365,6 +365,8 @@ fn quick_toggle_state(config: &Config) -> tray::QuickToggleState {
             config::CenteringModeConfig::Center => tray::CENTERING_CENTER,
             config::CenteringModeConfig::JustInView => tray::CENTERING_JUST_IN_VIEW,
             config::CenteringModeConfig::OnOverflow => tray::CENTERING_ON_OVERFLOW,
+            // No tray item for this mode: none is checked.
+            config::CenteringModeConfig::CenterColumnsWhenNarrower => tray::CENTERING_NONE,
         },
         placement_mode: placement_to_tray(config.behavior.new_window_placement),
     }

@@ -22,6 +22,9 @@ pub enum CenteringMode {
     /// Center only when the focused column is wider than the viewport (so it
     /// cannot fit otherwise); behave like `JustInView` for columns that fit.
     OnOverflow,
+    /// Center all active columns together when their total width is narrower
+    /// than the viewport; otherwise behave like `JustInView`.
+    CenterColumnsWhenNarrower,
 }
 
 /// A floating window that is not part of the tiling layout.
@@ -534,6 +537,13 @@ impl Workspace {
 
     pub fn center_single_column(&self) -> bool {
         self.center_single_column
+    }
+
+    /// Whether fitting columns are held centered (`center_single_column` or
+    /// `CenteringMode::CenterColumnsWhenNarrower`), so scroll bounds can
+    /// collapse to a centered offset that needs reconciling.
+    pub fn centers_fitting_columns(&self) -> bool {
+        self.center_single_column || self.centering_mode == CenteringMode::CenterColumnsWhenNarrower
     }
 
     /// Set whether center-column can scroll past content edges.

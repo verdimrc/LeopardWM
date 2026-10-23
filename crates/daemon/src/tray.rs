@@ -148,6 +148,7 @@ pub enum TrayEvent {
 pub const CENTERING_CENTER: u8 = 0;
 pub const CENTERING_JUST_IN_VIEW: u8 = 1;
 pub const CENTERING_ON_OVERFLOW: u8 = 2;
+pub const CENTERING_NONE: u8 = 3;
 pub const PLACEMENT_NEW_COLUMN: u8 = 0;
 pub const PLACEMENT_IN_COLUMN: u8 = 1;
 pub const TASKBAR_HIDE_OFFSCREEN: u8 = 0;
@@ -207,7 +208,7 @@ pub struct QuickToggleState {
     pub focus_follows_mouse: bool,
     pub taskbar_buttons: u8,
     pub auto_start: bool,
-    /// 0 = Center, 1 = JustInView, 2 = OnOverflow
+    /// 0 = Center, 1 = JustInView, 2 = OnOverflow, 3 = none (no tray item)
     pub centering_mode: u8,
     /// 0 = NewColumn, 1 = InColumn
     pub placement_mode: u8,
