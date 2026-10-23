@@ -38,6 +38,9 @@ pub struct Config {
     /// Window rules for per-window behavior.
     #[serde(default)]
     pub window_rules: Vec<WindowRule>,
+    /// Per-monitor overrides of `[layout]` centering settings.
+    #[serde(default)]
+    pub monitor_rules: Vec<MonitorRule>,
     /// Gesture bindings for touchpad support.
     #[serde(default)]
     pub gestures: GestureConfig,
@@ -53,6 +56,63 @@ pub struct Config {
     /// Overview-mode configuration.
     #[serde(default)]
     pub overview: OverviewConfig,
+}
+
+/// Per-monitor override of `[layout]` centering settings. Unset fields keep
+/// the `[layout]` value; the first rule for a display wins.
+///
+/// ```toml
+/// [[monitor_rules]]
+/// display = 3  # \\.\DISPLAY3
+/// centering_mode = "center_columns_when_narrower"
+/// center_past_edges = true
+/// ```
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MonitorRule {
+    /// Windows display number (`3` = `\\.\DISPLAY3`).
+    pub display: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub centering_mode: Option<CenteringModeConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub center_past_edges: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub center_single_column: Option<bool>,
+}
+
+/// Centering settings in effect on one monitor (see `Config::centering_for`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MonitorCentering {
+    pub centering_mode: CenteringModeConfig,
+    pub center_past_edges: bool,
+    pub center_single_column: bool,
+}
+
+impl MonitorCentering {
+    pub fn apply_to(&self, workspace: &mut leopardwm_core_layout::Workspace) {
+        workspace.set_centering_mode(self.centering_mode.into());
+        workspace.set_center_past_edges(self.center_past_edges);
+        workspace.set_center_single_column(self.center_single_column);
+    }
+}
+
+impl Config {
+    /// Centering settings for the monitor with this device name (e.g.
+    /// `\\.\DISPLAY3`): `[layout]`, overridden by its first `[[monitor_rules]]`.
+    pub fn centering_for(&self, device_name: &str) -> MonitorCentering {
+        let rule = display_index(device_name)
+            .and_then(|n| self.monitor_rules.iter().find(|rule| rule.display == n));
+        MonitorCentering {
+            centering_mode: rule
+                .and_then(|r| r.centering_mode)
+                .unwrap_or(self.layout.centering_mode),
+            center_past_edges: rule
+                .and_then(|r| r.center_past_edges)
+                .unwrap_or(self.layout.center_past_edges),
+            center_single_column: rule
+                .and_then(|r| r.center_single_column)
+                .unwrap_or(self.layout.center_single_column),
+        }
+    }
 }
 
 /// Overview-mode configuration.
@@ -2022,6 +2082,54 @@ mod tests {
 
         assert_eq!(mode_center, CenteringMode::Center);
         assert_eq!(mode_just_in_view, CenteringMode::JustInView);
+    }
+
+    #[test]
+    fn test_monitor_rules_override_centering_per_display() {
+        let config: Config = toml::from_str(
+            r#"
+            [layout]
+            centering_mode = "just_in_view"
+            center_past_edges = false
+            center_single_column = true
+
+            [[monitor_rules]]
+            display = 2
+            centering_mode = "center_columns_when_narrower"
+            center_past_edges = true
+
+            [[monitor_rules]]
+            display = 2
+            centering_mode = "center"
+            center_single_column = false
+            "#,
+        )
+        .unwrap();
+        let layout = MonitorCentering {
+            centering_mode: CenteringModeConfig::JustInView,
+            center_past_edges: false,
+            center_single_column: true,
+        };
+        assert_eq!(config.centering_for(r"\\.\DISPLAY1"), layout);
+        assert_eq!(config.centering_for(""), layout);
+        // The first rule for display 2 wins; what it leaves out comes from [layout].
+        assert_eq!(
+            config.centering_for(r"\\.\DISPLAY2"),
+            MonitorCentering {
+                centering_mode: CenteringModeConfig::CenterColumnsWhenNarrower,
+                center_past_edges: true,
+                center_single_column: true,
+            }
+        );
+
+        let saved = toml::to_string_pretty(&config).unwrap();
+        let parsed: Config = toml::from_str(&saved).unwrap();
+        assert_eq!(parsed.monitor_rules, config.monitor_rules, "{saved}");
+        assert!(Config::default().monitor_rules.is_empty());
+        assert!(
+            toml::from_str::<Config>("[[monitor_rules]]\ncentering_mode = \"center\"\n").is_err(),
+            "display is required"
+        );
     }
 
     #[test]

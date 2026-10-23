@@ -3,12 +3,14 @@
 `centering_mode` decides **when** the screen scrolls as you move focus. `center_past_edges` decides
 whether centering may leave **empty space** next to the first or last column.
 
+✨ marks what only haha adds.
+
 | You want | Setting |
 |---|---|
 | The focused window always in the middle, screen moves a lot | `"center"` |
 | The screen moves as little as possible | `"just_in_view"` |
 | Like `"just_in_view"`, but a window wider than the screen is shown from its middle | `"on_overflow"` |
-| All columns centered together while they're narrower than the screen, otherwise like `"just_in_view"` | `"center_columns_when_narrower"` |
+| All columns centered together while they're narrower than the screen, otherwise like `"just_in_view"` | ✨`"center_columns_when_narrower"` |
 | With `"center"`: the first column in the middle too, even if that leaves empty space | add `center_past_edges = true` |
 
 ## 1. Examples
@@ -68,7 +70,7 @@ just_in_view   W's left 400px hidden, right edge lined up with the screen's righ
 on_overflow    W centered: 200px hidden on each side
 ```
 
-### 2.4. `center_columns_when_narrower`
+### 2.4. ✨`center_columns_when_narrower`
 
 This setting centers all columns together, as one strip, while they're narrower than the screen.
 With only A and B open:
@@ -111,4 +113,16 @@ instead of putting it at the left edge. It works with every `centering_mode` and
 ```
 off   [AAAAAAAA············]
 on    [······AAAAAAAA······]
+```
+
+## 5. ✨Per monitor: `[[monitor_rules]]`
+
+The settings above apply to every monitor. A monitor rule overrides any of them for one monitor,
+by its Windows display number (`3` = `\.\DISPLAY3`). Options left out keep the `[layout]` value:
+
+```toml
+[[monitor_rules]]
+display = 3
+centering_mode = "center_columns_when_narrower"
+center_past_edges = true
 ```

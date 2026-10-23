@@ -229,10 +229,8 @@ impl AppState {
                 let was_centering_fitting_columns = workspace.centers_fitting_columns();
 
                 params.apply_to(workspace);
-                workspace.set_centering_mode(self.config.layout.centering_mode.into());
-                workspace.set_center_past_edges(self.config.layout.center_past_edges);
+                self.config.centering_for(&device_name).apply_to(workspace);
                 workspace.set_rtl(self.config.layout.is_rtl_monitor(&device_name));
-                workspace.set_center_single_column(self.config.layout.center_single_column);
 
                 // Rescale column widths to preserve fractions under new gap values
                 workspace.rescale_column_widths(

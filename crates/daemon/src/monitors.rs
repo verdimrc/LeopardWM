@@ -159,9 +159,7 @@ impl AppState {
                 {
                     source_viewport_widths.insert(monitor.id, source_viewport_width);
                     for workspace in &mut stashed_ws {
-                        workspace.set_centering_mode(self.config.layout.centering_mode.into());
-                        workspace.set_center_past_edges(self.config.layout.center_past_edges);
-                        workspace.set_center_single_column(self.config.layout.center_single_column);
+                        self.config.centering_for(&monitor.device_name).apply_to(workspace);
                         workspace.ensure_focused_visible(source_viewport_width);
                     }
                     let returning: HashSet<u64> =
@@ -235,9 +233,7 @@ impl AppState {
                 );
                 workspace.set_default_column_width(params.default_column_width);
                 workspace.set_tab_strip_reserve_px(params.tab_strip_reserve_px);
-                workspace.set_centering_mode(self.config.layout.centering_mode.into());
-                workspace.set_center_past_edges(self.config.layout.center_past_edges);
-                workspace.set_center_single_column(self.config.layout.center_single_column);
+                self.config.centering_for(&monitor.device_name).apply_to(&mut workspace);
                 workspace.set_reduce_motion(self.reduce_motion);
                 workspace.set_scroll_animation(
                     self.config.animation.scroll_duration_ms,

@@ -207,6 +207,15 @@ reduce_motion_on_battery = true
 # ("") to keep that workspace's number. Omit the list to name nothing.
 # names = ["web", "code", "chat", "media"]
 
+# Per-monitor centering: override centering_mode, center_past_edges, or
+# center_single_column for one Windows display number ("3" = \\.\DISPLAY3).
+# Options left out keep the [layout] value; the first rule for a display wins.
+# [[monitor_rules]]
+# display = 3
+# centering_mode = "center"
+# center_past_edges = false
+# center_single_column = false
+
 # Built-in example: Firefox / Zen Picture-in-Picture popups draw their own
 # square frame, so we override the focus-border corner style to match. Edit
 # or remove freely — corner_style accepts "square" | "rounded" | "small_rounded".

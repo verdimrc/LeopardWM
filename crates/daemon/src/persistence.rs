@@ -288,15 +288,13 @@ impl AppState {
                 self.monitors.get(&monitor_id).map_or("", |m| m.device_name.as_str()),
             );
             params.apply_to(&mut ws);
-            ws.set_centering_mode(self.config.layout.centering_mode.into());
-            ws.set_center_past_edges(self.config.layout.center_past_edges);
-            ws.set_center_single_column(self.config.layout.center_single_column);
+            let device_name = self.monitors.get(&monitor_id).map(|m| m.device_name.as_str()).unwrap_or("");
+            self.config.centering_for(device_name).apply_to(&mut ws);
             ws.set_reduce_motion(self.reduce_motion);
             ws.set_scroll_animation(
                 self.config.animation.scroll_duration_ms,
                 self.config.animation.easing,
             );
-            let device_name = self.monitors.get(&monitor_id).map(|m| m.device_name.as_str()).unwrap_or("");
             ws.set_rtl(self.config.layout.is_rtl_monitor(device_name));
             ws.set_scroll_offset(ws_snapshot.workspace.scroll_offset());
             ws.reconcile_scroll_bounds(vw);
@@ -314,15 +312,12 @@ impl AppState {
                 );
                 empty.set_default_column_width(params.default_column_width);
                 empty.set_tab_strip_reserve_px(params.tab_strip_reserve_px);
-                empty.set_centering_mode(self.config.layout.centering_mode.into());
-                empty.set_center_past_edges(self.config.layout.center_past_edges);
-                empty.set_center_single_column(self.config.layout.center_single_column);
+                self.config.centering_for(device_name).apply_to(&mut empty);
                 empty.set_reduce_motion(self.reduce_motion);
                 empty.set_scroll_animation(
                     self.config.animation.scroll_duration_ms,
                     self.config.animation.easing,
                 );
-                let device_name = self.monitors.get(&monitor_id).map(|m| m.device_name.as_str()).unwrap_or("");
                 empty.set_rtl(self.config.layout.is_rtl_monitor(device_name));
                 entry.push(empty);
             }
@@ -390,9 +385,7 @@ impl AppState {
                         );
                         ws.set_default_column_width(params.default_column_width);
                         ws.set_tab_strip_reserve_px(params.tab_strip_reserve_px);
-                        ws.set_centering_mode(self.config.layout.centering_mode.into());
-                        ws.set_center_past_edges(self.config.layout.center_past_edges);
-                        ws.set_center_single_column(self.config.layout.center_single_column);
+                        self.config.centering_for(&device_name).apply_to(&mut ws);
                         ws.set_reduce_motion(self.reduce_motion);
                         ws.set_scroll_animation(
                             self.config.animation.scroll_duration_ms,
@@ -403,8 +396,7 @@ impl AppState {
                     }
                     // Restore scroll offset from saved workspace
                     let saved_offset = ws_snapshot.workspace.scroll_offset();
-                    ws_vec[ws_idx]
-                        .set_center_single_column(self.config.layout.center_single_column);
+                    self.config.centering_for(&device_name).apply_to(&mut ws_vec[ws_idx]);
                     ws_vec[ws_idx].set_scroll_offset(saved_offset);
                     ws_vec[ws_idx].reconcile_scroll_bounds(vw);
                     restored_monitors.insert(id);

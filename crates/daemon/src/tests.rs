@@ -10166,6 +10166,35 @@ fn test_cmd_move_to_monitor_right_single() {
     assert_eq!(resp, IpcResponse::Ok); // no-op: no monitor to the right
 }
 
+#[test]
+fn test_monitor_rules_set_centering_on_their_monitor_only() {
+    use leopardwm_core_layout::CenteringMode;
+    let mut config = test_config();
+    config.layout.centering_mode = config::CenteringModeConfig::JustInView;
+    config.monitor_rules = vec![config::MonitorRule {
+        display: 2,
+        centering_mode: Some(config::CenteringModeConfig::CenterColumnsWhenNarrower),
+        center_single_column: Some(true),
+        ..Default::default()
+    }];
+    let mut state = AppState::new_with_config(config, two_monitors());
+    let modes = |state: &AppState, monitor| {
+        let ws = &state.workspaces[&monitor][0];
+        (ws.centering_mode(), ws.center_single_column())
+    };
+    assert_eq!(modes(&state, 1), (CenteringMode::JustInView, false));
+    assert_eq!(
+        modes(&state, 2),
+        (CenteringMode::CenterColumnsWhenNarrower, true)
+    );
+
+    // Reloading with the rule removed falls back to [layout].
+    let mut reloaded = state.config.clone();
+    reloaded.monitor_rules.clear();
+    state.apply_config(reloaded);
+    assert_eq!(modes(&state, 2), (CenteringMode::JustInView, false));
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum MoveBy {
     Hotkey,
