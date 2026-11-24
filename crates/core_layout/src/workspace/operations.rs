@@ -186,7 +186,7 @@ impl Workspace {
         if delta == 0 {
             return;
         }
-        self.maximized_column = None;
+        self.forget_focused_maximized();
         if let Some(column) = self.columns.get(self.focused_column) {
             let new_width = self.effective_column_width(column).saturating_add(delta);
             let column = &mut self.columns[self.focused_column];

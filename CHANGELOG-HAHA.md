@@ -148,6 +148,8 @@ Diff between `36574ea` .. HEAD
   tested; no consistent repro trigger).
 - Window resizing after opening a new window now targets the focused window.
 - A newly opened window no longer occasionally stays untiled.
+- The maximize shortcut no longer restores a window maximized earlier instead of maximizing the focused
+  one. Each window is maximized and restored on its own.
 - After Ctrl+Alt+C centers a window with `center_past_edges = true`, moving focus to a window that is
   already fully visible no longer scrolls the screen back to the edge.
 - Cross-monitor window moves:

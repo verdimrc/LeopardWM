@@ -86,17 +86,17 @@ impl Workspace {
         true
     }
 
-    /// Maximizes the focused column after restoring any existing maximized column.
+    /// Maximizes the focused column unless it is already maximized. Other
+    /// maximized columns stay maximized.
     pub fn maximize_focused_column(&mut self, viewport_width: i32) {
-        if self.maximized_column.is_some() {
+        if self.focused_maximized_entry().is_none() {
             self.toggle_maximize_column(viewport_width);
         }
-        self.toggle_maximize_column(viewport_width);
     }
 
-    /// With saved maximize state, restores the sentinel's column if found and returns `false`.
-    /// Otherwise maximizes focus and returns `true`; no valid column returns `false`.
-    /// Exits fullscreen first.
+    /// Restores the focused column if it is maximized and returns `false`.
+    /// Otherwise maximizes it and returns `true`; no valid column returns
+    /// `false`. Other maximized columns stay maximized. Exits fullscreen first.
     pub fn toggle_maximize_column(&mut self, viewport_width: i32) -> bool {
         if let Some(fs_wid) = self.fullscreen_window.take() {
             self.window_min_widths.remove(&fs_wid);
@@ -105,12 +105,11 @@ impl Workspace {
 
         let vis_w = self.visible_width(viewport_width);
 
-        if let Some(state) = self.maximized_column.take() {
-            if let Some((col_idx, _)) = self.find_window_location(state.sentinel_window) {
-                if let Some(column) = self.columns.get_mut(col_idx) {
-                    column.set_width(state.original_width);
-                    column.width_fraction_cache = state.width_fraction_cache;
-                }
+        if let Some(entry) = self.focused_maximized_entry() {
+            let state = self.maximized_columns.remove(entry);
+            if let Some(column) = self.columns.get_mut(self.focused_column) {
+                column.set_width(state.original_width);
+                column.width_fraction_cache = state.width_fraction_cache;
             }
             return false;
         }
@@ -125,7 +124,7 @@ impl Workspace {
             if let Some(column) = self.columns.get_mut(self.focused_column) {
                 column.set_width(vis_w);
             }
-            self.maximized_column = Some(super::MaximizedColumnState {
+            self.maximized_columns.push(super::MaximizedColumnState {
                 original_width,
                 width_fraction_cache,
                 sentinel_window,
@@ -136,9 +135,26 @@ impl Workspace {
         false
     }
 
+    /// Index in `maximized_columns` of the entry for the focused column, found
+    /// by its sentinel window so it survives column index shifts.
+    fn focused_maximized_entry(&self) -> Option<usize> {
+        self.maximized_columns.iter().position(|state| {
+            self.find_window_location(state.sentinel_window)
+                .is_some_and(|(col_idx, _)| col_idx == self.focused_column)
+        })
+    }
+
+    /// Forget the focused column's maximized state, e.g. after its width is
+    /// set directly. Other maximized columns keep theirs.
+    pub(super) fn forget_focused_maximized(&mut self) {
+        if let Some(entry) = self.focused_maximized_entry() {
+            self.maximized_columns.remove(entry);
+        }
+    }
+
     /// Sets width using the gap-aware viewport fraction, clamped to 0.1–1.0.
     pub fn set_focused_column_width_fraction(&mut self, fraction: f64, viewport_width: i32) {
-        self.maximized_column = None;
+        self.forget_focused_maximized();
         let fraction = fraction.clamp(0.1, 1.0);
         let base = self.width_base(viewport_width);
         let gap = self.gap.max(0);
@@ -201,7 +217,7 @@ impl Workspace {
     /// Shares viewport width among non-fully-minimized columns, accounting for gaps and the minimum
     /// column width.
     pub fn equalize_column_widths(&mut self, viewport_width: i32) {
-        self.maximized_column = None;
+        self.maximized_columns.clear();
         if self.columns.is_empty() {
             return;
         }
@@ -277,7 +293,7 @@ impl Workspace {
             );
             col.set_width(width);
         }
-        if let Some(state) = &mut self.maximized_column {
+        for state in &mut self.maximized_columns {
             state.original_width = Self::rescaled_width(
                 state.original_width,
                 &mut state.width_fraction_cache,
@@ -359,7 +375,7 @@ impl Workspace {
     }
 
     fn cycle_width_impl(&mut self, presets: &[f64], viewport_width: i32, cycle: PresetCycle) {
-        self.maximized_column = None;
+        self.forget_focused_maximized();
         if presets.is_empty() {
             return;
         }

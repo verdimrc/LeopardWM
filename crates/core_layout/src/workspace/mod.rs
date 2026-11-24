@@ -100,8 +100,9 @@ pub struct Workspace {
     /// Outside fullscreen, pins scroll to center when exactly one active column fits.
     #[serde(skip)]
     pub(crate) center_single_column: bool,
+    /// One entry per maximized column, each restored on its own.
     #[serde(skip)]
-    pub(crate) maximized_column: Option<MaximizedColumnState>,
+    pub(crate) maximized_columns: Vec<MaximizedColumnState>,
     /// DPI-scaled tab-strip space supplied by the daemon from `appearance.tab_strip_height`.
     /// Zero reserves no space, allowing the overlay to overlap the active tab or extend above the
     /// work area.
@@ -154,7 +155,7 @@ impl Default for Workspace {
             scroll_easing: Easing::default(),
             center_past_edges: false,
             center_single_column: false,
-            maximized_column: None,
+            maximized_columns: Vec::new(),
             tab_strip_reserve_px: 0,
             rtl: false,
             right_aligned: false,

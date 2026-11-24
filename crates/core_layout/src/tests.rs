@@ -3566,6 +3566,32 @@ mod tests {
     }
 
     #[test]
+    fn test_maximize_acts_on_the_focused_column_only() {
+        // A and B side by side. Maximize A, focus B, maximize again: B is
+        // maximized and A stays maximized. Each later press restores only
+        // the focused column.
+        let mut ws = gapless_workspace();
+        ws.insert_window(1, Some(300)).unwrap();
+        ws.insert_window(2, Some(400)).unwrap();
+        let widths = |ws: &Workspace| (ws.columns()[0].width(), ws.columns()[1].width());
+
+        ws.focus_left();
+        assert!(ws.toggle_maximize_column(1000), "A is maximized");
+        assert_eq!(widths(&ws), (1000, 400));
+
+        ws.focus_right();
+        assert!(ws.toggle_maximize_column(1000), "B is maximized, not A restored");
+        assert_eq!(widths(&ws), (1000, 1000));
+
+        assert!(!ws.toggle_maximize_column(1000), "B is restored");
+        assert_eq!(widths(&ws), (1000, 400));
+
+        ws.focus_left();
+        assert!(!ws.toggle_maximize_column(1000), "A is restored");
+        assert_eq!(widths(&ws), (300, 400));
+    }
+
+    #[test]
     fn test_rescale_column_widths_maximized_restore_round_trip() {
         let mut ws = Workspace::with_gaps(10, 10);
         ws.insert_window(1, Some(1267)).unwrap();
