@@ -1,5 +1,3 @@
-//! Window rule evaluation and application: tile/float/ignore decisions and rule-driven enumeration.
-
 use crate::config;
 use crate::state::*;
 use anyhow::Result;
@@ -40,7 +38,6 @@ impl AppState {
     /// Apply changed rule outcomes to managed windows, preserving manual overrides
     /// when the previous and current rules decide the same action.
     pub(crate) fn reapply_window_rules(&mut self, previous_rules: &[config::CompiledWindowRule]) {
-        // Collect all managed windows with their current state
         let mut transitions: Vec<(u64, MonitorId, usize, config::WindowAction, bool)> = Vec::new();
 
         for (&monitor_id, ws_vec) in &self.workspaces {
@@ -76,7 +73,6 @@ impl AppState {
             }
         }
 
-        // Pre-compute floating rects before mutating workspaces (avoids borrow conflicts)
         let float_rects: std::collections::HashMap<u64, Rect> = transitions
             .iter()
             .filter(|(_, _, _, action, is_floating)| {
@@ -100,7 +96,6 @@ impl AppState {
         for (wid, monitor_id, ws_idx, action, is_floating) in transitions {
             match action {
                 config::WindowAction::Float if !is_floating => {
-                    // Currently tiled, should be floating — restore snap before moving
                     self.restore_snap_for_window(wid);
                     let viewport = self
                         .monitors
@@ -128,7 +123,6 @@ impl AppState {
                     }
                 }
                 config::WindowAction::Tile if is_floating => {
-                    // Currently floating, should be tiled
                     if let Some(workspace) = self
                         .workspaces
                         .get_mut(&monitor_id)
@@ -140,7 +134,6 @@ impl AppState {
                     }
                 }
                 config::WindowAction::Ignore => {
-                    // Should no longer be managed — restore snap and remove from workspace
                     self.restore_snap_for_window(wid);
                     if let Some(workspace) = self
                         .workspaces
@@ -158,7 +151,7 @@ impl AppState {
                         info!("Rule change: unmanaged window {} (ignore)", wid);
                     }
                 }
-                _ => {} // No change needed
+                _ => {}
             }
         }
     }
@@ -206,7 +199,6 @@ impl AppState {
         rect
     }
 
-    /// Enumerate windows and add them to the appropriate workspace based on position.
     pub(crate) fn enumerate_and_add_windows(&mut self) -> Result<usize> {
         let windows = self.windows_for_enumeration()?;
         let monitors: Vec<_> = self.monitors.values().cloned().collect();
@@ -258,7 +250,6 @@ impl AppState {
                 .map(|m| m.id)
                 .unwrap_or(self.focused_monitor);
 
-            // Get floating rect before borrowing workspace mutably (to avoid borrow conflict)
             let floating_rect = if action == config::WindowAction::Float {
                 Some(self.get_floating_rect_from_rules(
                     &win_info.class_name,
@@ -293,7 +284,6 @@ impl AppState {
                 continue;
             }
 
-            // New windows land on the monitor's active workspace.
             let target_idx = self.active_workspace_idx(monitor_id);
             let _ = self.ensure_workspace_exists(monitor_id, target_idx);
             if let Some(workspace) = self
@@ -303,7 +293,6 @@ impl AppState {
             {
                 match action {
                     config::WindowAction::Float => {
-                        // Use rule dimensions or default to centered 800x600 window
                         let rule_rect = floating_rect.unwrap_or_else(|| {
                             let viewport = self
                                 .monitors
@@ -369,7 +358,7 @@ impl AppState {
                             }
                         }
                     }
-                    config::WindowAction::Ignore => unreachable!(), // Handled above
+                    config::WindowAction::Ignore => unreachable!(),
                 }
             }
         }
@@ -450,7 +439,6 @@ impl AppState {
         )
     }
 
-    /// Evaluate window rules and return the action for a window.
     pub(crate) fn evaluate_window_rules(
         &self,
         class_name: &str,
@@ -529,7 +517,6 @@ impl AppState {
         }
     }
 
-    /// The first window rule matching this window, if any (first match wins).
     pub(crate) fn matched_rule(
         &self,
         class_name: &str,

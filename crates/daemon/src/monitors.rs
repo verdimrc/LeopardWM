@@ -1,5 +1,3 @@
-//! Monitor topology reconciliation and cross-monitor window moves.
-
 use crate::helpers::ScaledLayoutParams;
 use crate::state::*;
 use leopardwm_core_layout::{Rect, Workspace};
@@ -30,11 +28,6 @@ fn apply_reconciled_geometry(
 }
 
 impl AppState {
-    /// Reconcile workspaces after monitor configuration change.
-    ///
-    /// This handles:
-    /// - Removing workspaces for disconnected monitors (migrating windows to primary)
-    /// - Adding workspaces for newly connected monitors
     #[allow(clippy::too_many_lines)]
     pub(crate) fn reconcile_monitors(&mut self, new_monitors: Vec<MonitorInfo>) {
         let new_ids: HashSet<MonitorId> = new_monitors.iter().map(|m| m.id).collect();
@@ -67,8 +60,6 @@ impl AppState {
                 .map(|m| (m.device_name.as_str(), m.id))
                 .collect();
 
-            // If every device_name from the old set has a match in the new set,
-            // this is a handle change, not a topology change.
             let remap: HashMap<MonitorId, MonitorId> = old_by_name
                 .iter()
                 .filter_map(|(name, &old_id)| new_by_name.get(name).map(|&new_id| (old_id, new_id)))
@@ -95,7 +86,6 @@ impl AppState {
                         }
                     }
                 }
-                // Update monitor info — no migration needed
                 self.monitors = new_monitors.into_iter().map(|m| (m.id, m)).collect();
                 // Re-apply scaled gaps in case DPI or work area changed
                 for (&monitor_id, ws_vec) in self.workspaces.iter_mut() {
@@ -134,7 +124,6 @@ impl AppState {
             }
         }
 
-        // Find primary monitor in new config (or first available)
         let primary_id = new_monitors
             .iter()
             .find(|m| m.is_primary)
@@ -244,7 +233,6 @@ impl AppState {
             }
         }
 
-        // Handle removed monitors - migrate ALL workspaces' windows to primary's active workspace
         for removed_id in old_ids.difference(&new_ids) {
             // The stable device_name and active index, captured before the
             // monitor info is dropped, so a reconnect can restore this layout.
@@ -252,7 +240,6 @@ impl AppState {
             let source_viewport_width = old_viewport_widths[removed_id];
             let active_idx = self.active_workspace.get(removed_id).copied().unwrap_or(0);
             if let Some(old_ws_vec) = self.workspaces.remove(removed_id) {
-                // Collect tiled and floating windows separately to preserve their type
                 let mut tiled_window_ids = Vec::new();
                 let mut floating_windows = Vec::new();
                 let mut minimized_ids = Vec::new();
@@ -274,7 +261,6 @@ impl AppState {
                 }
                 if let Some(primary) = primary_id {
                     let primary_active_idx = self.active_workspace_idx(primary);
-                    // Source monitor info is still available (removed from self.monitors later).
                     let source_wa = self.monitors.get(removed_id).map(|m| m.work_area);
                     let target_wa = self.monitors.get(&primary).map(|m| m.work_area);
                     if let Some(primary_ws) = self
@@ -307,7 +293,6 @@ impl AppState {
                                 warn!("Failed to migrate floating window {}: {}", wid, e);
                             }
                         }
-                        // Restore minimized state for migrated windows
                         for wid in &minimized_ids {
                             primary_ws.mark_minimized(*wid);
                         }
@@ -339,7 +324,6 @@ impl AppState {
             self.monitors.remove(removed_id);
         }
 
-        // Update monitor info
         self.monitors = new_monitors.into_iter().map(|m| (m.id, m)).collect();
 
         // Re-apply scaled gaps to ALL existing workspaces — monitor DPI or work
@@ -374,7 +358,6 @@ impl AppState {
             }
         }
 
-        // Update focused monitor if it was removed
         if !self.monitors.contains_key(&self.focused_monitor) {
             self.focused_monitor = primary_id.unwrap_or(0);
         }
@@ -444,9 +427,6 @@ impl AppState {
         self.resync_minimized_with(leopardwm_platform_win32::window_minimized_state);
     }
 
-    /// Core of [`resync_minimized_from_os`], parameterized on the per-window OS
-    /// state (`None` = dead window, left alone; `Some(minimized)` otherwise) so
-    /// the flag-correction logic is testable without real window handles.
     pub(crate) fn resync_minimized_with(&mut self, os_minimized: impl Fn(u64) -> Option<bool>) {
         for ws_vec in self.workspaces.values_mut() {
             for ws in ws_vec.iter_mut() {
@@ -466,22 +446,13 @@ impl AppState {
     }
 
     /// Move the focused window to another monitor using an all-or-nothing update.
-    ///
-    /// The source and target workspaces are mutated on cloned snapshots first and
-    /// committed only if both remove and insert operations succeed.
     pub(crate) fn move_focused_window_to_monitor_transactional(
         &mut self,
         target_monitor: MonitorId,
     ) -> std::result::Result<Option<u64>, String> {
-        let source_monitor = self.focused_monitor;
-        if source_monitor == target_monitor {
-            return Ok(None);
-        }
-
         // Prefer the OS-foreground window so floating windows can be moved too.
+        let source_monitor = self.focused_monitor;
         let src_idx = self.active_workspace_idx(source_monitor);
-        let tgt_idx = self.active_workspace_idx(target_monitor);
-
         let os_focus = self.previous_focused_hwnd.and_then(|hwnd| {
             self.workspaces
                 .get(&source_monitor)
@@ -493,6 +464,24 @@ impl AppState {
         let Some(window_id) = os_focus.or(tiled_focus) else {
             return Ok(None);
         };
+        self.move_window_to_monitor_transactional(window_id, target_monitor)
+    }
+
+    /// Move a window on the focused monitor's active workspace to another monitor.
+    ///
+    /// The source and target workspaces are mutated on cloned snapshots first and
+    /// committed only if both remove and insert operations succeed.
+    pub(crate) fn move_window_to_monitor_transactional(
+        &mut self,
+        window_id: u64,
+        target_monitor: MonitorId,
+    ) -> std::result::Result<Option<u64>, String> {
+        let source_monitor = self.focused_monitor;
+        if source_monitor == target_monitor {
+            return Ok(None);
+        }
+        let src_idx = self.active_workspace_idx(source_monitor);
+        let tgt_idx = self.active_workspace_idx(target_monitor);
 
         let Some(source_ws_vec) = self.workspaces.get(&source_monitor) else {
             return Err(format!(
@@ -527,7 +516,6 @@ impl AppState {
                 .find(|f| f.id == window_id)
                 .map(|f| f.rect)
                 .unwrap_or(leopardwm_core_layout::Rect::new(0, 0, 800, 600));
-            // Translate floating coordinates from source to target monitor work area
             let translated_rect = match (
                 self.monitors.get(&source_monitor),
                 self.monitors.get(&target_monitor),
@@ -582,6 +570,7 @@ impl AppState {
             source_workspace.ensure_focused_visible(source_viewport);
             target_workspace.stop_animation();
             target_workspace.ensure_focused_visible(target_viewport);
+            source_workspace.reconcile_scroll_bounds(self.viewport_width_for(source_monitor));
         }
 
         self.workspaces.get_mut(&source_monitor).unwrap()[src_idx] = source_workspace;

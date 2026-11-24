@@ -1,6 +1,6 @@
 # Change log of haha branch
 
-Diff between `c673836` .. HEAD
+Diff between `36574ea` .. HEAD
 
 ## 1. Features
 
@@ -94,6 +94,7 @@ Diff between `c673836` .. HEAD
   - Shows on all monitors simultaneously with Ctrl+Alt+Win+Space (`hotkeys.toggle_overview_all`).
   - Shows the monitor device name.
   - Shows empty workspace rows on monitors with no windows.
+  - Workspace panels are right-aligned when `direction` is `"rtl"` or `"ltr_right_aligned"`.
 
 ### 1.6. Desktop peek
 
@@ -117,6 +118,7 @@ Diff between `c673836` .. HEAD
 - Right Ctrl and Right Alt are interchangeable with their left counterparts in hotkeys.
   Opt in with `behavior.symmetric_modifiers = true` in the config. Useful for one-handed operation.
 - `behavior.notify_elevation_blocked` silences the toast when a privilege-elevated window is excluded from tiling.
+- Hotkeys also accept `QUOTE` and `GRAVE` as names for the `'` and `` ` `` keys.
 
 ## 2. New config fields
 
@@ -142,7 +144,6 @@ Diff between `c673836` .. HEAD
 
 - Closing the last window on a workspace no longer switches away from it.
 - Tray-menu and hotkey/IPC-triggered config changes no longer silently overwrite `config.toml`.
-- A vacated column stays visible on the source monitor after moving a window away.
 - Commands no longer act on the wrong window right after the windows slide into place (briefly
   tested; no consistent repro trigger).
 - Window resizing after opening a new window now targets the focused window.

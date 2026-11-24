@@ -1,12 +1,5 @@
-//! Workspace overview: a fullscreen map of the focused monitor's
-//! non-empty workspaces, one miniaturized row per workspace.
-//!
-//! `build_overview_model` reads workspace state and computes geometry
-//! (its only platform calls are cached per-window icon probes), so the
-//! model is unit tested without ever constructing the overlay window.
-//! `show_overview`
-//! lazily creates the [`OverviewOverlay`] on first use (never in
-//! `AppState::new`, never under `cfg(test)`).
+//! Build overview geometry without constructing the overlay window. Overlay
+//! creation is lazy and requires an event sender; headless tests omit it.
 
 use crate::state::AppState;
 use leopardwm_core_layout::{Rect, Visibility, Workspace};
@@ -16,11 +9,8 @@ use leopardwm_platform_win32::overview::{
 };
 use tracing::{info, warn};
 
-/// Height of the label row across the top of each workspace panel.
 const LABEL_STRIP_H: i32 = 24;
-/// Outer margin as a fraction of the work-area dimensions.
 const OUTER_MARGIN_FRAC: f64 = 0.04;
-/// Vertical gap between rows as a fraction of work-area height.
 const ROW_GAP_FRAC: f64 = 0.02;
 /// Padding between a row panel's edge and the viewport ring (the
 /// renderer folds the same value into the panel's corner radius).
@@ -33,7 +23,7 @@ const BODY_INSET: i32 = ROW_INNER_PAD + VIEWPORT_RING_PAD;
 
 /// MAXIMUM geometry for one overview row, all in overlay client
 /// coordinates. The final panel/label-strip rects wrap the actual scaled
-/// strip content (left-aligned), so these are upper bounds on width.
+/// strip content (horizontally centered), so these are upper bounds on width.
 struct OverviewRowGeometry {
     panel: Rect,
     label_strip: Rect,
@@ -74,9 +64,6 @@ fn layout_overview_columns(w: i32, h: i32, n: usize) -> Vec<OverviewRowGeometry>
         .collect()
 }
 
-/// Lay out `n` row slots top-to-bottom inside a `w` x `h` client area:
-/// 4% outer margin, 2% row gap, equal-height rows capped at `h / 3` and
-/// centered vertically when fewer rows than would fill the area.
 fn layout_overview_rows(w: i32, h: i32, n: usize) -> Vec<OverviewRowGeometry> {
     let n_i = n as i32;
     if n_i <= 0 || w <= 0 || h <= 0 {
@@ -114,9 +101,8 @@ fn layout_overview_rows(w: i32, h: i32, n: usize) -> Vec<OverviewRowGeometry> {
 /// Gap carved symmetrically off each scaled card so neighbors don't touch.
 const CARD_INSET: i32 = 2;
 
-/// Uniform full-strip → row-strip transform: one scale factor for both
-/// axes and one offset for every rect, so relative window geometry is
-/// preserved exactly (no per-card clamping or fitting).
+/// Share one scale and offset across all cards to preserve relative geometry
+/// apart from pixel rounding; do not fit cards independently.
 struct StripTransform {
     scale: f64,
     min_x: i32,
@@ -126,9 +112,6 @@ struct StripTransform {
 }
 
 impl StripTransform {
-    /// Fit `content` (full-strip virtual coordinates) into `strip`,
-    /// preserving aspect ratio: left-aligned (the row panel wraps the
-    /// scaled content), centered vertically.
     fn fit(content: &Rect, strip: &Rect) -> Self {
         let content_w = f64::from(content.width.max(1));
         let content_h = f64::from(content.height.max(1));
@@ -143,8 +126,6 @@ impl StripTransform {
         }
     }
 
-    /// Width of the scaled content, i.e. how much of the strip's width
-    /// the content actually occupies after fitting.
     fn scaled_width(&self, content: &Rect) -> i32 {
         (f64::from(content.width.max(1)) * self.scale)
             .round()
@@ -161,7 +142,7 @@ impl StripTransform {
     }
 }
 
-/// Bounding box of `rects` (assumed non-empty checked by the caller).
+/// Caller must supply at least one rect.
 fn bounding_box(rects: impl Iterator<Item = Rect>) -> Rect {
     let mut min_x = i32::MAX;
     let mut min_y = i32::MAX;
@@ -176,7 +157,6 @@ fn bounding_box(rects: impl Iterator<Item = Rect>) -> Rect {
     Rect::new(min_x, min_y, (max_x - min_x).max(1), (max_y - min_y).max(1))
 }
 
-/// Shrink `r` symmetrically by up to `CARD_INSET` per side, never below 1px.
 fn inset_card(r: &Rect) -> Rect {
     let ix = CARD_INSET.min((r.width - 1) / 2).max(0);
     let iy = CARD_INSET.min((r.height - 1) / 2).max(0);
@@ -301,7 +281,7 @@ impl AppState {
             }));
         }
         // Fill the icon cache before the row loop re-borrows the
-        // workspaces: a `get_window_icon` miss costs up to two 50ms
+        // workspaces: a `get_window_icon` miss costs up to three 50ms
         // `SendMessageTimeoutW` probes against a hung app, so rebuilds
         // (one per window event while the overview is open) must not
         // re-probe every card.
@@ -359,12 +339,9 @@ impl AppState {
                 Some(name) => format!("{} {}", ws_idx + 1, name),
                 None => format!("{}", ws_idx + 1),
             };
-            // The panel wraps its content: scaled strip width + inner
-            // padding, left-aligned at the outer margin; the label strip
-            // shares the panel width. Height per row is unchanged.
-            // Empty workspaces (no cards) use a compact width so the
-            // label badge doesn't span the full monitor width.
-            // vmon uses full column width (panels are tall columns, no width wrapping).
+            // Empty workspaces (no cards) use a compact width so the label
+            // badge doesn't span the full monitor width. Vertical monitors
+            // keep the full column width (panels are tall columns).
             let panel_w = if orient.is_vertical() {
                 geom.panel.width
             } else {
@@ -374,24 +351,23 @@ impl AppState {
                     None => geom.panel.width,
                 }
             };
-            // RTL monitors right-anchor the panel within the full slot so
-            // content accumulates from the right edge, matching the strip.
-            let panel_x = if rtl {
-                geom.panel.x + geom.panel.width - panel_w
+            // Center the panel in its row, or right-align it on monitors
+            // whose columns sit against the right edge, matching the strip.
+            let shift = if rtl {
+                geom.panel.width - panel_w
             } else {
-                geom.panel.x
+                (geom.panel.width - panel_w) / 2
             };
-            if rtl {
-                let dx = panel_x - geom.panel.x;
-                for card in &mut cards {
-                    card.rect.x += dx;
-                    if let Some(ref mut fr) = card.from_rect {
-                        fr.x += dx;
-                    }
-                }
-                viewport.x += dx;
+            let panel = Rect::new(
+                geom.panel.x + shift,
+                geom.panel.y,
+                panel_w,
+                geom.panel.height,
+            );
+            for card in &mut cards {
+                card.rect.x += shift;
             }
-            let panel = Rect::new(panel_x, geom.panel.y, panel_w, geom.panel.height);
+            viewport.x += shift;
             let label_strip = Rect::new(panel.x, panel.y, panel_w, geom.label_strip.height);
             rows.push(OverviewRow {
                 workspace_index: ws_idx,
@@ -455,7 +431,6 @@ impl AppState {
         let Some(ws) = self.workspaces.get(&monitor).and_then(|v| v.get(idx)) else {
             return;
         };
-        // all_window_ids covers tiled AND floating windows.
         for wid in ws.all_window_ids() {
             if !ws.is_minimized(wid) {
                 let _ = leopardwm_platform_win32::snapshot::snapshot_capture(wid);
@@ -463,8 +438,6 @@ impl AppState {
         }
     }
 
-    /// Open/close zoom duration for the overlay: the overview duration
-    /// from config, snapping instantly (0) under reduce-motion.
     fn overview_anim_ms(&self) -> u32 {
         if self.reduce_motion {
             return 0;
@@ -472,21 +445,10 @@ impl AppState {
         u32::try_from(self.config.animation.overview_duration_ms).unwrap_or(0)
     }
 
-    /// Miniaturize one workspace's ENTIRE strip into `strip` (scrolled-out
-    /// columns included), plus a marker rect for the region currently in
-    /// the real viewport (zero-sized when every window already fits the
-    /// viewport) and the scaled content width (None when the workspace
-    /// has no visible windows) so the caller can wrap the panel.
-    ///
-    /// Tiled placements come from `placements_for_full_strip` (pure — no
-    /// state mutation) against a virtual viewport at origin, wide enough
-    /// for every column. Floating windows are viewport-anchored, so they
-    /// are translated by `scroll_offset` to sit over the viewport region.
-    /// Every rect goes through ONE uniform [`StripTransform`] — same
-    /// scale, same offset — so relative geometry is exact.
-    ///
-    /// A fullscreen workspace collapses to ONE viewport-sized card unless
-    /// selection follows another window moved into its underlying strip.
+    // Include scrolled-out columns in one uniform strip transform. Floating
+    // windows are viewport-anchored, so translate them by the scroll offset.
+    // Fullscreen collapses to one viewport-sized card unless selection follows
+    // another window in its underlying strip. Return content width for panel wrap.
     #[allow(clippy::too_many_arguments)]
     fn overview_cards_for(
         &self,
@@ -502,7 +464,6 @@ impl AppState {
         let full_w = ws.total_width().saturating_add(layout_vp.width).max(1);
         let virtual_viewport = Rect::new(0, 0, full_w, layout_vp.height);
         let scroll = ws.scroll_offset().round() as i32;
-        // Viewport region in layout space; rotated to physical for vmon.
         let viewport_region_layout = Rect::new(scroll, 0, layout_vp.width, layout_vp.height);
         let viewport_region = if orient.is_vertical() {
             crate::monitors::rotate_layout_rect(viewport_region_layout, work_area)
@@ -515,7 +476,6 @@ impl AppState {
             .filter(|&wid| ws.contains_window(wid) && !ws.is_minimized(wid))
             .filter(|&wid| selected_wid.is_none_or(|selected| selected == wid));
         let sources: Vec<(u64, Rect, Option<usize>)> = if let Some(fs_wid) = fullscreen {
-            // The fullscreen window covers the whole viewport (physical space).
             vec![(fs_wid, viewport_region, None)]
         } else {
             let mut sources: Vec<(u64, Rect, Option<usize>)> = ws
@@ -666,8 +626,6 @@ impl AppState {
                         .lookup_window_info(wid)
                         .map(|i| i.title)
                         .unwrap_or_default(),
-                    // Prefetched into the cache by build_overview_model;
-                    // the fallback probe covers any uncached id.
                     icon: self
                         .overview_icon_cache
                         .get(&wid)
@@ -708,9 +666,6 @@ impl AppState {
         (cards, marker, content_primary)
     }
 
-    /// Toggle the overview overlay on the focused monitor. Closing via
-    /// the toggle hotkey uses the same animated zoom-out as every other
-    /// close path.
     pub(crate) fn toggle_overview(&mut self) {
         if self.overview_open {
             self.hide_overview_animated(None);
@@ -780,9 +735,7 @@ impl AppState {
         }
     }
 
-    /// Show the overview. No-op when every workspace is empty. Creates
-    /// the overlay lazily on first use (skipped when no event sender is
-    /// installed — tests and headless runs).
+    // Without an event sender, record visibility intent without creating a window.
     pub(crate) fn show_overview(&mut self) {
         // No ghost animation should keep playing beneath the overlay.
         // Aborting BEFORE the model build also clears `ghost_handles`, so
@@ -837,15 +790,9 @@ impl AppState {
         }
     }
 
-    /// Hide the overview with the animated zoom-out close toward
-    /// `target_workspace` (`None` = the active workspace).
-    ///
-    /// Design choice: `OverviewOverlay::hide_animated` is non-blocking —
-    /// the overlay glides its live thumbnails back on its own timer
-    /// thread and hides itself when done, while the daemon proceeds with
-    /// its focus/switch flow immediately. The workspace switch composing
-    /// in underneath the closing overlay is the Task View look; deferring
-    /// the activate flow until the zoom ends would just feel laggy.
+    // Do not wait for the overlay's timer-thread zoom-out: the workspace switch
+    // composes underneath it while the daemon proceeds with activation.
+    // None closes toward the active workspace.
     pub(crate) fn hide_overview_animated(&mut self, target_workspace: Option<usize>) {
         let was_open = self.overview_open;
         if let Some(overlay) = &self.overview_overlay {
@@ -859,9 +806,6 @@ impl AppState {
         }
     }
 
-    /// Rebuild and push a fresh model while the overview is open (a
-    /// window closed or appeared underneath it). Hides the overview when
-    /// the last window on the monitor is gone.
     pub(crate) fn refresh_overview_model(&mut self) {
         if !self.overview_open {
             return;
@@ -908,7 +852,6 @@ mod tests {
         )
     }
 
-    /// Insert tiled windows into workspace `ws_idx` on monitor 1.
     fn add_windows(state: &mut AppState, ws_idx: usize, wids: &[u64]) {
         let ws = state.ensure_workspace_exists(1, ws_idx).unwrap();
         for &wid in wids {
@@ -1243,7 +1186,6 @@ mod tests {
         let mut state = test_state();
         add_windows(&mut state, 0, &[101]);
         add_windows(&mut state, 2, &[201, 202]);
-        // Workspace 1 is empty but must still produce a labeled row.
         state.ensure_workspace_exists(1, 1);
 
         let (overlay_rect, model) = state.build_overview_model().expect("model");
@@ -1283,7 +1225,6 @@ mod tests {
         // there are 3 rows; ws1 is empty and ws2 is active.
         let active: Vec<bool> = model.rows.iter().map(|r| r.is_active).collect();
         assert_eq!(active, vec![false, false, true]);
-        // Selection lives on the active row only (its focused window).
         assert!(model.rows[2].cards.iter().any(|c| c.selected));
         assert!(model.rows[0].cards.iter().all(|c| !c.selected));
     }
@@ -1293,7 +1234,7 @@ mod tests {
         let mut state = test_state();
         add_windows(&mut state, 0, &[101, 102, 103]);
         add_windows(&mut state, 1, &[201]);
-        // A floating window partially outside the work area must clamp.
+        // Fit a partially off-work-area float into the panel with the whole strip.
         state
             .workspaces
             .get_mut(&1)
@@ -1341,8 +1282,6 @@ mod tests {
             );
             assert_eq!(row.label_strip.height, LABEL_STRIP_H);
         }
-        // The accent comes from the configured focus-border color (or the
-        // platform default when unparseable / high contrast handled there).
         let expected = state.border_color_bgr().unwrap_or(DEFAULT_ACCENT_BGR);
         assert_eq!(model.accent_bgr, expected);
         assert_ne!(model.accent_bgr, 0, "accent must be a real color");
@@ -1510,9 +1449,6 @@ mod tests {
                 ring
             );
         }
-        // The body insets reserve room: the ring clears the panel edges,
-        // the label strip, and the 1px panel frame (the active accent
-        // ring sits OUTSIDE the panel now) by the panel padding.
         assert!(ring.x >= row.panel.x + ROW_INNER_PAD);
         assert!(ring.x + ring.width <= row.panel.x + row.panel.width - ROW_INNER_PAD + 2);
         assert!(ring.y >= row.label_strip.y + row.label_strip.height + ROW_INNER_PAD);
@@ -1533,8 +1469,6 @@ mod tests {
             (0, 0),
             "ring conveys nothing when everything is visible"
         );
-        // No boundary reserve and no phantom viewport width: the panel
-        // hugs the cards (widest card + inset + body inset).
         let content_right = row
             .cards
             .iter()
@@ -1626,7 +1560,7 @@ mod tests {
     fn test_ring_centers_vertically_in_panel_body() {
         let mut state = test_state();
         state.config.appearance.active_border_width = 4;
-        // Strips wider than the viewport so both rows show their ring.
+        // Both strips overflow; only the active row should show its ring.
         add_windows(&mut state, 0, &[101, 102, 103, 104]);
         add_windows(&mut state, 1, &[201, 202, 203, 204]);
         for ws_idx in [0, 1] {
@@ -1643,7 +1577,6 @@ mod tests {
         for row in &model.rows {
             let ring = row.viewport;
             if !row.is_active {
-                // The viewport ring belongs to the active workspace only.
                 assert_eq!(ring.height, 0, "inactive rows must not show a ring");
                 continue;
             }
@@ -1776,11 +1709,9 @@ mod tests {
     }
 
     #[test]
-    fn test_panels_wrap_content_left_aligned() {
+    fn test_panels_wrap_content_centered() {
         let mut state = test_state();
-        // Row 0: a single window — content is just the viewport region.
         add_windows(&mut state, 0, &[101]);
-        // Row 1: a strip much wider than the viewport.
         add_windows(&mut state, 1, &[201, 202, 203, 204]);
         state
             .workspaces
@@ -1788,15 +1719,19 @@ mod tests {
             .unwrap()
             .get_mut(1)
             .unwrap()
-            .set_all_column_widths(1000);
+            .set_all_column_widths(3000);
 
         let (_, model) = state.build_overview_model().expect("model");
         let margin_x = (1920.0_f64 * OUTER_MARGIN_FRAC).round() as i32;
         let max_panel_w = 1920 - 2 * margin_x;
         let narrow = &model.rows[0];
         let wide = &model.rows[1];
-        assert_eq!(narrow.panel.x, margin_x, "panels sit at the left margin");
-        assert_eq!(wide.panel.x, margin_x, "panels sit at the left margin");
+        assert!(
+            (narrow.panel.x + narrow.panel.width / 2 - 1920 / 2).abs() <= 1,
+            "narrow panel must be centered on the work area"
+        );
+        assert_eq!(wide.panel.x, margin_x, "full rows keep the left margin");
+        assert_eq!(wide.panel.width, max_panel_w, "wide content fills the row");
         assert!(
             narrow.panel.width < max_panel_w,
             "panel must wrap content, not span the full row: {} vs {}",
@@ -1810,7 +1745,19 @@ mod tests {
             wide.panel.width
         );
         for row in &model.rows {
+            assert_eq!(row.label_strip.x, row.panel.x, "strip follows panel");
             assert_eq!(row.label_strip.width, row.panel.width, "strip wraps too");
+            let content_left = row
+                .cards
+                .iter()
+                .map(|c| c.rect.x - CARD_INSET)
+                .chain((row.viewport.width > 0).then_some(row.viewport.x + VIEWPORT_RING_PAD))
+                .min()
+                .unwrap();
+            assert!(
+                (content_left - row.panel.x - BODY_INSET).abs() <= 2,
+                "panel left must hug content left with a body inset"
+            );
             // The panel hugs its content: the widest element (card edges
             // un-inset, or the raw viewport region — the model's viewport
             // is the ring rect, inflated by VIEWPORT_RING_PAD) ends one
@@ -1826,11 +1773,113 @@ mod tests {
                 .unwrap();
             let panel_right = row.panel.x + row.panel.width;
             assert!(
+                ((content_left - row.panel.x) - (panel_right - content_right)).abs() <= 2,
+                "left and right body insets must be symmetric"
+            );
+            assert!(
                 (panel_right - content_right - BODY_INSET).abs() <= 2,
                 "panel right {} must hug content right {} + body inset",
                 panel_right,
                 content_right
             );
+        }
+    }
+
+    #[test]
+    fn test_rows_right_align_on_monitors_whose_columns_sit_right() {
+        use crate::config::{MonitorDirection, MonitorRule};
+        let margin_x = (1920.0_f64 * OUTER_MARGIN_FRAC).round() as i32;
+        for direction in [
+            MonitorDirection::Ltr,
+            MonitorDirection::Rtl,
+            MonitorDirection::LtrRightAligned,
+        ] {
+            let mut state = test_state();
+            state.config.monitor_rules = vec![MonitorRule {
+                display: 1,
+                direction: Some(direction),
+                ..Default::default()
+            }];
+            add_windows(&mut state, 0, &[101]);
+
+            let (_, model) = state.build_overview_model().expect("model");
+            let row = &model.rows[0];
+            let panel_center = row.panel.x + row.panel.width / 2;
+            let panel_right = row.panel.x + row.panel.width;
+            if direction.pins_right() {
+                assert!(
+                    (panel_right - (1920 - margin_x)).abs() <= 1,
+                    "{direction:?}: row must touch the right margin, right edge {panel_right}"
+                );
+            } else {
+                assert!(
+                    (panel_center - 1920 / 2).abs() <= 1,
+                    "{direction:?}: row must be centered, center {panel_center}"
+                );
+            }
+            for card in &row.cards {
+                assert!(card.rect.x >= row.panel.x && card.rect.x < panel_right);
+            }
+        }
+    }
+
+    #[test]
+    fn test_centered_rows_keep_cards_and_viewport_inside_panel_body() {
+        for overflow in [false, true] {
+            let mut state = test_state();
+            add_windows(&mut state, 0, &[101]);
+            if overflow {
+                add_windows(&mut state, 0, &[102, 103, 104]);
+                let ws = &mut state.workspaces.get_mut(&1).unwrap()[0];
+                ws.set_all_column_widths(1000);
+                ws.set_scroll_offset(1100.0);
+            }
+
+            let (_, model) = state.build_overview_model().expect("model");
+            let row = &model.rows[0];
+            let margin_x = (1920.0_f64 * OUTER_MARGIN_FRAC).round() as i32;
+            assert!(
+                row.panel.x > margin_x,
+                "fixture must exercise a shifted row"
+            );
+            assert!(
+                (row.panel.x + row.panel.width / 2 - 1920 / 2).abs() <= 1,
+                "row must be centered"
+            );
+            assert_eq!(row.viewport.width > 0, overflow);
+            if overflow {
+                assert!(row
+                    .cards
+                    .iter()
+                    .any(|c| c.rect.x + c.rect.width <= row.viewport.x));
+                assert!(row
+                    .cards
+                    .iter()
+                    .any(|c| c.rect.x >= row.viewport.x + row.viewport.width));
+            }
+            for rect in row
+                .cards
+                .iter()
+                .map(|c| c.rect)
+                .chain((row.viewport.width > 0).then_some(row.viewport))
+            {
+                assert!(
+                    rect.x >= row.panel.x + ROW_INNER_PAD
+                        && rect.x + rect.width <= row.panel.x + row.panel.width - ROW_INNER_PAD
+                        && rect.y >= row.label_strip.y + row.label_strip.height + ROW_INNER_PAD
+                        && rect.y + rect.height <= row.panel.y + row.panel.height - ROW_INNER_PAD,
+                    "content {rect:?} escapes panel body {:?}",
+                    row.panel
+                );
+            }
+            for card in &row.cards {
+                let x = card.rect.x + card.rect.width / 2;
+                let y = card.rect.y + card.rect.height / 2;
+                assert!(x >= card.rect.x && x < card.rect.x + card.rect.width);
+                assert!(y >= card.rect.y && y < card.rect.y + card.rect.height);
+                assert!(x >= row.panel.x && x < row.panel.x + row.panel.width);
+                assert!(y >= row.panel.y && y < row.panel.y + row.panel.height);
+            }
         }
     }
 
@@ -1855,7 +1904,6 @@ mod tests {
         );
         let card = &row.cards[0];
         assert_eq!(card.window_id, fs_wid);
-        // The single card shows the full viewport: work-area aspect.
         let aspect = f64::from(card.rect.width) / f64::from(card.rect.height);
         let wa_aspect = 1920.0 / 1040.0;
         assert!(
@@ -1895,18 +1943,10 @@ mod tests {
     }
 
     #[test]
-    fn test_app_state_skips_overview_overlay_under_cfg_test() {
-        let state = test_state();
-        assert!(
-            state.overview_overlay.is_none(),
-            "OverviewOverlay must stay None in AppState::new — it spawns a real top-level window"
-        );
-        assert!(!state.overview_open);
-    }
-
-    #[test]
     fn test_toggle_overview_flips_open_flag_without_overlay() {
         let mut state = test_state();
+        assert!(state.overview_overlay.is_none());
+        assert!(!state.overview_open);
         add_windows(&mut state, 0, &[101]);
         // No event sender installed under cfg(test) -> no overlay is
         // constructed, but the open flag still tracks visibility intent.
@@ -1974,7 +2014,6 @@ mod tests {
             assert!(ws.mark_minimized(201));
             assert!(ws.mark_minimized(202));
         }
-        // Workspace 2: a lone minimized floating window.
         {
             let ws = state.ensure_workspace_exists(1, 2).unwrap();
             ws.add_floating(301, Rect::new(100, 100, 400, 300)).unwrap();
@@ -2008,19 +2047,12 @@ mod tests {
         assert_eq!(result.unwrap().1.rows[0].cards.len(), 0);
     }
 
-    // Overlay-creation failure (show_overview leaving overview_open false)
-    // is not unit-testable: OverviewOverlay::new is only reached when an
-    // overview_event_tx is installed, and constructing one spawns a real
-    // top-level window — never done under cfg(test). Verified by
-    // inspection: the Err arm warns and returns before the flag is set.
-
     #[test]
     fn test_hide_overview_restores_foreground_focus() {
         let mut state = test_state();
         add_windows(&mut state, 0, &[101]);
         state.toggle_overview();
         assert!(state.overview_open);
-        // Simulate the overlay having taken the OS foreground.
         state.previous_focused_hwnd = None;
         state.toggle_overview();
         assert!(!state.overview_open);
@@ -2153,8 +2185,6 @@ mod tests {
         let work_area = Rect::new(0, 0, 1920, 1040);
         let placements = state.workspaces[&1][0].compute_placements(work_area);
         let (_, model) = state.build_overview_model().expect("model");
-        // Windows visible in the real viewport must have from_rects that
-        // match their actual scrolled placements.
         for p in placements
             .iter()
             .filter(|p| p.visibility == Visibility::Visible)
@@ -2180,8 +2210,6 @@ mod tests {
         add_windows(&mut state, 1, &[201]);
 
         let (_, model) = state.build_overview_model().expect("model");
-        // The close animation may target any row: every card carries a
-        // from_rect (the would-be placement when that workspace shows).
         for row in &model.rows {
             for card in &row.cards {
                 assert!(
@@ -2198,7 +2226,6 @@ mod tests {
         let mut state = test_state();
         add_windows(&mut state, 0, &[101]);
         state.config.animation.overview_duration_ms = 175;
-        // The overview no longer borrows the layout duration.
         state.config.animation.layout_duration_ms = 999;
         state.reduce_motion = false;
 
@@ -2232,9 +2259,10 @@ mod tests {
         add_windows(&mut state, 0, &[101, 102]);
 
         let (_, model) = state.build_overview_model().expect("model");
+        assert_eq!(model.rows[0].cards.len(), 2);
         assert!(
-            model.rows[0].cards.iter().all(|c| c.live),
-            "default config: every card requests a live preview"
+            model.rows[0].cards.iter().all(|c| c.live && !c.snapshot),
+            "default config: every card requests a live preview without a snapshot"
         );
     }
 
@@ -2261,18 +2289,6 @@ mod tests {
         assert!(
             model.rows[0].cards.iter().all(|c| c.snapshot && !c.live),
             "render = snapshot marks cards snapshot and disables live previews"
-        );
-    }
-
-    #[test]
-    fn test_cards_not_snapshot_by_default() {
-        let mut state = test_state();
-        add_windows(&mut state, 0, &[101]);
-
-        let (_, model) = state.build_overview_model().expect("model");
-        assert!(
-            model.rows[0].cards.iter().all(|c| !c.snapshot),
-            "live mode must not draw snapshot bodies"
         );
     }
 

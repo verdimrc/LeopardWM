@@ -1,15 +1,4 @@
 #![windows_subsystem = "windows"]
-//! LeopardWM Daemon
-//!
-//! Main daemon process for the LeopardWM window manager.
-//!
-//! Responsibilities:
-//! - Maintain workspace state
-//! - Process window events from the platform layer
-//! - Handle IPC commands from the CLI
-//! - Trigger layout recalculations
-//! - Apply window placements
-//! - System tray icon and menu
 
 mod animation_worker;
 mod command_handler;
@@ -98,7 +87,6 @@ pub struct Args {
 }
 
 impl Args {
-    /// Returns true if hotkeys should be skipped (either --no-hotkeys or --safe-mode).
     pub fn skip_hotkeys(&self) -> bool {
         self.no_hotkeys || self.safe_mode
     }
@@ -209,14 +197,13 @@ async fn setup_daemon_runtime(
     (event_tx, event_rx, animation_worker)
 }
 
-/// Listen for console-close / Ctrl+C / break. On receipt, latch apply
-/// cancellation, restore scrolled-away windows (sync, no AppState lock), then
-/// send Shutdown. Loops so a second signal re-runs the same idempotent restore
-/// rather than falling through to default handlers.
+/// Restore synchronously without the AppState lock before sending Shutdown; a
+/// wedged worker must not consume the OS console-close budget. Keep listening
+/// so repeated signals repeat the idempotent recovery instead of falling through
+/// to default handlers.
 ///
-/// The logoff/shutdown listeners only ever fire if this process runs as a
-/// service. Interactive session end is restored synchronously by the hidden
-/// system-event window's WM_ENDSESSION handler.
+/// Logoff/shutdown console signals reach services only. Interactive session end
+/// uses the hidden system-event window's synchronous WM_ENDSESSION handler.
 fn install_console_control_signal_handlers(
     event_tx: mpsc::Sender<DaemonEvent>,
     apply_worker_cancelled: Arc<std::sync::atomic::AtomicBool>,
@@ -324,7 +311,6 @@ fn install_console_control_signal_handlers(
         }
     });
 }
-/// Hotkey registration result containing handles and mapping.
 struct HotkeyState {
     /// System-event window (display/work-area/power/session-end); kept alive for
     /// its message pump. Independent of hotkeys.
@@ -332,9 +318,7 @@ struct HotkeyState {
     /// Low-level keyboard hook: LeopardWM's sole hotkey matcher. `None` only
     /// when installation failed.
     hook: Option<KeyboardHookHandle>,
-    /// Mapping of hotkey IDs to commands.
     mapping: HashMap<HotkeyId, IpcCommand>,
-    /// Number of hotkeys parsed from config and handed to the hook.
     requested_count: usize,
     /// Number of hotkeys the hook is matching (equals `requested_count` when
     /// the hook installed, 0 when it failed).
@@ -346,7 +330,6 @@ struct HotkeyState {
     recording: bool,
 }
 
-/// Build the tray quick-toggle state from config (reads autostart from the registry).
 fn quick_toggle_state(config: &Config) -> tray::QuickToggleState {
     tray::QuickToggleState {
         language: config.appearance.language.clone(),
@@ -395,7 +378,6 @@ fn sync_once_badge(
     }
 }
 
-/// Sync tray quick-toggle check marks with the current config.
 fn sync_tray_toggles(tray_manager: &Option<tray::TrayManager>, config: &Config) {
     if let Some(ref mgr) = tray_manager {
         mgr.update_quick_toggles(&quick_toggle_state(config));
@@ -414,9 +396,6 @@ fn sync_tray_and_clear_once_placement(tray_manager: &Option<tray::TrayManager>, 
     }
 }
 
-/// Reload hotkeys and sync tray/overlay state after a config change.
-///
-/// Called from IPC Reload, tray Reload, and settings save handlers.
 async fn reload_config_and_hotkeys(
     state: &Arc<Mutex<AppState>>,
     hotkey_state: &mut HotkeyState,
@@ -440,8 +419,6 @@ async fn reload_config_and_hotkeys(
         set_recording(true);
         hotkey_state.recording = true;
     }
-    // Apply a focus-follows-mouse change from the reloaded config (e.g. the
-    // Settings toggle) without waiting for a restart.
     sync_mouse_hook(
         new_config.behavior.focus_follows_mouse,
         mouse_hook_handle,
@@ -484,8 +461,6 @@ fn is_os_protected(m: Modifiers, vk: u32) -> bool {
     (win_only && vk == keys::L) || (ctrl_alt && vk == VK_DELETE)
 }
 
-/// Binds the user configured that Windows reserves below the hook. Surfaced as
-/// a Settings warning so the user knows why they won't fire.
 fn protected_binds(bind_labels: &[BindInfo]) -> Vec<String> {
     bind_labels
         .iter()
@@ -494,8 +469,6 @@ fn protected_binds(bind_labels: &[BindInfo]) -> Vec<String> {
         .collect()
 }
 
-/// Install the keyboard hook for the given binds and forward hook events into
-/// the daemon loop. Returns `None` if the hook fails to install.
 fn install_hotkey_hook(
     binds: Vec<HotkeyBind>,
     event_tx: mpsc::Sender<DaemonEvent>,
@@ -645,7 +618,6 @@ fn setup_hotkeys(config: &Config, event_tx: mpsc::Sender<DaemonEvent>) -> Hotkey
     }
 }
 
-/// Shared shutdown/recovery cleanup used by all daemon exit paths.
 async fn run_shutdown_cleanup(
     state: &Arc<Mutex<AppState>>,
     mode: ShutdownMode,
@@ -766,8 +738,8 @@ async fn stop_animation_worker_and_run_recovery(
     run_visibility_recovery_pass(&managed_window_ids, "post-animation-worker");
 }
 
-/// Lightweight DwmFlush-aligned animation loop for resize preview transitions.
-/// Directly repositions the overlay window via SetWindowPos — no channel round-trip.
+/// Reposition the resize overlay directly on a DwmFlush-aligned thread to avoid
+/// a channel round-trip on each preview frame.
 fn resize_preview_animation_loop(
     overlay_hwnd: isize,
     start: leopardwm_core_layout::Rect,
@@ -789,7 +761,6 @@ fn resize_preview_animation_loop(
         let elapsed = start_time.elapsed().as_millis() as u64;
         let done = elapsed >= duration_ms;
         let t = (elapsed as f64 / duration_ms as f64).clamp(0.0, 1.0);
-        // Cubic ease-out
         let t = 1.0 - (1.0 - t).powi(3);
         let rect = leopardwm_core_layout::Rect::new(
             crate::state::lerp_i32(start.x, target.x, t),
@@ -797,7 +768,6 @@ fn resize_preview_animation_loop(
             crate::state::lerp_i32(start.width, target.width, t),
             crate::state::lerp_i32(start.height, target.height, t),
         );
-        // Direct SetWindowPos — zero indirection, zero channel latency.
         leopardwm_platform_win32::overlay::reposition_overlay(overlay_hwnd, rect);
         if done {
             break;
@@ -809,7 +779,6 @@ fn resize_preview_animation_loop(
     active.store(false, Ordering::Release);
 }
 
-/// Borrowed event-loop state shared by the main-loop event handlers.
 struct EventLoopCtx<'a> {
     quit_fallback: &'a quit_fallback::QuitFallback,
     state: &'a Arc<Mutex<AppState>>,
@@ -904,7 +873,6 @@ async fn apply_initial_layout(
     sync_pending_layout_apply_timeout_ui(state, tray_manager, hotkey_state).await;
 }
 
-/// Set DPI awareness, ensure a config file exists, load and validate config, and init logging.
 fn bootstrap_config() -> Result<(
     Config,
     Vec<config::ConfigWarning>,
@@ -918,7 +886,6 @@ fn bootstrap_config() -> Result<(
         eprintln!("[leopardwm] Warning: Failed to set DPI awareness (may already be set)");
     }
 
-    // Auto-create config file on first run
     match config::ensure_config_on_disk() {
         Ok(Some(path)) => eprintln!("[leopardwm] Created default config: {}", path.display()),
         Ok(None) => {}
@@ -932,14 +899,13 @@ fn bootstrap_config() -> Result<(
         Config::default()
     });
 
-    // Initialize logging with configured log level
     let log_level = match config.behavior.log_level.to_lowercase().as_str() {
         "trace" => Level::TRACE,
         "debug" => Level::DEBUG,
         "info" => Level::INFO,
         "warn" => Level::WARN,
         "error" => Level::ERROR,
-        _ => Level::INFO, // default fallback for invalid values
+        _ => Level::INFO,
     };
     // Clamp capture duration before logging init; validate() repeats the same
     // bound for the in-memory config. Zero does not open or truncate a file.
@@ -947,7 +913,6 @@ fn bootstrap_config() -> Result<(
         config::clamp_diagnostic_capture_secs(config.gestures.diagnostic_capture_secs);
     let (capture_handle, log_health) = init_logging(log_level, &config, capture_secs)?;
 
-    // Validate and clamp config values
     let config_warnings = config.validate();
     for w in &config_warnings {
         warn!("Config: {} - {}", w.field, w.message);
@@ -1029,7 +994,6 @@ fn init_logging(
     Ok((capture_handle, log_health))
 }
 
-/// Install a panic hook that uncloaks all windows and writes a crash report.
 fn install_panic_hook() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -1061,7 +1025,6 @@ fn install_panic_hook() {
             }
         }
 
-        // Write crash report to temp dir
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -1081,7 +1044,6 @@ fn install_panic_hook() {
     }));
 }
 
-/// Detect all monitors, falling back to a single default monitor on failure.
 fn detect_monitors() -> Vec<MonitorInfo> {
     match enumerate_monitors() {
         Ok(monitors) if !monitors.is_empty() => {
@@ -1120,14 +1082,10 @@ fn detect_monitors() -> Vec<MonitorInfo> {
     }
 }
 
-/// Enumerate existing windows, restore saved workspace state, and normalize startup layout.
 fn init_workspace_state(state: &mut AppState) {
-    // Load the saved snapshot once and rebuild the FULL workspace structure
-    // (column grouping, widths, heights, scroll) BEFORE enumerating, so each
-    // surviving window returns to its exact saved slot. enumerate then skips
-    // already-managed (restored) windows and only adds genuinely-new ones by
-    // current position. `restored_slots` are exempt from the startup
-    // width-normalization / scroll-reset below, which would wipe restored data.
+    // Restore saved slots before enumeration so surviving windows keep their
+    // grouping and geometry. Enumeration skips managed windows; restored slots
+    // must also bypass startup width normalization and scroll reset.
     let snapshot = AppState::load_state();
     let restored_slots = if let Some(ref snap) = snapshot {
         state.restore_workspace_structure(snap)
@@ -1144,7 +1102,6 @@ fn init_workspace_state(state: &mut AppState) {
         }
     }
 
-    // Log workspace state for all monitors
     let total_windows: usize = state
         .workspaces
         .values()
@@ -1164,9 +1121,7 @@ fn init_workspace_state(state: &mut AppState) {
         total_windows
     );
 
-    // Restore scroll offsets / active workspace (after windows are enumerated
-    // so offsets aren't clamped against empty workspaces). Reuses the snapshot
-    // loaded above.
+    // Restore scroll only after enumeration so empty workspaces do not clamp it.
     let _restored_monitors = if let Some(ref snapshot) = snapshot {
         let restored = state.restore_state(snapshot);
         info!("Restored workspace state from previous session");
@@ -1175,16 +1130,13 @@ fn init_workspace_state(state: &mut AppState) {
         HashSet::new()
     };
 
-    // Collect viewport widths first to avoid borrow issues
     let monitor_widths: HashMap<MonitorId, i32> = state
         .monitors
         .iter()
         .map(|(id, m)| (*id, crate::monitors::monitor_viewport_width(m)))
         .collect();
 
-    // Ensure the focused column is visible in the viewport for every workspace.
-    // This also corrects stale scroll offsets from restored state that no longer
-    // match the current window set.
+    // Reconcile focus visibility only for workspaces without restored slots.
     for (&monitor_id, ws_vec) in state.workspaces.iter_mut() {
         for (ws_idx, workspace) in ws_vec.iter_mut().enumerate() {
             // Restored slots keep their exact saved scroll offset.
@@ -1201,9 +1153,8 @@ fn init_workspace_state(state: &mut AppState) {
         }
     }
 
-    // Normalize all column widths to each monitor's default width preset on startup.
-    // Windows may have arbitrary sizes before tiling; using a uniform width
-    // ensures consistent initial layout.
+    // Freshly enumerated workspaces use each monitor's configured default width
+    // preset rather than the windows' arbitrary pre-tiling widths.
     let monitor_widths_for_default: HashMap<_, _> = state
         .monitors
         .iter()
@@ -1228,10 +1179,8 @@ fn init_workspace_state(state: &mut AppState) {
         }
     }
 
-    // Reset scroll offset to 0 so windows tile from the left edge on startup
-    // (like niri). The ensure_focused_visible call above may leave a stale
-    // centered offset when restoring state. Restored slots keep their saved
-    // scroll offset.
+    // Fresh workspaces start at the left edge, overriding any centering above.
+    // Restored slots retain their saved scroll offsets.
     for (&monitor_id, ws_vec) in state.workspaces.iter_mut() {
         for (ws_idx, workspace) in ws_vec.iter_mut().enumerate() {
             if restored_slots.contains(&(monitor_id, ws_idx)) {
@@ -1242,7 +1191,6 @@ fn init_workspace_state(state: &mut AppState) {
     }
 }
 
-/// Wire up the tab-strip action and rename-dialog channels and their forwarder threads.
 async fn spawn_tab_forwarders(
     state: &Arc<Mutex<AppState>>,
     event_tx: &mpsc::Sender<DaemonEvent>,
@@ -1283,12 +1231,8 @@ async fn spawn_tab_forwarders(
         }
     }
 
-    // Rename-dialog result channel. The Rename arm spawns a modal
-    // dialog on its own short-lived thread; that thread posts a
-    // `TabRenameResult` here when the user OKs or cancels. This
-    // forwarder converts the result into a `DaemonEvent::TabRenameSubmitted`
-    // so the daemon writes the override under the main event loop's
-    // serial lock (no races with concurrent layout work).
+    // The modal rename dialog runs on its own thread. Route results through
+    // the main event loop so overrides are written under its serial AppState lock.
     let (rename_result_tx, rename_result_rx) =
         std::sync::mpsc::channel::<crate::events::TabRenameResult>();
     {
@@ -1322,9 +1266,7 @@ async fn spawn_tab_forwarders(
     }
 }
 
-/// Wire the overview overlay's event channel and forwarder thread.
-/// The overlay itself is created lazily on first show; this just installs
-/// the sender and drains the channel into `DaemonEvent::Overview`.
+/// Install the overview sender before the lazily created overlay needs it.
 async fn spawn_overview_forwarder(
     state: &Arc<Mutex<AppState>>,
     event_tx: &mpsc::Sender<DaemonEvent>,
@@ -1347,7 +1289,6 @@ async fn spawn_overview_forwarder(
     }
 }
 
-/// Install WinEvent hooks and register display-change and power-state forwarding.
 fn setup_window_hooks(
     config: &Config,
     event_tx: &mpsc::Sender<DaemonEvent>,
@@ -1358,7 +1299,6 @@ fn setup_window_hooks(
             Ok((handle, event_receiver)) => {
                 info!("WinEvent hooks installed");
 
-                // Spawn task to forward window events from std::sync::mpsc to tokio channel
                 match spawn_forwarding_thread(
                     "winevent-fwd",
                     event_receiver,
@@ -1384,14 +1324,12 @@ fn setup_window_hooks(
         None
     };
 
-    // Register display change sender for WM_DISPLAYCHANGE events
-    // This allows the hotkey window to forward display changes to our event loop
+    // The system-event window forwards WM_DISPLAYCHANGE independently of hotkeys.
     {
         let (display_tx, display_rx) = std::sync::mpsc::channel::<WindowEvent>();
         if let Err(e) = set_display_change_sender(display_tx) {
             warn!("Failed to register display change sender: {}. Display changes may not be detected.", e);
         } else {
-            // Forward display change events to the daemon event loop
             match spawn_forwarding_thread(
                 "display-fwd",
                 display_rx,
@@ -1422,8 +1360,6 @@ fn setup_window_hooks(
         }
     }
 
-    // Register power state sender for WM_POWERBROADCAST events
-    // Forwards AC/battery and power saver state changes to the daemon event loop
     {
         let (power_tx, power_rx) = std::sync::mpsc::channel::<bool>();
         if let Err(e) = set_power_state_sender(power_tx) {
@@ -1447,11 +1383,8 @@ fn setup_window_hooks(
     hook_handle
 }
 
-/// Install the focus-follows-mouse hook and spawn its event-forwarding thread.
-/// Returns the handle; dropping it uninstalls the hook, after which the
-/// forwarding thread exits as its channel closes. `thread_handles`, when
-/// supplied (startup), tracks that thread for a clean shutdown join; live
-/// toggles pass `None` and let it exit on channel close.
+/// Dropping the hook closes the channel and lets its forwarder exit. Startup
+/// tracks the thread for a shutdown join; live toggles pass `None`.
 fn install_ffm_hook(
     event_tx: &mpsc::Sender<DaemonEvent>,
     thread_handles: Option<&mut Vec<std::thread::JoinHandle<()>>>,
@@ -1485,7 +1418,6 @@ fn install_ffm_hook(
     }
 }
 
-/// Install the mouse hook for focus-follows-mouse (if enabled at startup).
 fn setup_mouse_hook(
     config: &Config,
     event_tx: &mpsc::Sender<DaemonEvent>,
@@ -1499,9 +1431,6 @@ fn setup_mouse_hook(
     }
 }
 
-/// Bring the live mouse hook in line with the configured focus-follows-mouse
-/// setting: install it when newly enabled, drop it (uninstalling) when newly
-/// disabled. Lets the tray/Settings toggle take effect without a restart.
 fn sync_mouse_hook(
     enabled: bool,
     handle: &mut Option<MouseHookHandle>,
@@ -1685,7 +1614,6 @@ async fn setup_gestures(
     gestures
 }
 
-/// Initialize the system tray icon and bridge its events into the event loop.
 async fn setup_tray(
     state: &Arc<Mutex<AppState>>,
     config: &Config,
@@ -1714,7 +1642,6 @@ async fn setup_tray(
     ));
     let (tray_sync_tx, tray_sync_rx) = std::sync::mpsc::channel();
 
-    // Spawn task to forward tray events from sync channel to async channel
     match spawn_forwarding_thread(
         "tray-fwd",
         tray_sync_rx,
@@ -1744,7 +1671,6 @@ async fn setup_tray(
     (manager, quit_fallback)
 }
 
-/// Print the startup banner for immediate user feedback.
 async fn print_banner(
     state: &Arc<Mutex<AppState>>,
     config_warnings: &[config::ConfigWarning],
@@ -1793,7 +1719,6 @@ async fn print_banner(
     });
 }
 
-/// Handle an IPC Subscribe: build the ack + snapshot + receiver bundle atomically.
 async fn handle_ipc_subscribe(
     state: &Arc<Mutex<AppState>>,
     events: std::collections::BTreeSet<leopardwm_ipc::EventKind>,
@@ -1916,7 +1841,6 @@ async fn handle_ipc_command(
         let response = state.handle_command(cmd);
         let animating = state.is_animating();
 
-        // Get column rect for snap hint if this is a resize
         let rect = if is_resize && state.config.snap_hints.enabled {
             state.get_focused_column_rect()
         } else {
@@ -1927,7 +1851,6 @@ async fn handle_ipc_command(
         (response, animating, rect, duration)
     };
 
-    // If config was reloaded successfully, also reload hotkeys
     if is_reload && matches!(response, IpcResponse::Ok) {
         reload_config_and_hotkeys(
             ctx.state,
@@ -1941,7 +1864,6 @@ async fn handle_ipc_command(
         info!("Hotkeys reloaded after config reload");
     }
 
-    // Log if client disconnected before receiving response
     if responder.send(response).is_err() {
         debug!("Client disconnected before receiving IPC response");
     }
@@ -1976,18 +1898,14 @@ async fn handle_ipc_command(
         sync_tray_and_clear_once_placement(ctx.tray_manager, &state.config);
     }
 
-    // Show snap hint for resize operations
     if is_resize {
         if let (Some(ref overlay), Some(rect)) = (ctx.snap_hint_overlay, column_rect) {
-            // Cancel any pending hide timer
             if let Some(handle) = ctx.snap_hint_timer_handle.take() {
                 handle.abort();
             }
 
-            // Show the snap hint
             overlay.show_snap_target(rect);
 
-            // Schedule hide after duration
             let hide_tx = ctx.event_tx.clone();
             let duration = hint_duration;
             *ctx.snap_hint_timer_handle = Some(tokio::spawn(async move {
@@ -1997,7 +1915,6 @@ async fn handle_ipc_command(
         }
     }
 
-    // Start animation if needed
     if should_animate && !*ctx.animation_active {
         let mut state = ctx.state.lock().await;
         state.tick_animations(0);
@@ -2010,7 +1927,6 @@ async fn handle_ipc_command(
     false
 }
 
-/// Handle a platform window event, including display-change and focus-follows-mouse debouncing.
 async fn process_window_event(ctx: &mut EventLoopCtx<'_>, win_event: WindowEvent) {
     // Debounce DisplayChange / WorkAreaChanged into a single reconcile.
     // Contrast/DPI changes fire multiple WM_DISPLAYCHANGE messages with
@@ -2023,8 +1939,6 @@ async fn process_window_event(ctx: &mut EventLoopCtx<'_>, win_event: WindowEvent
         win_event,
         WindowEvent::DisplayChange | WindowEvent::WorkAreaChanged
     ) {
-        // Immediately clear inset cache and refresh high contrast state
-        // (cheap operations that should happen right away).
         leopardwm_platform_win32::clear_inset_cache();
         {
             let mut state = ctx.state.lock().await;
@@ -2045,7 +1959,6 @@ async fn process_window_event(ctx: &mut EventLoopCtx<'_>, win_event: WindowEvent
         } else {
             500
         };
-        // Cancel pending timer and restart — only process after quiet.
         if let Some(handle) = ctx.display_change_timer.take() {
             handle.abort();
         }
@@ -2056,7 +1969,6 @@ async fn process_window_event(ctx: &mut EventLoopCtx<'_>, win_event: WindowEvent
         }));
         return;
     }
-    // Handle MouseEnterWindow specially for focus-follows-mouse debouncing
     if let WindowEvent::MouseEnterWindow(hwnd) = win_event {
         let (enabled, delay_ms) = {
             let state = ctx.state.lock().await;
@@ -2067,12 +1979,10 @@ async fn process_window_event(ctx: &mut EventLoopCtx<'_>, win_event: WindowEvent
         };
 
         if enabled {
-            // Cancel any pending focus timer
             if let Some(handle) = ctx.focus_follows_mouse_timer.take() {
                 handle.abort();
             }
 
-            // Schedule focus after delay (debouncing)
             let focus_tx = ctx.event_tx.clone();
             let delay = delay_ms;
             *ctx.focus_follows_mouse_timer = Some(tokio::spawn(async move {
@@ -2100,7 +2010,6 @@ async fn process_window_event(ctx: &mut EventLoopCtx<'_>, win_event: WindowEvent
                 state.refresh_overview_model();
             }
 
-            // Start animation worker if the event triggered a transition.
             if state.is_animating() && !*ctx.animation_active {
                 state.tick_animations(0);
                 if let Ok(true) = state.send_animation_frame(ctx.animation_worker) {
@@ -2129,7 +2038,6 @@ async fn process_window_event(ctx: &mut EventLoopCtx<'_>, win_event: WindowEvent
                 }
             }
 
-            // Update tray tooltip with current state
             if let Some(ref mgr) = ctx.tray_manager {
                 let wc = state.all_managed_window_ids().len();
                 let mc = state.monitors.len();
@@ -2148,10 +2056,8 @@ async fn process_window_event(ctx: &mut EventLoopCtx<'_>, win_event: WindowEvent
                 // placement override; set_once_active no-ops if unchanged.
                 sync_once_badge(ctx.tray_manager, state.next_window_placement_override);
             }
-            // Spawn vsync-aligned animation thread for resize preview transitions.
             if let Some(req) = state.pending_resize_animation.take() {
                 if let Some(ref overlay) = ctx.snap_hint_overlay {
-                    // Cancel any running preview animation thread.
                     state
                         .resize_preview_cancel
                         .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -2171,7 +2077,6 @@ async fn process_window_event(ctx: &mut EventLoopCtx<'_>, win_event: WindowEvent
                 }
             }
 
-            // Start animation if needed (e.g. animated snap-back)
             if state.is_animating() && !*ctx.animation_active {
                 state.tick_animations(0);
                 if let Ok(true) = state.send_animation_frame(ctx.animation_worker) {
@@ -2227,7 +2132,6 @@ async fn handle_hotkey_event(
                 }
                 let animating = state.is_animating();
 
-                // Get column rect for snap hint if this is a resize
                 let rect = if is_resize && state.config.snap_hints.enabled {
                     state.get_focused_column_rect()
                 } else {
@@ -2252,18 +2156,14 @@ async fn handle_hotkey_event(
         return true;
     }
 
-    // Show snap hint for resize operations
     if is_resize {
         if let (Some(ref overlay), Some(rect)) = (ctx.snap_hint_overlay, column_rect) {
-            // Cancel any pending hide timer
             if let Some(handle) = ctx.snap_hint_timer_handle.take() {
                 handle.abort();
             }
 
-            // Show the snap hint
             overlay.show_snap_target(rect);
 
-            // Schedule hide after duration
             let hide_tx = ctx.event_tx.clone();
             let duration = hint_duration;
             *ctx.snap_hint_timer_handle = Some(tokio::spawn(async move {
@@ -2273,7 +2173,6 @@ async fn handle_hotkey_event(
         }
     }
 
-    // Start animation if needed
     if should_animate && !*ctx.animation_active {
         let mut state = ctx.state.lock().await;
         state.tick_animations(0);
@@ -2317,7 +2216,6 @@ fn diagnose_gesture_dispatch(event: GestureEvent, command: &str) -> GestureComma
 
 /// Handle a touchpad/scroll gesture; returns true when the daemon should shut down.
 async fn handle_gesture_event(ctx: &mut EventLoopCtx<'_>, gesture_event: GestureEvent) -> bool {
-    // Map gesture to command from config
     let gesture_config = {
         let state = ctx.state.lock().await;
         state.config.gestures.clone()
@@ -2497,7 +2395,6 @@ async fn handle_tray_event(ctx: &mut EventLoopCtx<'_>, tray_event: tray::TrayEve
                 state.handle_command(IpcCommand::Reload)
             };
 
-            // If config was reloaded successfully, also reload hotkeys
             if matches!(response, IpcResponse::Ok) {
                 reload_config_and_hotkeys(
                     ctx.state,
@@ -2623,8 +2520,6 @@ async fn handle_tray_event(ctx: &mut EventLoopCtx<'_>, tray_event: tray::TrayEve
                 );
                 state.config.behavior.focus_follows_mouse
             };
-            // Install or drop the hook now so the toggle takes effect without a
-            // restart; clear any pending focus when turning it off.
             sync_mouse_hook(enabled, ctx.mouse_hook_handle, ctx.event_tx);
             if !enabled {
                 if let Some(handle) = ctx.focus_follows_mouse_timer.take() {
@@ -2739,7 +2634,6 @@ async fn set_persistent_placement(
     sync_tray_and_clear_once_placement(ctx.tray_manager, &state.config);
 }
 
-/// Check eventless focus disappearance, deferred landings and suppressed moves.
 fn spawn_periodic_ticker(event_tx: &mpsc::Sender<DaemonEvent>) {
     let tx = event_tx.clone();
     tokio::spawn(async move {
@@ -2754,8 +2648,6 @@ fn spawn_periodic_ticker(event_tx: &mpsc::Sender<DaemonEvent>) {
     });
 }
 
-/// Prune vanished tracked focus, re-check deferred landings, suppressed moves and off-screen drift,
-/// and start the animation worker when either check changes the layout.
 async fn handle_periodic_check(ctx: &mut EventLoopCtx<'_>) {
     let mut state = ctx.state.lock().await;
     let focus_changed = state.check_tracked_focus_liveness();
@@ -2775,7 +2667,6 @@ async fn handle_periodic_check(ctx: &mut EventLoopCtx<'_>) {
     }
 }
 
-/// Refresh tab-strip overlays so background icon-only changes stay fresh.
 async fn handle_tab_strip_icon_poll(state: &Arc<Mutex<AppState>>) {
     // Single lock: check-and-refresh atomically so the state
     // we gated on (overlay present, workspace not fullscreen,
@@ -2833,11 +2724,9 @@ async fn spawn_debounced_save(state: &Arc<Mutex<AppState>>, event_tx: &mpsc::Sen
     tokio::spawn(async move {
         const DEBOUNCE: Duration = Duration::from_millis(1000);
         loop {
-            // Wait for the first request; exit when the channel closes.
             if save_rx.recv().await.is_none() {
                 break;
             }
-            // Coalesce: each further request resets the quiet timer.
             loop {
                 tokio::select! {
                     _ = tokio::time::sleep(DEBOUNCE) => break,
@@ -2855,7 +2744,6 @@ async fn spawn_debounced_save(state: &Arc<Mutex<AppState>>, event_tx: &mpsc::Sen
     });
 }
 
-/// Handle a tab-strip click action routed to the captured column identity.
 async fn handle_tab_action(
     state: &Arc<Mutex<AppState>>,
     monitor: isize,
@@ -2934,9 +2822,6 @@ async fn handle_tab_action_with_restore(
                 tab_idx,
                 set_at: std::time::Instant::now(),
             });
-            // Run all workspace operations under one borrow,
-            // collecting the proceed-or-abort decision so we
-            // can drop the borrow before invoking handle_command.
             let proceed = match s.focused_workspace_mut() {
                 None => false,
                 Some(ws) => {
@@ -2952,7 +2837,7 @@ async fn handle_tab_action_with_restore(
                 }
             };
             if proceed {
-                let resp = s.handle_command(IpcCommand::ExpelToRight);
+                let resp = s.untab_tiled_focus();
                 if let IpcResponse::Error { message } = resp {
                     warn!("ExpelToRight from untab failed: {}", message);
                     s.pending_tab_focus = None;
@@ -2970,10 +2855,6 @@ async fn handle_tab_action_with_restore(
                 debug!("Rename popup already active, ignoring duplicate request");
             } else {
                 let initial = s.tab_title_for(monitor, workspace_idx, column_idx, tab_idx);
-                // Resolve the strip overlay that owns this
-                // column so the rename popup lands precisely
-                // over the right tab cell. With per-column
-                // overlays the lookup is keyed by identity.
                 let (tab_rect, colors) =
                     match s
                         .tab_strip_overlays
@@ -2982,13 +2863,8 @@ async fn handle_tab_action_with_restore(
                         Some(strip) => (strip.tab_screen_rect(tab_idx), strip.current_colors()),
                         None => (None, None),
                     };
-                // Resolve the tab's HWND ONCE at spawn —
-                // this is the authoritative rename target.
-                // Capturing the HWND here means a column
-                // mutation (close/reorder/untab) while the
-                // popup is open won't retarget the override
-                // to a different window. Index-based
-                // resolution at submission time was racy.
+                // Capture the HWND before opening the popup: column closes, reorders,
+                // or untabs during the dialog must not retarget the title override.
                 let target_hwnd_opt = s
                     .workspaces
                     .get(&monitor)
@@ -2998,8 +2874,6 @@ async fn handle_tab_action_with_restore(
                 let icon = target_hwnd_opt.and_then(leopardwm_platform_win32::get_window_icon);
                 let tx = s.rename_result_tx.as_ref().map(Arc::downgrade);
                 let guard = s.rename_dialog_active.clone();
-                // Second clone — needed for the spawn-failure
-                // path below since the closure consumes `guard`.
                 let guard_for_spawn_failure = guard.clone();
                 drop(s);
                 match (tab_rect, colors, target_hwnd_opt) {
@@ -3031,13 +2905,8 @@ async fn handle_tab_action_with_restore(
                                 }
                                 guard.store(false, std::sync::atomic::Ordering::SeqCst);
                             });
-                        // Thread::spawn can fail (OOM, hit
-                        // OS thread limit). The closure owns
-                        // `guard`, so on Err we must reset
-                        // it ourselves — otherwise the
-                        // active-flag stays `true` forever
-                        // and all future renames are
-                        // silently suppressed.
+                        // A failed spawn never runs the closure that clears the flag; reset
+                        // it here or all later rename requests would be suppressed.
                         if let Err(e) = spawn_res {
                             warn!("Failed to spawn rename popup thread: {}", e);
                             guard_for_spawn_failure
@@ -3167,6 +3036,37 @@ mod tab_action_tests {
     }
 
     #[tokio::test]
+    async fn untab_expels_clicked_tab_while_floating_window_has_focus() {
+        const FLOATING: u64 = 900;
+        let mut app = AppState::new_with_config(Config::default(), vec![monitor(1, true)]);
+        let workspace = app.focused_workspace_mut().unwrap();
+        workspace.insert_window(100, None).unwrap();
+        workspace.insert_window_in_column(200, 0).unwrap();
+        workspace.set_focus(0, 0).unwrap();
+        workspace.toggle_focused_column_tabbed_mode();
+        workspace.insert_window(300, None).unwrap();
+        workspace.set_focus(1, 0).unwrap();
+        workspace
+            .add_floating(FLOATING, Rect::new(100, 100, 500, 400))
+            .unwrap();
+        app.previous_focused_hwnd = Some(FLOATING);
+        let state = Arc::new(Mutex::new(app));
+
+        handle_tab_action(&state, 1, 0, 0, 1, TabAction::Untab).await;
+
+        let app = state.lock().await;
+        let workspace = app.focused_workspace().unwrap();
+        let columns: Vec<_> = workspace
+            .columns()
+            .iter()
+            .map(|c| c.windows().to_vec())
+            .collect();
+        assert_eq!(columns, vec![vec![100], vec![200], vec![300]]);
+        assert_eq!(workspace.focused_window(), Some(200));
+        assert_eq!(app.focused_floating_window(), Some(FLOATING));
+    }
+
+    #[tokio::test]
     async fn tab_activation_drops_invalid_captured_column() {
         let mut app =
             AppState::new_with_config(Config::default(), vec![monitor(1, true), monitor(2, false)]);
@@ -3188,7 +3088,6 @@ mod tab_action_tests {
     }
 }
 
-/// Handle an overview overlay action (mirrors `handle_tab_action`).
 async fn handle_overview_event(
     ctx: &mut EventLoopCtx<'_>,
     event: leopardwm_platform_win32::overview::OverviewEvent,
@@ -3267,7 +3166,6 @@ async fn handle_overview_event(
             }
         }
     }
-    // A workspace switch above may have started a slide transition.
     let mut state = ctx.state.lock().await;
     if state.is_animating() && !*ctx.animation_active {
         state.tick_animations(0);
@@ -3278,7 +3176,6 @@ async fn handle_overview_event(
     }
 }
 
-/// Apply a rename-dialog result as a tab title override.
 async fn handle_tab_rename_submitted(
     state: &Arc<Mutex<AppState>>,
     monitor: isize,
@@ -3289,7 +3186,6 @@ async fn handle_tab_rename_submitted(
     new_title: Option<String>,
 ) {
     let Some(title) = new_title else {
-        // User cancelled; nothing to do.
         return;
     };
     let mut s = state.lock().await;
@@ -3307,8 +3203,7 @@ async fn handle_tab_rename_submitted(
     if title.is_empty() {
         s.tab_title_overrides.remove(&hwnd);
     } else if title.len() > leopardwm_platform_win32::dialog::TAB_TITLE_MAX_BYTES {
-        // The dialog already rejects over-length input, but
-        // belt-and-suspenders in case a future surface bypasses it.
+        // Enforce the title-size limit at the event boundary as well as in the dialog.
         warn!(
             "Rejecting tab title override ({} bytes > {} max)",
             title.len(),
@@ -3318,12 +3213,10 @@ async fn handle_tab_rename_submitted(
     } else {
         s.tab_title_overrides.insert(hwnd, title);
     }
-    // Refresh the strip so the new label shows immediately.
     s.update_tab_strip();
     let _ = s.save_state();
 }
 
-/// Handle a settings-window event.
 async fn handle_settings_event(
     ctx: &mut EventLoopCtx<'_>,
     settings_event: settings::SettingsEvent,
@@ -3417,7 +3310,6 @@ fn resume_after_interrupted_animation_frame(
     }
 }
 
-/// Process an applied animation frame: feed back violations, tick, and land the final layout.
 async fn handle_animation_frame_applied(
     ctx: &mut EventLoopCtx<'_>,
     frame_result: animation_worker::FrameResult,
@@ -3454,17 +3346,9 @@ async fn handle_animation_frame_applied(
     let still_animating = {
         let mut state = ctx.state.lock().await;
         let running = state.tick_animations(delta_ms);
-        // Reposition the border AFTER the tick so it reflects the
-        // SAME interpolated state the next animation frame will
-        // position windows at. The border SetWindowPos and the
-        // worker's window SetWindowPos calls below both commit
-        // before the next DwmFlush vsync, so the border arrives
-        // on screen in the same frame as the windows. Doing
-        // show_border BEFORE tick (the previous order) lagged the
-        // border by one vsync — windows updated at vsync N,
-        // border at vsync N+1 — which is what the user noticed
-        // as "border scrolling at a different framerate".
-        // send_animation_frame updates the border itself for continuing frames.
+        // Update the border after ticking so it uses the windows' interpolated
+        // geometry for the same vsync, rather than lagging by one frame.
+        // send_animation_frame updates it for continuing frames.
         if !running && !state.is_animating() {
             if let Some(hwnd) = state.previous_focused_hwnd {
                 if state.config.appearance.active_border {
@@ -3606,9 +3490,6 @@ async fn handle_animation_frame_applied(
                         sources.insert(*wid);
                     }
                 }
-                // Any non-surviving entries (HWND recycled) are
-                // already cleared above. Drop any stragglers
-                // belt-and-suspenders.
                 state.ghost_handles.clear();
                 let entry_count = entries.len();
                 state
@@ -3669,7 +3550,6 @@ async fn handle_animation_frame_applied(
     }
 }
 
-/// Apply debounced focus-follows-mouse focus.
 async fn handle_focus_follows_mouse(ctx: &mut EventLoopCtx<'_>, window_id: u64) {
     let mut state = ctx.state.lock().await;
     if state.config.behavior.focus_follows_mouse {
@@ -3693,12 +3573,9 @@ async fn handle_focus_follows_mouse(ctx: &mut EventLoopCtx<'_>, window_id: u64) 
     }
 }
 
-/// Process a debounced display change with the settled monitor state.
 async fn handle_display_change_settled(ctx: &mut EventLoopCtx<'_>) {
-    // Debounced display change — process the final monitor state after
-    // WM_DISPLAYCHANGE messages have stopped (theme/DPI transitions settled).
-    // Clear inset cache again — MovedOrResized events during the transition
-    // may have re-populated it with stale border metrics.
+    // Clear insets again: MovedOrResized events during the WM_DISPLAYCHANGE
+    // transition may have repopulated the cache with stale border metrics.
     leopardwm_platform_win32::clear_inset_cache();
     ctx.animation_worker.clear_cache();
     let needs_full = {
@@ -3824,7 +3701,6 @@ async fn handle_display_change_apply_retry(ctx: &mut EventLoopCtx<'_>, generatio
     }
 }
 
-/// Finish each processed event before waiting for the next one.
 async fn finish_daemon_event(ctx: &mut EventLoopCtx<'_>) {
     sync_pending_layout_apply_timeout_ui(ctx.state, ctx.tray_manager, &*ctx.hotkey_state).await;
     let enabled = ctx.state.lock().await.config.gestures.enabled;
@@ -3885,7 +3761,6 @@ async fn main() -> Result<()> {
 
     let (config, config_warnings, _gesture_capture, log_health) = bootstrap_config()?;
 
-    // Install panic hook to uncloak all windows and write a crash report
     install_panic_hook();
 
     info!("LeopardWM daemon starting...");
@@ -3910,10 +3785,8 @@ async fn main() -> Result<()> {
 
     let monitors = detect_monitors();
 
-    // Initialize state with config and monitors
     let state = initialize_state(config.clone(), monitors, log_health).await;
 
-    // Enumerate existing windows
     info!("Enumerating windows...");
     {
         let mut state = state.lock().await;
@@ -3923,32 +3796,23 @@ async fn main() -> Result<()> {
     // Create the event channel/animation worker before the system-event window.
     let (event_tx, mut event_rx, animation_worker) = setup_daemon_runtime(&state).await;
 
-    // Collect forwarding thread handles for graceful shutdown
     let mut thread_handles: Vec<std::thread::JoinHandle<()>> = Vec::new();
 
     spawn_tab_forwarders(&state, &event_tx, &mut thread_handles).await;
     spawn_overview_forwarder(&state, &event_tx, &mut thread_handles).await;
 
-    // Debounced workspace-state persistence (see `spawn_debounced_save`).
     spawn_debounced_save(&state, &event_tx).await;
 
-    // Install WinEvent hooks for window lifecycle tracking (if enabled in config)
     let _hook_handle = setup_window_hooks(&config, &event_tx, &mut thread_handles);
 
-    // Register global hotkeys (mutable to support reload)
     let (mut hotkey_state, _mouse_press_hook) =
         setup_input_hooks(&config, event_tx.clone(), args.skip_hotkeys());
 
-    // Install mouse hook for focus-follows-mouse (if enabled). Kept mutable so
-    // a tray/Settings toggle can install or drop it live (see sync_mouse_hook).
     let mut mouse_hook_handle = setup_mouse_hook(&config, &event_tx, &mut thread_handles);
 
-    // Register gesture detection (if enabled)
     let mut gestures = setup_gestures(&config, &event_tx, &state).await;
 
-    // Initialize overlay for snap hints and drag ghost preview.
-    // Always created — snap_hints.enabled only gates resize-hint visibility,
-    // drag ghost preview always works regardless.
+    // Create the overlay even with resize hints disabled: drag previews share it.
     let snap_hint_overlay: Option<OverlayWindow> = match OverlayWindow::new() {
         Ok(overlay) => {
             overlay.set_opacity(config.snap_hints.opacity);
@@ -3972,17 +3836,14 @@ async fn main() -> Result<()> {
         }
     };
 
-    // Initialize system tray icon
     let (tray_manager, quit_fallback) =
         setup_tray(&state, &config, &event_tx, &mut thread_handles).await;
 
-    // Update checker — daily GitHub Releases poll, opt-out via behavior.check_for_updates.
     let update_check_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     if config.behavior.check_for_updates {
         let tx = event_tx.clone();
         let cancel = update_check_cancel.clone();
         update_check::spawn_update_checker(cancel, move |tag| {
-            // Best-effort send — if the receiver is gone we're already shutting down.
             let _ = tx.blocking_send(DaemonEvent::UpdateAvailable(tag));
         });
     }
@@ -4009,7 +3870,6 @@ async fn main() -> Result<()> {
 
     spawn_periodic_ticker(&event_tx);
 
-    // Settings window forwarding channel + handle
     let (settings_sync_tx, settings_sync_rx) = std::sync::mpsc::channel();
     let settings_sync_tx = Arc::new(settings_sync_tx);
     match spawn_forwarding_thread(
@@ -4033,7 +3893,6 @@ async fn main() -> Result<()> {
 
     info!("IPC server listening on {}", preferred_pipe_name());
 
-    // Console-close / Ctrl+C: clone cancel arcs once (uncontended), then restore-first.
     {
         let s = state.lock().await;
         install_console_control_signal_handlers(
@@ -4043,14 +3902,12 @@ async fn main() -> Result<()> {
         );
     }
 
-    // Print startup banner for immediate user feedback
     print_banner(&state, &config_warnings, &hotkey_state, &args).await;
 
     // Taskbar-button controller (ITaskbarList). Held for the whole session;
     // dropping it on shutdown restores every hidden window's taskbar button.
     let _taskbar_handle = leopardwm_platform_win32::taskbar::init_taskbar();
 
-    // Apply initial layout so windows are tiled on startup
     apply_initial_layout(&state, &tray_manager, &hotkey_state).await;
 
     info!("Ready. Use leopardwm-cli to send commands.");
@@ -4058,10 +3915,8 @@ async fn main() -> Result<()> {
     let mut animation_active = false;
     let mut last_frame_instant: Option<std::time::Instant> = None;
 
-    // Snap hint timer handle - cancels pending hide operation when new hint is shown
     let mut snap_hint_timer_handle: Option<tokio::task::JoinHandle<()>> = None;
 
-    // Focus-follows-mouse timer handle - debounces rapid mouse movements
     let mut focus_follows_mouse_timer: Option<tokio::task::JoinHandle<()>> = None;
 
     // Display change debounce timer — contrast theme switches fire multiple
@@ -4093,7 +3948,6 @@ async fn main() -> Result<()> {
         gestures: &mut gestures,
     };
 
-    // Main event loop
     loop {
         let event = match event_rx.recv().await {
             Some(e) => e,
@@ -4222,7 +4076,6 @@ async fn main() -> Result<()> {
         finish_daemon_event(&mut ctx).await;
     }
 
-    // Stop the update-checker worker so it doesn't hold up shutdown.
     update_check_cancel.store(true, std::sync::atomic::Ordering::SeqCst);
     abort_event_timers(&mut ctx);
     ctx.gestures.stop();
@@ -4237,7 +4090,6 @@ async fn main() -> Result<()> {
     drop(_settings_handle);
     drop(settings_sync_tx);
 
-    // Join forwarding threads with timeout for graceful shutdown
     info!("Waiting for forwarding threads to exit...");
     let shutdown_deadline = std::time::Instant::now() + Duration::from_secs(5);
     for handle in thread_handles {

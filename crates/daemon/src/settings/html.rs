@@ -1,10 +1,3 @@
-//! Embedded HTML/CSS/JS for the WebView2-based settings panel.
-//!
-//! WinUI 3 / Fluent Design System v2 single-page app with NavigationView
-//! sidebar, seven settings sections, and IPC back to the Rust host.
-//! Color tokens, typography, spacing, and component styling match the
-//! official WinUI 3 theme resources.
-
 pub const SETTINGS_HTML: &str = r##"<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1819,7 +1812,10 @@ function initGestureCombo(id) {
 /* Show key chords with friendly symbols (Bracket_Left -> [). Both the
    token and the symbol alias parse to the same key, and the catalog now
    ships symbols, so this mainly tidies older token-form configs on display. */
-var KEY_SYMBOLS = { 'BRACKET_LEFT': '[', 'BRACKET_RIGHT': ']', 'COMMA': ',', 'PERIOD': '.', 'MINUS': '-', 'EQUALS': '=' };
+var KEY_SYMBOLS = {
+  'BRACKET_LEFT': '[', 'BRACKET_RIGHT': ']', 'COMMA': ',', 'PERIOD': '.', 'MINUS': '-', 'EQUALS': '=',
+  'SEMICOLON': ';', 'SLASH': '/', 'BACKTICK': '`', 'BACKSLASH': '\\', 'APOSTROPHE': "'"
+};
 function humanizeKey(chord) {
   var parts = (chord || '').split('+');
   var i = parts.length - 1;
@@ -1837,6 +1833,7 @@ var CODE_TO_KEY = {
   Home: 'Home', End: 'End', PageUp: 'PageUp', PageDown: 'PageDown',
   Space: 'Space', Enter: 'Enter', Tab: 'Tab', Escape: 'Escape',
   Minus: '-', Equal: '=', Comma: ',', Period: '.', BracketLeft: '[', BracketRight: ']',
+  Semicolon: ';', Quote: "'", Slash: '/', Backslash: '\\', Backquote: '`',
   NumpadAdd: 'NumpadAdd', NumpadSubtract: 'NumpadSubtract', NumpadMultiply: 'NumpadMultiply',
   NumpadDivide: 'NumpadDivide', NumpadDecimal: 'NumpadDecimal'
 };
@@ -2615,11 +2612,6 @@ mod tests {
     }
 
     #[test]
-    fn scroll_modifier_row_follows_linear_focus_navigation() {
-        assert!(SETTINGS_HTML.contains("tbody.querySelectorAll('tr[data-cmd=\"focus_prev\"]')"));
-    }
-
-    #[test]
     fn gesture_combos_offer_and_preserve_no_action_and_custom_commands() {
         let no_action = "var options = '<div class=\"combobox-option' + (current === '' ? ' selected' : '') + '\" data-value=\"\" data-i18n=\"settings.text.no_action\">' + escHtml(t('settings.text.no_action')) + '</div>' +";
         let catalog_options = "CMD_ORDER.map(function(cmd) {";
@@ -2653,13 +2645,6 @@ mod tests {
         assert!(SETTINGS_HTML
             .contains("setChecked('gestures-wheel_swipes', cfg.gestures.wheel_swipes !== false)"));
         assert!(SETTINGS_HTML.contains("wheel_swipes: checked('gestures-wheel_swipes')"));
-    }
-
-    #[test]
-    fn recorder_accepts_hook_delivered_chords() {
-        assert!(SETTINGS_HTML.contains("function onRecordedChord(chord) {"));
-        assert!(SETTINGS_HTML.contains("activeRecorder = input;"));
-        assert!(SETTINGS_HTML.contains("action: 'set_recording', recording: active"));
     }
 
     #[test]

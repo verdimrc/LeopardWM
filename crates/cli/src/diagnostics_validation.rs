@@ -1,22 +1,12 @@
-//! Opt-in exact-pipe diagnostics validation client.
-//!
-//! Ordinary `cargo test` compiles this module and runs the pure tests. The
-//! native client entrypoint is `#[ignore]` and fail-closed unless
-//! `LEOPARDWM_DIAGNOSTICS_VALIDATION=1`. It never consults
-//! `pipe_name_candidates()` and never opens the daily-driver pipe.
-//!
-//! Missing HealthInfo leaves Daemon integrity unavailable. The CLI RID is
-//! rendered separately and is never copied into the daemon line.
-//! Stop/PanicRevert are not sent by this client; negative-command coverage
-//! lives in the restricted host test seam.
+//! Native diagnostics is opt-in only: connect to the exact scoped pipe without candidate fallback,
+//! and verify the server identity before sending commands.
 
 use crate::doctor::{blocked_windows_check, format_integrity_line, integrity_check, CheckResult};
-use crate::ipc_client::parse_ipc_response_frame;
+use crate::ipc_client::{named_pipe_server_pid, parse_ipc_response_frame};
 use leopardwm_ipc::{IpcCommand, IpcResponse, MAX_IPC_MESSAGE_SIZE, PIPE_NAME};
 use serde_json::{json, Value};
 use std::fs;
 use std::io::ErrorKind;
-use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -26,7 +16,6 @@ use windows::Win32::Security::{
     GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, TokenIntegrityLevel,
     TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
 };
-use windows::Win32::System::Pipes::GetNamedPipeServerProcessId;
 use windows::Win32::System::Threading::{
     GetCurrentProcess, GetProcessTimes, OpenProcess, OpenProcessToken,
     PROCESS_QUERY_LIMITED_INFORMATION,
@@ -245,18 +234,6 @@ fn process_creation_filetime(pid: u32) -> Option<u64> {
         }
         Some(((create.dwHighDateTime as u64) << 32) | u64::from(create.dwLowDateTime))
     }
-}
-
-fn named_pipe_server_pid(client: &NamedPipeClient) -> Result<u32, String> {
-    let mut pid = 0u32;
-    unsafe {
-        GetNamedPipeServerProcessId(HANDLE(client.as_raw_handle()), &mut pid)
-            .map_err(|e| format!("GetNamedPipeServerProcessId failed: {e}"))?;
-    }
-    if pid == 0 {
-        return Err("GetNamedPipeServerProcessId returned 0".into());
-    }
-    Ok(pid)
 }
 
 async fn open_exact_pipe(pipe: &str, timeout: Duration) -> Result<NamedPipeClient, String> {

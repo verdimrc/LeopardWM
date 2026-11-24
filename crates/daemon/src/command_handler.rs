@@ -1,12 +1,12 @@
-//! IPC command handling for AppState.
-
 use crate::config::Config;
 use crate::hotkey_resolution::resolve_hotkeys;
 use crate::layout_apply::LayoutApplyOutcome;
 use crate::state::{
     validate_set_width_fraction, AppState, ElevationBlockedRecord, PendingWorkspaceSwitchFocus,
 };
-use leopardwm_core_layout::{LayoutError, Rect, Visibility, WindowPlacement, Workspace};
+use leopardwm_core_layout::{
+    FloatingFocus, LayoutError, Rect, Visibility, WindowPlacement, Workspace,
+};
 use leopardwm_ipc::{
     ElevationBlockReason, ElevationBlockedWindow, HotkeyBindingInfo, IpcCommand, IpcResponse,
 };
@@ -17,7 +17,6 @@ use leopardwm_platform_win32::{
 use std::collections::HashMap;
 use tracing::{debug, info, warn};
 
-/// How a command interacts with a workspace that is currently fullscreen.
 enum FullscreenPolicy {
     /// Drop fullscreen first, then run the command against the visible strip.
     /// For structural commands that would otherwise mutate the hidden layout
@@ -31,11 +30,19 @@ enum FullscreenPolicy {
     /// effect on a single fullscreen window, and a stray scroll gesture must
     /// not silently drop fullscreen.
     Suppress,
-    /// Run unchanged (fullscreen toggle, queries, cross-monitor/workspace moves).
     Allow,
 }
 
-/// Generate a display label for a valid action outside the catalog.
+enum FloatingPolicy {
+    /// Act on the focused floating window instead of the tiled focus.
+    Target,
+    /// Ignore while a floating window has focus — the command only makes
+    /// sense for columns, and would otherwise reshape or scroll the strip
+    /// behind it.
+    Ignore,
+    Unchanged,
+}
+
 fn humanize_action_id(action_id: &str) -> String {
     let mut label = action_id.replace('_', " ");
     if let Some(first) = label.get_mut(0..1) {
@@ -44,13 +51,9 @@ fn humanize_action_id(action_id: &str) -> String {
     label
 }
 
-/// Whether `cmd` navigates focus to a (possibly different) window, so the
-/// cursor should follow it when `mouse_follows_focus` is on. Covers in-column
-/// and cross-column focus, cross-monitor focus, and cross-monitor window moves
-/// (focus travels with the window). The explicit workspace-switch commands are
-/// excluded here; the caller only warps when the focused window actually
-/// changed, so an edge-wrap focus command that crosses into another workspace
-/// still warps onto the window it lands on.
+/// Explicit workspace switches do not warp the cursor. Edge-wrap focus commands
+/// still qualify when they land on a different window, as do cross-monitor moves
+/// whose focus travels with the window.
 fn is_focus_navigation(cmd: &IpcCommand) -> bool {
     use IpcCommand::*;
     matches!(
@@ -105,7 +108,6 @@ fn is_peek_passthrough_command(cmd: &IpcCommand) -> bool {
     )
 }
 
-/// Classify how `cmd` should behave when the focused workspace is fullscreen.
 fn fullscreen_policy(cmd: &IpcCommand) -> FullscreenPolicy {
     use IpcCommand::*;
     match cmd {
@@ -128,6 +130,58 @@ fn fullscreen_policy(cmd: &IpcCommand) -> FullscreenPolicy {
         | EqualizeColumnWidths
         | EqualizeColumnHeights => FullscreenPolicy::Suppress,
         _ => FullscreenPolicy::Allow,
+    }
+}
+
+fn floating_policy(cmd: &IpcCommand) -> FloatingPolicy {
+    use IpcCommand::*;
+    match cmd {
+        CloseWindow
+        | ToggleFloating
+        | ToggleSticky
+        | ToggleFullscreen
+        | Resize { .. }
+        | QueryFocused
+        | ScratchpadStash
+        | MoveToWorkspace { .. }
+        | MoveToWorkspacePrev
+        | MoveToWorkspaceNext
+        | MoveWindowToMonitorLeft
+        | MoveWindowToMonitorRight
+        | MoveWindowToMonitorUp
+        | MoveWindowToMonitorDown
+        | FocusLeft
+        | FocusRight
+        | FocusUp
+        | FocusDown
+        | FocusNext
+        | FocusPrev
+        | FocusStart
+        | FocusEnd => FloatingPolicy::Target,
+        SetColumnWidth { .. }
+        | CycleWidth
+        | CycleWidthUp
+        | CycleWidthDown
+        | CycleHeight
+        | CycleHeightUp
+        | CycleHeightDown
+        | MaximizeColumn
+        | CenterColumn
+        | EqualizeColumnHeights
+        | ToggleTabbed
+        | MoveColumnLeft
+        | MoveColumnRight
+        | MoveColumnToStart
+        | MoveColumnToEnd
+        | MoveWindowLeft
+        | MoveWindowRight
+        | MoveWindowUp
+        | MoveWindowDown
+        | ConsumeFromLeft
+        | ConsumeFromRight
+        | ExpelToLeft
+        | ExpelToRight => FloatingPolicy::Ignore,
+        _ => FloatingPolicy::Unchanged,
     }
 }
 
@@ -161,7 +215,6 @@ fn elevation_blocked_health_views(
 }
 
 impl AppState {
-    /// Snapshot a workspace's current animated placements.
     pub(crate) fn workspace_placements(
         &self,
         monitor: leopardwm_platform_win32::MonitorId,
@@ -176,12 +229,6 @@ impl AppState {
             .unwrap_or_default()
     }
 
-    /// Execute a command on the focused workspace, handling snapshot/transition
-    /// and layout application boilerplate.
-    ///
-    /// - `animated`: if true, snapshots before and starts a layout transition after
-    /// - `sync_focus`: if true, syncs the OS foreground window after layout apply
-    /// - `f`: receives the focused workspace and viewport width
     fn execute_workspace_command(
         &mut self,
         animated: bool,
@@ -212,10 +259,6 @@ impl AppState {
         IpcResponse::Ok
     }
 
-    /// Exit fullscreen on the focused workspace if active, restoring the tiled
-    /// strip (un-cloaking the other windows) and the focus border. Returns
-    /// whether fullscreen was cleared. Called before focus/structural commands
-    /// so they apply to the visible layout instead of the hidden one.
     fn exit_fullscreen_if_active(&mut self) -> bool {
         let Some(fs_wid) = self
             .focused_workspace()
@@ -233,10 +276,6 @@ impl AppState {
         true
     }
 
-    /// Handle a focus command while fullscreen: move focus and carry fullscreen
-    /// to the newly focused window (monocle mode) rather than dropping it. The
-    /// focused window becomes the fullscreen one, so focus cycles through
-    /// windows fullscreen.
     fn focus_in_fullscreen(&mut self, cmd: &IpcCommand) -> IpcResponse {
         let resp = self.execute_workspace_command(false, true, |ws, vw| {
             match cmd {
@@ -256,12 +295,10 @@ impl AppState {
             // focused window instead of a stale off-screen scroll position.
             ws.ensure_focused_visible_animated(vw);
         });
-        // Fullscreen hides the focus border; keep it hidden after retargeting.
         self.hide_border();
         resp
     }
 
-    /// Focus or move the focused column to the start/end of the strip.
     fn handle_strip_end_command(&mut self, cmd: IpcCommand) -> IpcResponse {
         match cmd {
             IpcCommand::FocusStart => self.execute_workspace_command(false, true, |ws, vw| {
@@ -290,13 +327,9 @@ impl AppState {
         }
     }
 
-    /// Apply the fullscreen interaction policy for `cmd`. Returns `Some` if the
-    /// command was fully handled here (suppressed, or focus moved within
-    /// fullscreen), or `None` to continue normal dispatch (possibly after
-    /// exiting fullscreen). A fullscreen window cloaks the rest of the strip, so
-    /// structural commands must drop fullscreen first to act on the visible
-    /// layout, focus commands carry fullscreen along, and sizing/scroll commands
-    /// are ignored.
+    // Fullscreen cloaks the rest of the strip: structural commands must reveal
+    // it before mutating it. Focus may carry fullscreen; sizing/scroll is ignored.
+    // Some means dispatch is complete; None continues normal dispatch.
     fn apply_fullscreen_policy(&mut self, cmd: &IpcCommand) -> Option<IpcResponse> {
         if !self
             .focused_workspace()
@@ -310,12 +343,16 @@ impl AppState {
                 None
             }
             FullscreenPolicy::FollowFocus => {
-                if self.config.behavior.fullscreen_follows_focus {
+                // Following focus would hand a floating window's fullscreen to
+                // the tiled focus behind it, so leave fullscreen instead.
+                if self.config.behavior.fullscreen_follows_focus
+                    && !self.focused_workspace().is_some_and(|ws| {
+                        ws.fullscreen_window_id()
+                            .is_some_and(|wid| ws.is_floating(wid))
+                    })
+                {
                     Some(self.focus_in_fullscreen(cmd))
                 } else {
-                    // Monocle-follow disabled: navigating away drops fullscreen
-                    // and applies the focus command to the visible tiled layout,
-                    // so fullscreen only ever affects the one window.
                     self.exit_fullscreen_if_active();
                     None
                 }
@@ -328,29 +365,154 @@ impl AppState {
         }
     }
 
+    // A focused floating window has no column. Runs before the fullscreen
+    // policy so an ignored column command does not drop fullscreen either.
+    // Some means dispatch is complete; None continues normal dispatch.
+    fn apply_floating_policy(&mut self, cmd: &IpcCommand) -> Option<IpcResponse> {
+        let hwnd = self.focused_floating_window()?;
+        match floating_policy(cmd) {
+            FloatingPolicy::Target => self.handle_floating_target(cmd, hwnd),
+            FloatingPolicy::Ignore => {
+                debug!("Ignoring {:?} while a floating window has focus", cmd);
+                Some(IpcResponse::Ok)
+            }
+            FloatingPolicy::Unchanged => None,
+        }
+    }
+
+    fn handle_floating_target(&mut self, cmd: &IpcCommand, hwnd: u64) -> Option<IpcResponse> {
+        match *cmd {
+            IpcCommand::CloseWindow => Some(self.handle_close_window()),
+            IpcCommand::ToggleFloating => Some(self.handle_unfloat_window(hwnd)),
+            IpcCommand::ToggleSticky => {
+                self.toggle_sticky_window(hwnd);
+                Some(IpcResponse::Ok)
+            }
+            IpcCommand::MoveToWorkspace { index } => {
+                Some(self.move_window_from_active_workspace(hwnd, index))
+            }
+            IpcCommand::MoveToWorkspacePrev => {
+                let index = self.relative_workspace_index(false);
+                Some(self.move_window_from_active_workspace(hwnd, index))
+            }
+            IpcCommand::MoveToWorkspaceNext => {
+                let index = self.relative_workspace_index(true);
+                Some(self.move_window_from_active_workspace(hwnd, index))
+            }
+            IpcCommand::MoveWindowToMonitorLeft => {
+                Some(self.move_to_monitor(Some(hwnd), monitor_to_left, "left"))
+            }
+            IpcCommand::MoveWindowToMonitorRight => {
+                Some(self.move_to_monitor(Some(hwnd), monitor_to_right, "right"))
+            }
+            IpcCommand::MoveWindowToMonitorUp => {
+                Some(self.move_to_monitor(Some(hwnd), monitor_above, "up"))
+            }
+            IpcCommand::MoveWindowToMonitorDown => {
+                Some(self.move_to_monitor(Some(hwnd), monitor_below, "down"))
+            }
+            IpcCommand::ScratchpadStash => {
+                self.scratchpad_stash();
+                Some(IpcResponse::Ok)
+            }
+            IpcCommand::ToggleFullscreen => {
+                Some(self.toggle_fullscreen_with(|ws| ws.toggle_fullscreen_window(hwnd)))
+            }
+            IpcCommand::Resize { delta } => {
+                if self
+                    .focused_workspace()
+                    .is_some_and(|ws| ws.fullscreen_window_id() == Some(hwnd))
+                {
+                    debug!("Ignoring {:?} while the floating window is fullscreen", cmd);
+                    return Some(IpcResponse::Ok);
+                }
+                Some(self.execute_workspace_command(true, false, |ws, _vw| {
+                    ws.resize_floating(hwnd, delta);
+                    info!("Resized floating window {} by {}", hwnd, delta);
+                }))
+            }
+            IpcCommand::QueryFocused => {
+                let ws = self.focused_workspace()?;
+                // The indices keep pointing at the tiled focus so older clients
+                // that ignore `is_floating` still read a valid strip position.
+                Some(IpcResponse::FocusedWindow {
+                    window_id: Some(hwnd),
+                    column_index: ws.focused_column_index(),
+                    window_index: ws.focused_window_index_in_column(),
+                    is_floating: true,
+                })
+            }
+            IpcCommand::FocusLeft => Some(self.focus_floating(hwnd, FloatingFocus::Left)),
+            IpcCommand::FocusRight => Some(self.focus_floating(hwnd, FloatingFocus::Right)),
+            IpcCommand::FocusUp => Some(self.focus_floating(hwnd, FloatingFocus::Up)),
+            IpcCommand::FocusDown => Some(self.focus_floating(hwnd, FloatingFocus::Down)),
+            IpcCommand::FocusStart => Some(self.focus_floating(hwnd, FloatingFocus::Leftmost)),
+            IpcCommand::FocusEnd => Some(self.focus_floating(hwnd, FloatingFocus::Rightmost)),
+            IpcCommand::FocusNext => Some(self.focus_floating(hwnd, FloatingFocus::Next)),
+            IpcCommand::FocusPrev => Some(self.focus_floating(hwnd, FloatingFocus::Prev)),
+            _ => None,
+        }
+    }
+
+    // Focus stays among the floating windows and the strip is left alone.
+    // With no floating window that way, focus stays put, except that up/down
+    // switch workspace when workspace_edge_wrap is on, as they do in the strip.
+    fn focus_floating(&mut self, hwnd: u64, to: FloatingFocus) -> IpcResponse {
+        let Some(ws) = self.focused_workspace() else {
+            return IpcResponse::Ok;
+        };
+        if ws.is_fullscreen() {
+            debug!("Ignoring floating focus {:?} while fullscreen", to);
+            return IpcResponse::Ok;
+        }
+        if let Some(target) = ws.floating_focus_target(hwnd, to) {
+            info!("Floating focus {:?} -> {}", to, target);
+            self.previous_focused_hwnd = Some(target);
+            self.sync_foreground_window();
+            return IpcResponse::Ok;
+        }
+        let wrap = match to {
+            FloatingFocus::Up => Some(IpcCommand::WorkspacePrev),
+            FloatingFocus::Down => Some(IpcCommand::WorkspaceNext),
+            _ => None,
+        };
+        match wrap {
+            Some(cmd) if self.config.behavior.workspace_edge_wrap => {
+                self.handle_workspace_prev_next(cmd)
+            }
+            _ => IpcResponse::Ok,
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     pub(crate) fn handle_command(&mut self, cmd: IpcCommand) -> IpcResponse {
-        if let Some(resp) = self.apply_fullscreen_policy(&cmd) {
-            return resp;
-        }
+        // Capture focus before dispatch refreshes previous_focused_hwnd: mouse
+        // follows focus (#43) must not warp when navigation leaves focus unchanged.
+        let focus_before = (self.config.behavior.mouse_follows_focus && is_focus_navigation(&cmd))
+            .then_some(self.previous_focused_hwnd);
         // Exit desktop peek before any window-operation command, but only when
         // the command targets the peeked monitor. Operations on other monitors
         // are local to those monitors and must not disturb peek. Queries,
         // health checks, and the peek-toggle commands themselves are exempt.
+        // With a floating window focused, only commands that act on it count;
+        // the floating policy ignores the rest, so they leave peek alone.
         if self
             .desktop_peek
             .as_ref()
             .is_some_and(|s| s.monitor == self.focused_monitor)
             && !is_peek_passthrough_command(&cmd)
+            && (self.focused_floating_window().is_none()
+                || matches!(floating_policy(&cmd), FloatingPolicy::Target))
         {
             self.exit_desktop_peek();
         }
-        // "Mouse follows focus" (#43): warp the cursor onto the focused window
-        // after a focus-navigation command, but only if focus actually moved to
-        // a different window. Snapshot the focused HWND before `cmd` is moved
-        // into the match; `sync_foreground_window` refreshes it during dispatch.
-        let focus_before = (self.config.behavior.mouse_follows_focus && is_focus_navigation(&cmd))
-            .then_some(self.previous_focused_hwnd);
+        if let Some(resp) = self.apply_floating_policy(&cmd) {
+            self.warp_cursor_if_focus_moved(focus_before);
+            return resp;
+        }
+        if let Some(resp) = self.apply_fullscreen_policy(&cmd) {
+            return resp;
+        }
         let resp = match cmd {
             IpcCommand::FocusLeft => self.execute_workspace_command(false, true, |ws, vw| {
                 ws.focus_left();
@@ -411,11 +573,7 @@ impl AppState {
                 ws.ensure_focused_visible_animated(vw);
                 info!("Expelled window to left");
             }),
-            IpcCommand::ExpelToRight => self.execute_workspace_command(true, true, |ws, vw| {
-                ws.expel_to_right();
-                ws.ensure_focused_visible_animated(vw);
-                info!("Expelled window to right");
-            }),
+            IpcCommand::ExpelToRight => self.expel_tiled_focus_to_right(),
             IpcCommand::ConsumeFromLeft => self.execute_workspace_command(true, true, |ws, vw| {
                 ws.consume_from_left();
                 ws.ensure_focused_visible_animated(vw);
@@ -432,10 +590,16 @@ impl AppState {
             IpcCommand::FocusMonitorRight => self.focus_monitor(monitor_to_right, "right"),
             IpcCommand::FocusMonitorUp => self.focus_monitor(monitor_above, "up"),
             IpcCommand::FocusMonitorDown => self.focus_monitor(monitor_below, "down"),
-            IpcCommand::MoveWindowToMonitorLeft => self.move_to_monitor(monitor_to_left, "left"),
-            IpcCommand::MoveWindowToMonitorRight => self.move_to_monitor(monitor_to_right, "right"),
-            IpcCommand::MoveWindowToMonitorUp => self.move_to_monitor(monitor_above, "up"),
-            IpcCommand::MoveWindowToMonitorDown => self.move_to_monitor(monitor_below, "down"),
+            IpcCommand::MoveWindowToMonitorLeft => {
+                self.move_to_monitor(None, monitor_to_left, "left")
+            }
+            IpcCommand::MoveWindowToMonitorRight => {
+                self.move_to_monitor(None, monitor_to_right, "right")
+            }
+            IpcCommand::MoveWindowToMonitorUp => self.move_to_monitor(None, monitor_above, "up"),
+            IpcCommand::MoveWindowToMonitorDown => {
+                self.move_to_monitor(None, monitor_below, "down")
+            }
             IpcCommand::Resize { delta } => {
                 self.execute_workspace_command(true, false, |ws, vw| {
                     ws.resize_focused_column(delta);
@@ -647,18 +811,19 @@ impl AppState {
             }),
             IpcCommand::SetActiveTab { column, tab } => self.handle_set_active_tab(column, tab),
         };
-        if let Some(before) = focus_before {
-            if let Some(hwnd) = self.previous_focused_hwnd {
-                if Some(hwnd) != before {
-                    leopardwm_platform_win32::warp_cursor_to_window(hwnd);
-                }
-            }
-        }
+        self.warp_cursor_if_focus_moved(focus_before);
         resp
     }
 
-    /// Focus the monitor picked by `select` (left/right/above/below), if any.
-    /// `dir` labels the direction for logging.
+    // `before` is None when mouse_follows_focus does not apply to the command.
+    fn warp_cursor_if_focus_moved(&self, before: Option<Option<u64>>) {
+        if let (Some(before), Some(hwnd)) = (before, self.previous_focused_hwnd) {
+            if Some(hwnd) != before {
+                leopardwm_platform_win32::warp_cursor_to_window(hwnd);
+            }
+        }
+    }
+
     fn focus_monitor(
         &mut self,
         select: fn(&[MonitorInfo], MonitorId) -> Option<&MonitorInfo>,
@@ -679,20 +844,19 @@ impl AppState {
         IpcResponse::Ok
     }
 
-    /// Handle `IpcCommand::QueryFocused`.
     fn handle_query_focused(&mut self) -> IpcResponse {
         if let Some(workspace) = self.focused_workspace() {
             IpcResponse::FocusedWindow {
                 window_id: workspace.focused_window(),
                 column_index: workspace.focused_column_index(),
                 window_index: workspace.focused_window_index_in_column(),
+                is_floating: false,
             }
         } else {
             IpcResponse::error("No focused workspace")
         }
     }
 
-    /// Handle `IpcCommand::Refresh`.
     fn handle_refresh(&mut self) -> IpcResponse {
         match self.enumerate_and_add_windows() {
             Ok(added) => {
@@ -723,7 +887,6 @@ impl AppState {
         }
     }
 
-    /// Handle `IpcCommand::Reload`.
     fn handle_reload(&mut self) -> IpcResponse {
         self.reload_config(true)
     }
@@ -751,7 +914,6 @@ impl AppState {
         }
     }
 
-    /// Handle `IpcCommand::SetGhostAnimation`.
     fn handle_set_ghost_animation(&mut self, enabled: Option<bool>) -> IpcResponse {
         if let Some(new_value) = enabled {
             // Aborts any active ghost transition first — the flag
@@ -764,9 +926,13 @@ impl AppState {
         }
     }
 
-    /// Handle `IpcCommand::CloseWindow`.
+    fn close_window_target(&self) -> Option<u64> {
+        self.focused_floating_window()
+            .or_else(|| self.focused_workspace().and_then(|ws| ws.focused_window()))
+    }
+
     fn handle_close_window(&mut self) -> IpcResponse {
-        if let Some(hwnd) = self.focused_workspace().and_then(|ws| ws.focused_window()) {
+        if let Some(hwnd) = self.close_window_target() {
             if let Err(e) = leopardwm_platform_win32::close_window(hwnd) {
                 return IpcResponse::error(format!("Failed to close window: {}", e));
             }
@@ -824,10 +990,16 @@ impl AppState {
         IpcResponse::Ok
     }
 
-    /// Handle `IpcCommand::ToggleFullscreen`.
     fn handle_toggle_fullscreen(&mut self) -> IpcResponse {
+        self.toggle_fullscreen_with(Workspace::toggle_fullscreen)
+    }
+
+    fn toggle_fullscreen_with(
+        &mut self,
+        toggle: impl FnOnce(&mut Workspace) -> bool,
+    ) -> IpcResponse {
         let resp = self.execute_workspace_command(true, false, |ws, _vw| {
-            let entering = ws.toggle_fullscreen();
+            let entering = toggle(ws);
             info!("Fullscreen: {}", if entering { "on" } else { "off" });
         });
         if self
@@ -841,7 +1013,6 @@ impl AppState {
         resp
     }
 
-    /// Handle `IpcCommand::QueryStatus`.
     fn handle_query_status(&mut self) -> IpcResponse {
         let uptime = self.start_time.elapsed().as_secs();
         let total_windows: usize = self
@@ -858,7 +1029,6 @@ impl AppState {
         }
     }
 
-    /// Handle `IpcCommand::WorkspacePrev` and `IpcCommand::WorkspaceNext`.
     fn handle_workspace_prev_next(&mut self, cmd: IpcCommand) -> IpcResponse {
         const COUNT: usize = 9;
         let monitor = self.focused_monitor;
@@ -892,24 +1062,22 @@ impl AppState {
         self.handle_switch_workspace_with_direction((target + 1) as u8, Some(forward))
     }
 
-    /// Move the focused window to the previous (`forward = false`) or next
-    /// (`forward = true`) workspace, wrapping 1 ↔ 9. Handles
-    /// `IpcCommand::MoveToWorkspacePrev` / `MoveToWorkspaceNext`.
     fn handle_move_to_workspace_relative(&mut self, forward: bool) -> IpcResponse {
+        self.handle_move_to_workspace(self.relative_workspace_index(forward))
+    }
+
+    /// The 1-based index of the workspace next to the active one, wrapping.
+    fn relative_workspace_index(&self, forward: bool) -> u8 {
         const COUNT: usize = 9;
-        let monitor = self.focused_monitor;
-        let current = self.active_workspace_idx(monitor);
+        let current = self.active_workspace_idx(self.focused_monitor);
         let target = if forward {
             (current + 1) % COUNT
         } else {
             (current + COUNT - 1) % COUNT
         };
-        self.handle_move_to_workspace((target + 1) as u8)
+        (target + 1) as u8
     }
 
-    /// Vertical focus (`focus_up`/`focus_down`). With `workspace_edge_wrap` on,
-    /// a press at the column's top/bottom edge or on an empty workspace
-    /// switches to the adjacent workspace. `up` selects up vs down.
     fn focus_vertical(&mut self, up: bool) -> IpcResponse {
         let empty_workspace = self
             .focused_workspace()
@@ -937,9 +1105,6 @@ impl AppState {
         })
     }
 
-    /// Vertical move (`move_window_up`/`move_window_down` within a column). With
-    /// `workspace_edge_wrap` on, a press at the column's top/bottom edge moves
-    /// the focused window to the adjacent workspace instead of no-oping.
     fn move_window_vertical(&mut self, up: bool) -> IpcResponse {
         if self.config.behavior.workspace_edge_wrap && self.focus_at_vertical_edge(up) {
             return self.handle_move_to_workspace_relative(!up);
@@ -954,8 +1119,6 @@ impl AppState {
         })
     }
 
-    /// Whether vertical focus/move is pinned at the top (`up = true`) or bottom
-    /// (`up = false`) of the focused column, so it can't move within it.
     fn focus_at_vertical_edge(&self, up: bool) -> bool {
         self.focused_workspace().is_some_and(|ws| {
             if up {
@@ -966,17 +1129,21 @@ impl AppState {
         })
     }
 
-    /// Move the focused window to the monitor picked by `select`
-    /// (left/right/above/below), if any. `dir` labels the direction for logging.
+    /// Moves `window`, or the focused window when `None`.
     fn move_to_monitor(
         &mut self,
+        window: Option<u64>,
         select: fn(&[MonitorInfo], MonitorId) -> Option<&MonitorInfo>,
         dir: &str,
     ) -> IpcResponse {
         let monitors: Vec<_> = self.monitors.values().cloned().collect();
         if let Some(target) = select(&monitors, self.focused_monitor) {
             let target_id = target.id;
-            match self.move_focused_window_to_monitor_transactional(target_id) {
+            let moved = match window {
+                Some(hwnd) => self.move_window_to_monitor_transactional(hwnd, target_id),
+                None => self.move_focused_window_to_monitor_transactional(target_id),
+            };
+            match moved {
                 Ok(Some(hwnd)) => {
                     info!("Moved window {} to monitor {}", hwnd, target_id);
                     self.move_to_monitor_target =
@@ -996,7 +1163,6 @@ impl AppState {
         IpcResponse::Ok
     }
 
-    /// Handle `IpcCommand::QueryWorkspace`.
     fn handle_query_workspace(&mut self) -> IpcResponse {
         let active_idx = self.active_workspace_idx(self.focused_monitor);
         let active_workspace_name = self.config.workspaces.name_for(active_idx);
@@ -1016,7 +1182,6 @@ impl AppState {
         }
     }
 
-    /// Handle `IpcCommand::QueryHotkeys`.
     fn handle_query_hotkeys(&self) -> IpcResponse {
         let catalog = leopardwm_ipc::hotkeys::hotkey_catalog();
         let mut bindings_by_action: HashMap<String, Vec<String>> = HashMap::new();
@@ -1064,7 +1229,6 @@ impl AppState {
         }
     }
 
-    /// Handle `IpcCommand::QueryAllWindows`.
     fn handle_query_all_windows(&mut self) -> IpcResponse {
         let mut windows = Vec::new();
 
@@ -1080,7 +1244,6 @@ impl AppState {
 
         for (monitor_id, ws_vec) in &self.workspaces {
             for workspace in ws_vec {
-                // Tiled windows
                 for (col_idx, column) in workspace.columns().iter().enumerate() {
                     for (win_idx, &window_id) in column.windows().iter().enumerate() {
                         let (title, class_name, process_id) = win_info_map
@@ -1090,7 +1253,6 @@ impl AppState {
 
                         let executable = get_process_executable(process_id).unwrap_or_default();
 
-                        // Get rect from computed placements
                         let rect = self
                             .monitors
                             .contains_key(monitor_id)
@@ -1126,7 +1288,6 @@ impl AppState {
                     }
                 }
 
-                // Floating windows
                 for floating in workspace.floating_windows() {
                     let (title, class_name, process_id) = win_info_map
                         .get(&floating.id)
@@ -1160,26 +1321,30 @@ impl AppState {
         IpcResponse::WindowList { windows }
     }
 
-    /// Handle `IpcCommand::ToggleFloating`.
     fn handle_toggle_floating(&mut self) -> IpcResponse {
         let viewport = self.focused_viewport();
-        let prev_hwnd = self.previous_focused_hwnd;
-        if let Some(workspace) = self.focused_workspace_mut() {
-            // Check if the OS-foreground window is floating — unfloat it
-            let foreground_is_floating = prev_hwnd
-                .map(|hwnd| workspace.is_floating(hwnd))
-                .unwrap_or(false);
-            if foreground_is_floating {
-                let hwnd = prev_hwnd.unwrap();
-                if workspace.unfloat_window(hwnd) {
-                    self.disable_snap_for_window(hwnd);
-                    info!("Unfloated window {} back to tiling", hwnd);
-                }
-            } else if let Some(wid) = workspace.toggle_floating(viewport) {
-                self.restore_snap_for_window(wid);
-                info!("Toggled window {} to floating", wid);
-            }
+        if let Some(wid) = self
+            .focused_workspace_mut()
+            .and_then(|ws| ws.toggle_floating(viewport))
+        {
+            self.restore_snap_for_window(wid);
+            info!("Toggled window {} to floating", wid);
         }
+        self.apply_floating_toggle()
+    }
+
+    fn handle_unfloat_window(&mut self, hwnd: u64) -> IpcResponse {
+        if self
+            .focused_workspace_mut()
+            .is_some_and(|ws| ws.unfloat_window(hwnd))
+        {
+            self.disable_snap_for_window(hwnd);
+            info!("Unfloated window {} back to tiling", hwnd);
+        }
+        self.apply_floating_toggle()
+    }
+
+    fn apply_floating_toggle(&mut self) -> IpcResponse {
         if let Err(e) = self.apply_layout() {
             return IpcResponse::error(format!("Failed to apply layout: {}", e));
         }
@@ -1187,7 +1352,6 @@ impl AppState {
         IpcResponse::Ok
     }
 
-    /// Handle `IpcCommand::SwitchWorkspace`.
     fn handle_switch_workspace(&mut self, index: u8) -> IpcResponse {
         self.handle_switch_workspace_with_direction(index, None)
     }
@@ -1288,9 +1452,6 @@ impl AppState {
             }
         }
 
-        // Cancel any in-progress drag: reinsert window if it was
-        // removed from source during live preview, then remove placeholders.
-        // Only reinsert if the window still exists.
         if let Some(drag) = self.drag_state.take() {
             if drag.removed_from_source
                 && drag.is_tiled
@@ -1338,7 +1499,6 @@ impl AppState {
             None => -slide_height,
         };
 
-        // Snapshot old workspace's current positions (start for exiting windows).
         let mut old_placements = self.workspace_placements(monitor, current_idx);
 
         // Overview snapshot mode: grab the outgoing windows NOW, while
@@ -1351,7 +1511,6 @@ impl AppState {
             }
         }
 
-        // Ensure target workspace exists (lazy creation)
         self.ensure_workspace_exists(monitor, idx);
 
         // A new explicit destination supersedes earlier switch-focus and
@@ -1359,11 +1518,8 @@ impl AppState {
         self.pending_workspace_switch_focus = None;
         self.pending_last_window_departure = None;
 
-        // Switch active workspace
         self.active_workspace.insert(monitor, idx);
 
-        // Sticky windows follow the switch: move them onto the
-        // now-active workspace.
         self.rehome_sticky_windows();
 
         let viewport_width = self.viewport_width_for(monitor);
@@ -1372,7 +1528,6 @@ impl AppState {
             workspace.reconcile_scroll_bounds(viewport_width);
         }
 
-        // Compute new workspace's final placements.
         let mut new_placements = self.workspace_placements(monitor, idx);
 
         // Keep sticky windows out of the slide animation so they sit
@@ -1386,13 +1541,9 @@ impl AppState {
                 && !self.is_application_fullscreen(p.window_id)
         });
 
-        // Build animation rects:
-        // - Entering windows: start offscreen, end at final position
-        // - Exiting windows: start at current position, end offscreen
         let mut start_rects = std::collections::HashMap::new();
         let mut exit_rects = std::collections::HashMap::new();
 
-        // New workspace windows enter from the opposite side.
         for placement in &new_placements {
             let rect = placement.rect;
             start_rects.insert(
@@ -1406,7 +1557,6 @@ impl AppState {
             );
         }
 
-        // Old workspace windows slide out.
         for placement in &old_placements {
             if placement.visibility != Visibility::Visible {
                 continue;
@@ -1458,9 +1608,6 @@ impl AppState {
         // Mid-slide windows are skipped here and cloaked when the transition
         // settles (see tick_animations).
         self.sync_taskbar_buttons();
-        // Restore the floating window that was focused on this
-        // workspace (if it still floats here) so it regains focus on
-        // return, before syncing the OS foreground.
         self.restore_workspace_floating_focus(monitor, idx);
         self.sync_foreground_window();
         // If a summoned scratchpad lives on this workspace, restore
@@ -1518,7 +1665,6 @@ impl AppState {
         }
     }
 
-    /// Handle `IpcCommand::MoveToWorkspace`.
     fn handle_move_to_workspace(&mut self, index: u8) -> IpcResponse {
         if !(1..=9).contains(&index) {
             return IpcResponse::error("Workspace index must be 1-9");
@@ -1536,7 +1682,6 @@ impl AppState {
         let focused_hwnd = {
             let tiled_focus = self.focused_workspace().and_then(|ws| ws.focused_window());
             let os_focus = self.previous_focused_hwnd.and_then(|hwnd| {
-                // Verify the OS-focused window is actually on the current workspace
                 self.workspaces
                     .get(&monitor)
                     .and_then(|v| v.get(current_idx))
@@ -1550,6 +1695,12 @@ impl AppState {
         };
 
         self.move_window_to_workspace(monitor, current_idx, focused_hwnd, index, true)
+    }
+
+    fn move_window_from_active_workspace(&mut self, hwnd: u64, index: u8) -> IpcResponse {
+        let monitor = self.focused_monitor;
+        let current_idx = self.active_workspace_idx(monitor);
+        self.move_window_to_workspace(monitor, current_idx, hwnd, index, true)
     }
 
     pub(crate) fn move_window_to_workspace(
@@ -1575,10 +1726,8 @@ impl AppState {
         }
         let snapshot = self.snapshot_layout();
 
-        // Ensure target workspace exists (lazy creation)
         self.ensure_workspace_exists(monitor, idx);
 
-        // Check if the window is floating so we use the correct add/remove APIs.
         let is_floating = self
             .workspaces
             .get(&monitor)
@@ -1636,8 +1785,7 @@ impl AppState {
             }
         };
 
-        // Remove from source and insert into target.
-        // For floating windows, get the rect from workspace state (canonical position).
+        // Workspace state owns the floating window's canonical position.
         let floating_rect = if is_floating {
             self.workspaces
                 .get(&monitor)
@@ -1664,12 +1812,10 @@ impl AppState {
             }
         }
 
-        // Ensure target workspace exists (lazy creation)
         self.ensure_workspace_exists(monitor, idx);
 
         let target_viewport_width = self.viewport_width_for(monitor);
 
-        // Insert into target workspace
         if let Some(workspace) = self
             .workspaces
             .get_mut(&monitor)
@@ -1679,7 +1825,6 @@ impl AppState {
                 let rect =
                     floating_rect.unwrap_or(leopardwm_core_layout::Rect::new(0, 0, 800, 600));
                 if let Err(e) = workspace.add_floating(focused_hwnd, rect) {
-                    // Rollback: re-add to source
                     if let Some(src_ws) = self
                         .workspaces
                         .get_mut(&monitor)
@@ -1759,7 +1904,6 @@ impl AppState {
             }
         }
 
-        // Ensure the source workspace scrolls to show its new focused window
         let viewport_width = self.viewport_width_for(monitor);
         if let Some(workspace) = self
             .workspaces
@@ -1786,7 +1930,6 @@ impl AppState {
         IpcResponse::Ok
     }
 
-    /// Handle `IpcCommand::HealthCheck`.
     fn handle_health_check(&mut self) -> IpcResponse {
         let uptime = self.start_time.elapsed().as_secs();
         let total_windows: usize = self
@@ -1815,7 +1958,6 @@ impl AppState {
         }
     }
 
-    /// Handle `IpcCommand::SetAutoStart`.
     fn handle_set_auto_start(&mut self, enabled: bool) -> IpcResponse {
         use leopardwm_platform_win32::autostart;
         let result = if enabled {
@@ -1839,7 +1981,6 @@ impl AppState {
         }
     }
 
-    /// Handle `IpcCommand::SetActiveTab`.
     fn handle_set_active_tab(&mut self, column: usize, tab: usize) -> IpcResponse {
         self.handle_set_active_tab_with_restore(
             column,
@@ -1888,6 +2029,22 @@ impl AppState {
         }
 
         self.commit_active_tab_after_restore(column, tab, target, was_minimized)
+    }
+
+    /// The tab strip's Untab names its tab explicitly, so it skips the
+    /// floating policy but keeps the fullscreen exit `ExpelToRight` gets
+    /// from `handle_command`.
+    pub(crate) fn untab_tiled_focus(&mut self) -> IpcResponse {
+        self.exit_fullscreen_if_active();
+        self.expel_tiled_focus_to_right()
+    }
+
+    fn expel_tiled_focus_to_right(&mut self) -> IpcResponse {
+        self.execute_workspace_command(true, true, |ws, vw| {
+            ws.expel_to_right();
+            ws.ensure_focused_visible_animated(vw);
+            info!("Expelled window to right");
+        })
     }
 
     pub(crate) fn handle_tab_action_activation_with_restore(
@@ -2159,6 +2316,579 @@ mod focus_nav_tests {
                 "{cmd:?} should not warp the cursor"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod floating_policy_tests {
+    use super::*;
+    use crate::config::Config;
+    use leopardwm_core_layout::Rect;
+    use leopardwm_platform_win32::MonitorInfo;
+
+    const FLOATING: u64 = 900;
+
+    const FOCUS: [IpcCommand; 8] = [
+        IpcCommand::FocusLeft,
+        IpcCommand::FocusRight,
+        IpcCommand::FocusUp,
+        IpcCommand::FocusDown,
+        IpcCommand::FocusNext,
+        IpcCommand::FocusPrev,
+        IpcCommand::FocusStart,
+        IpcCommand::FocusEnd,
+    ];
+
+    const IGNORED: [IpcCommand; 23] = [
+        IpcCommand::SetColumnWidth { fraction: 0.5 },
+        IpcCommand::CycleWidth,
+        IpcCommand::CycleWidthUp,
+        IpcCommand::CycleWidthDown,
+        IpcCommand::CycleHeight,
+        IpcCommand::CycleHeightUp,
+        IpcCommand::CycleHeightDown,
+        IpcCommand::MaximizeColumn,
+        IpcCommand::CenterColumn,
+        IpcCommand::EqualizeColumnHeights,
+        IpcCommand::ToggleTabbed,
+        IpcCommand::MoveColumnLeft,
+        IpcCommand::MoveColumnRight,
+        IpcCommand::MoveColumnToStart,
+        IpcCommand::MoveColumnToEnd,
+        IpcCommand::MoveWindowLeft,
+        IpcCommand::MoveWindowRight,
+        IpcCommand::MoveWindowUp,
+        IpcCommand::MoveWindowDown,
+        IpcCommand::ConsumeFromLeft,
+        IpcCommand::ConsumeFromRight,
+        IpcCommand::ExpelToLeft,
+        IpcCommand::ExpelToRight,
+    ];
+
+    fn monitor(id: MonitorId, x: i32) -> MonitorInfo {
+        MonitorInfo {
+            id,
+            rect: Rect::new(x, 0, 1920, 1080),
+            work_area: Rect::new(x, 0, 1920, 1040),
+            is_primary: id == 1,
+            device_name: format!("DISPLAY{id}"),
+            scale_factor: 1.0,
+        }
+    }
+
+    /// Three columns (100 | 200+201 | 300) focused on 201, with a floating
+    /// window holding focus over them.
+    fn floating_focus_state() -> AppState {
+        floating_focus_state_on(vec![monitor(1, 0)])
+    }
+
+    fn floating_focus_state_on(monitors: Vec<MonitorInfo>) -> AppState {
+        let mut state = AppState::new_with_config(Config::default(), monitors);
+        assert!(state.paused);
+        let ws = state.focused_workspace_mut().unwrap();
+        ws.insert_window(100, Some(400)).unwrap();
+        ws.insert_window(200, Some(600)).unwrap();
+        ws.insert_window_in_column(201, 1).unwrap();
+        ws.insert_window(300, Some(800)).unwrap();
+        ws.set_focus(1, 1).unwrap();
+        ws.add_floating(FLOATING, Rect::new(100, 100, 500, 400))
+            .unwrap();
+        state.previous_focused_hwnd = Some(FLOATING);
+        assert_eq!(state.focused_floating_window(), Some(FLOATING));
+        state
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct StripSnapshot {
+        columns: Vec<(Vec<u64>, i32, Vec<f64>, bool)>,
+        focus: (usize, usize),
+        fullscreen: Option<u64>,
+    }
+
+    fn strip_snapshot(state: &AppState) -> StripSnapshot {
+        let ws = state.focused_workspace().unwrap();
+        StripSnapshot {
+            columns: ws
+                .columns()
+                .iter()
+                .map(|c| {
+                    (
+                        c.windows().to_vec(),
+                        c.width(),
+                        c.height_weights().to_vec(),
+                        c.is_tabbed(),
+                    )
+                })
+                .collect(),
+            focus: (
+                ws.focused_column_index(),
+                ws.focused_window_index_in_column(),
+            ),
+            fullscreen: ws.fullscreen_window_id(),
+        }
+    }
+
+    #[test]
+    fn floating_policy_groups_commands() {
+        for cmd in [
+            IpcCommand::CloseWindow,
+            IpcCommand::ToggleFloating,
+            IpcCommand::ToggleSticky,
+            IpcCommand::ToggleFullscreen,
+            IpcCommand::Resize { delta: 100 },
+            IpcCommand::QueryFocused,
+            IpcCommand::ScratchpadStash,
+            IpcCommand::MoveToWorkspace { index: 2 },
+            IpcCommand::MoveToWorkspacePrev,
+            IpcCommand::MoveToWorkspaceNext,
+            IpcCommand::MoveWindowToMonitorLeft,
+            IpcCommand::MoveWindowToMonitorRight,
+            IpcCommand::MoveWindowToMonitorUp,
+            IpcCommand::MoveWindowToMonitorDown,
+        ]
+        .into_iter()
+        .chain(FOCUS)
+        {
+            assert!(
+                matches!(floating_policy(&cmd), FloatingPolicy::Target),
+                "{cmd:?} should target the floating window"
+            );
+        }
+        for cmd in IGNORED {
+            assert!(
+                matches!(floating_policy(&cmd), FloatingPolicy::Ignore),
+                "{cmd:?} should be ignored"
+            );
+        }
+        for cmd in [
+            IpcCommand::Scroll { delta: 100.0 },
+            IpcCommand::EqualizeColumnWidths,
+        ] {
+            assert!(
+                matches!(floating_policy(&cmd), FloatingPolicy::Unchanged),
+                "{cmd:?} should keep its normal dispatch"
+            );
+        }
+    }
+
+    #[test]
+    fn column_commands_are_ignored_while_floating_has_focus() {
+        for fullscreen in [false, true] {
+            let mut state = floating_focus_state();
+            if fullscreen {
+                state.focused_workspace_mut().unwrap().toggle_fullscreen();
+            }
+            let before = strip_snapshot(&state);
+            assert_eq!(before.fullscreen.is_some(), fullscreen);
+            for cmd in IGNORED {
+                assert_eq!(
+                    state.handle_command(cmd.clone()),
+                    IpcResponse::Ok,
+                    "{cmd:?}"
+                );
+                assert_eq!(
+                    strip_snapshot(&state),
+                    before,
+                    "{cmd:?} changed the strip (fullscreen: {fullscreen})"
+                );
+                assert_eq!(state.focused_floating_window(), Some(FLOATING));
+            }
+        }
+    }
+
+    #[test]
+    fn strip_commands_still_act_while_floating_has_focus() {
+        let mut state = floating_focus_state();
+        assert_eq!(
+            state.handle_command(IpcCommand::EqualizeColumnWidths),
+            IpcResponse::Ok
+        );
+        let widths: Vec<i32> = state
+            .focused_workspace()
+            .unwrap()
+            .columns()
+            .iter()
+            .map(|c| c.width())
+            .collect();
+        assert!(widths.windows(2).all(|w| w[0] == w[1]), "{widths:?}");
+    }
+
+    #[test]
+    fn toggle_floating_unfloats_the_focused_floating_window() {
+        let mut state = floating_focus_state();
+        assert_eq!(
+            state.handle_command(IpcCommand::ToggleFloating),
+            IpcResponse::Ok
+        );
+        let ws = state.focused_workspace().unwrap();
+        assert!(!ws.is_floating(FLOATING));
+        assert!(ws.columns().iter().any(|c| c.windows().contains(&FLOATING)));
+
+        let mut state = floating_focus_state();
+        state.previous_focused_hwnd = Some(201);
+        assert_eq!(
+            state.handle_command(IpcCommand::ToggleFloating),
+            IpcResponse::Ok
+        );
+        let ws = state.focused_workspace().unwrap();
+        assert!(ws.is_floating(201));
+        assert!(ws.is_floating(FLOATING));
+    }
+
+    #[test]
+    fn toggle_sticky_pins_the_focused_floating_window() {
+        let mut state = floating_focus_state();
+        let before = strip_snapshot(&state);
+        assert_eq!(
+            state.handle_command(IpcCommand::ToggleSticky),
+            IpcResponse::Ok
+        );
+        assert!(state.sticky_windows.contains(&FLOATING));
+        assert!(state.focused_workspace().unwrap().is_floating(FLOATING));
+        assert_eq!(strip_snapshot(&state), before);
+
+        assert_eq!(
+            state.handle_command(IpcCommand::ToggleSticky),
+            IpcResponse::Ok
+        );
+        assert!(state.sticky_windows.is_empty());
+    }
+
+    #[test]
+    fn move_to_workspace_targets_the_focused_floating_window() {
+        for (cmd, target) in [
+            (IpcCommand::MoveToWorkspace { index: 3 }, 2),
+            (IpcCommand::MoveToWorkspacePrev, 8),
+            (IpcCommand::MoveToWorkspaceNext, 1),
+        ] {
+            let mut state = floating_focus_state();
+            let before = strip_snapshot(&state);
+            assert_eq!(state.handle_command(cmd.clone()), IpcResponse::Ok);
+            assert_eq!(strip_snapshot(&state), before, "{cmd:?}");
+            assert!(!state.focused_workspace().unwrap().contains_window(FLOATING));
+            assert!(
+                state.workspaces[&1][target].is_floating(FLOATING),
+                "{cmd:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn move_to_monitor_targets_the_focused_floating_window() {
+        let mut state = floating_focus_state_on(vec![monitor(1, 0), monitor(2, 1920)]);
+        let before = strip_snapshot(&state);
+        assert_eq!(
+            state.handle_command(IpcCommand::MoveWindowToMonitorRight),
+            IpcResponse::Ok
+        );
+        assert_eq!(state.focused_monitor, 2);
+        let target = state.focused_workspace().unwrap();
+        assert!(target.is_floating(FLOATING));
+        assert!(target.columns().is_empty());
+        state.focused_monitor = 1;
+        assert!(!state.focused_workspace().unwrap().contains_window(FLOATING));
+        assert_eq!(strip_snapshot(&state), before);
+    }
+
+    fn floating_rect(state: &AppState) -> Rect {
+        state
+            .focused_workspace()
+            .unwrap()
+            .floating_windows()
+            .iter()
+            .find(|f| f.id == FLOATING)
+            .unwrap()
+            .rect
+    }
+
+    #[test]
+    fn close_targets_the_focused_floating_window() {
+        let mut state = floating_focus_state();
+        assert_eq!(state.close_window_target(), Some(FLOATING));
+
+        state.previous_focused_hwnd = Some(201);
+        assert_eq!(state.close_window_target(), Some(201));
+    }
+
+    #[test]
+    fn scratchpad_stash_targets_the_focused_floating_window() {
+        let mut state = floating_focus_state();
+        let before = strip_snapshot(&state);
+        assert_eq!(
+            state.handle_command(IpcCommand::ScratchpadStash),
+            IpcResponse::Ok
+        );
+        assert_eq!(state.scratchpad.map(|sp| sp.window_id), Some(FLOATING));
+        let ws = state.focused_workspace().unwrap();
+        assert!(!ws.contains_window(FLOATING));
+        assert_eq!(strip_snapshot(&state), before);
+    }
+
+    #[test]
+    fn resize_targets_the_focused_floating_window() {
+        let mut state = floating_focus_state();
+        let before = strip_snapshot(&state);
+        assert_eq!(
+            state.handle_command(IpcCommand::Resize { delta: 100 }),
+            IpcResponse::Ok
+        );
+        assert_eq!(floating_rect(&state), Rect::new(100, 100, 600, 400));
+        assert_eq!(strip_snapshot(&state), before);
+    }
+
+    #[test]
+    fn resize_hint_follows_the_focused_floating_window() {
+        let mut state = floating_focus_state();
+        assert_eq!(
+            state.get_focused_column_rect(),
+            Some(Rect::new(100, 100, 500, 400))
+        );
+
+        state.previous_focused_hwnd = Some(201);
+        let tiled = state.get_focused_column_rect().unwrap();
+        assert_ne!(tiled, Rect::new(100, 100, 500, 400));
+    }
+
+    #[test]
+    fn resize_is_ignored_while_the_floating_window_is_fullscreen() {
+        let mut state = floating_focus_state();
+        assert!(state
+            .focused_workspace_mut()
+            .unwrap()
+            .toggle_fullscreen_window(FLOATING));
+        assert_eq!(
+            state.handle_command(IpcCommand::Resize { delta: 100 }),
+            IpcResponse::Ok
+        );
+        assert_eq!(floating_rect(&state), Rect::new(100, 100, 500, 400));
+    }
+
+    #[test]
+    fn toggle_fullscreen_targets_the_focused_floating_window() {
+        let mut state = floating_focus_state();
+        let before = strip_snapshot(&state);
+        assert_eq!(
+            state.handle_command(IpcCommand::ToggleFullscreen),
+            IpcResponse::Ok
+        );
+        assert_eq!(
+            state.focused_workspace().unwrap().fullscreen_window_id(),
+            Some(FLOATING)
+        );
+        assert_eq!(state.focused_floating_window(), Some(FLOATING));
+
+        assert_eq!(
+            state.handle_command(IpcCommand::ToggleFullscreen),
+            IpcResponse::Ok
+        );
+        assert_eq!(strip_snapshot(&state), before);
+        assert_eq!(floating_rect(&state), Rect::new(100, 100, 500, 400));
+        assert_eq!(state.focused_floating_window(), Some(FLOATING));
+    }
+
+    #[test]
+    fn focus_is_ignored_while_floating_is_fullscreen() {
+        let mut state = floating_focus_state();
+        assert!(state.config.behavior.fullscreen_follows_focus);
+        assert_eq!(
+            state.handle_command(IpcCommand::ToggleFullscreen),
+            IpcResponse::Ok
+        );
+        let before = strip_snapshot(&state);
+        assert_eq!(before.fullscreen, Some(FLOATING));
+        assert_eq!(state.handle_command(IpcCommand::FocusLeft), IpcResponse::Ok);
+        assert_eq!(strip_snapshot(&state), before);
+        assert_eq!(state.focused_floating_window(), Some(FLOATING));
+    }
+
+    const RIGHT: u64 = 901;
+    const LOWER_LEFT: u64 = 902;
+
+    /// `floating_focus_state` plus a floating window to the right of FLOATING
+    /// (center 1000,250) and one to its lower left (center 150,750).
+    fn three_floating_state() -> AppState {
+        let mut state = floating_focus_state();
+        let ws = state.focused_workspace_mut().unwrap();
+        ws.add_floating(RIGHT, Rect::new(800, 100, 400, 300))
+            .unwrap();
+        ws.add_floating(LOWER_LEFT, Rect::new(0, 600, 300, 300))
+            .unwrap();
+        state
+    }
+
+    /// Runs `cmd` with focus on `from` and returns the focused floating window,
+    /// checking that the strip behind it did not change.
+    fn floating_focus_after(state: &mut AppState, from: u64, cmd: IpcCommand) -> Option<u64> {
+        state.previous_focused_hwnd = Some(from);
+        let before = strip_snapshot(state);
+        assert_eq!(
+            state.handle_command(cmd.clone()),
+            IpcResponse::Ok,
+            "{cmd:?}"
+        );
+        assert_eq!(strip_snapshot(state), before, "{cmd:?} changed the strip");
+        state.focused_floating_window()
+    }
+
+    #[test]
+    fn directional_focus_moves_between_floating_windows() {
+        let mut state = three_floating_state();
+        for (from, cmd, expected) in [
+            (FLOATING, IpcCommand::FocusRight, RIGHT),
+            (FLOATING, IpcCommand::FocusLeft, LOWER_LEFT),
+            (FLOATING, IpcCommand::FocusUp, RIGHT),
+            (FLOATING, IpcCommand::FocusDown, LOWER_LEFT),
+            (RIGHT, IpcCommand::FocusLeft, FLOATING),
+            (LOWER_LEFT, IpcCommand::FocusUp, FLOATING),
+        ] {
+            assert_eq!(
+                floating_focus_after(&mut state, from, cmd.clone()),
+                Some(expected),
+                "{cmd:?} from {from}"
+            );
+        }
+    }
+
+    #[test]
+    fn floating_focus_stays_put_without_a_candidate() {
+        let mut state = three_floating_state();
+        for (from, cmd) in [
+            (RIGHT, IpcCommand::FocusRight),
+            (RIGHT, IpcCommand::FocusUp),
+            (LOWER_LEFT, IpcCommand::FocusLeft),
+            (LOWER_LEFT, IpcCommand::FocusDown),
+            (LOWER_LEFT, IpcCommand::FocusStart),
+            (RIGHT, IpcCommand::FocusEnd),
+        ] {
+            assert_eq!(
+                floating_focus_after(&mut state, from, cmd.clone()),
+                Some(from),
+                "{cmd:?} from {from}"
+            );
+        }
+
+        // A lone floating window keeps focus instead of dropping to the strip.
+        let mut state = floating_focus_state();
+        for cmd in FOCUS {
+            assert_eq!(
+                floating_focus_after(&mut state, FLOATING, cmd.clone()),
+                Some(FLOATING),
+                "{cmd:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn start_end_and_next_prev_pick_floating_windows() {
+        let mut state = three_floating_state();
+        // Ordered by left edge: LOWER_LEFT (0), FLOATING (100), RIGHT (800).
+        for (from, cmd, expected) in [
+            (FLOATING, IpcCommand::FocusStart, LOWER_LEFT),
+            (FLOATING, IpcCommand::FocusEnd, RIGHT),
+            (FLOATING, IpcCommand::FocusNext, RIGHT),
+            (FLOATING, IpcCommand::FocusPrev, LOWER_LEFT),
+            (RIGHT, IpcCommand::FocusNext, LOWER_LEFT),
+            (LOWER_LEFT, IpcCommand::FocusPrev, RIGHT),
+        ] {
+            assert_eq!(
+                floating_focus_after(&mut state, from, cmd.clone()),
+                Some(expected),
+                "{cmd:?} from {from}"
+            );
+        }
+    }
+
+    #[test]
+    fn floating_focus_up_down_wraps_workspace_without_a_candidate() {
+        for (from, cmd, target) in [
+            (RIGHT, IpcCommand::FocusUp, 8),
+            (LOWER_LEFT, IpcCommand::FocusDown, 1),
+        ] {
+            let mut state = three_floating_state();
+            state.config.behavior.workspace_edge_wrap = true;
+            state.previous_focused_hwnd = Some(from);
+            assert_eq!(state.handle_command(cmd.clone()), IpcResponse::Ok);
+            assert_eq!(state.active_workspace_idx(1), target, "{cmd:?}");
+            assert_eq!(state.floating_focus.get(&(1, 0)), Some(&from), "{cmd:?}");
+        }
+    }
+
+    #[test]
+    fn floating_focus_up_down_prefers_a_candidate_over_wrapping() {
+        let mut state = three_floating_state();
+        state.config.behavior.workspace_edge_wrap = true;
+        for (from, cmd, expected) in [
+            (FLOATING, IpcCommand::FocusUp, RIGHT),
+            (FLOATING, IpcCommand::FocusDown, LOWER_LEFT),
+        ] {
+            assert_eq!(
+                floating_focus_after(&mut state, from, cmd.clone()),
+                Some(expected),
+                "{cmd:?}"
+            );
+            assert_eq!(state.active_workspace_idx(1), 0, "{cmd:?}");
+        }
+    }
+
+    #[test]
+    fn floating_focus_up_down_stays_put_without_edge_wrap() {
+        let mut state = three_floating_state();
+        assert!(!state.config.behavior.workspace_edge_wrap);
+        for (from, cmd) in [
+            (RIGHT, IpcCommand::FocusUp),
+            (LOWER_LEFT, IpcCommand::FocusDown),
+        ] {
+            assert_eq!(
+                floating_focus_after(&mut state, from, cmd.clone()),
+                Some(from),
+                "{cmd:?}"
+            );
+            assert_eq!(state.active_workspace_idx(1), 0, "{cmd:?}");
+        }
+    }
+
+    #[test]
+    fn floating_focus_is_ignored_while_a_tiled_window_is_fullscreen() {
+        let mut state = three_floating_state();
+        assert_eq!(
+            state.handle_command(IpcCommand::ToggleSticky),
+            IpcResponse::Ok
+        );
+        assert!(state.sticky_windows.contains(&FLOATING));
+        state.focused_workspace_mut().unwrap().toggle_fullscreen();
+        assert_eq!(strip_snapshot(&state).fullscreen, Some(201));
+        for cmd in FOCUS {
+            assert_eq!(
+                floating_focus_after(&mut state, FLOATING, cmd.clone()),
+                Some(FLOATING),
+                "{cmd:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn query_focused_reports_the_floating_window() {
+        let mut state = floating_focus_state();
+        assert_eq!(
+            state.handle_command(IpcCommand::QueryFocused),
+            IpcResponse::FocusedWindow {
+                window_id: Some(FLOATING),
+                column_index: 1,
+                window_index: 1,
+                is_floating: true,
+            }
+        );
+
+        state.previous_focused_hwnd = Some(201);
+        assert_eq!(
+            state.handle_command(IpcCommand::QueryFocused),
+            IpcResponse::FocusedWindow {
+                window_id: Some(201),
+                column_index: 1,
+                window_index: 1,
+                is_floating: false,
+            }
+        );
     }
 }
 

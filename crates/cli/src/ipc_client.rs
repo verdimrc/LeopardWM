@@ -1,23 +1,21 @@
-//! Named-pipe IPC client: connect/retry, send/receive, and error classification.
-
 use anyhow::{Context, Result};
 use leopardwm_ipc::{pipe_name_candidates, IpcCommand, IpcResponse, MAX_IPC_MESSAGE_SIZE};
+use std::os::windows::io::AsRawHandle;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::windows::named_pipe::ClientOptions;
+use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient};
 use tokio::time::{sleep, timeout};
+use windows::Win32::Foundation::HANDLE;
+use windows::Win32::System::Pipes::GetNamedPipeServerProcessId;
+use windows::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow;
 
-/// Timeout budget for establishing an IPC connection to the daemon.
 pub(crate) const IPC_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Extended connect timeout budget for recovery commands that can race shutdown/startup.
 pub(crate) const IPC_RECOVERY_CONNECT_TIMEOUT: Duration = Duration::from_secs(12);
-/// Default timeout budget for daemon responses after request send.
 pub(crate) const IPC_DEFAULT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Extended timeout for recovery commands that can race shutdown.
 pub(crate) const IPC_RECOVERY_RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
-/// How long to wait for daemon process/pipe teardown after stop-style commands.
 pub(crate) const SHUTDOWN_CONFIRM_TIMEOUT: Duration = Duration::from_secs(15);
-/// Poll cadence for daemon shutdown confirmation.
 pub(crate) const SHUTDOWN_CONFIRM_POLL_INTERVAL: Duration = Duration::from_millis(150);
 /// Fast-fail threshold for pure "pipe not found" states on command sends.
 pub(crate) const IPC_NOT_FOUND_FAST_FAIL_AFTER: Duration = Duration::from_millis(800);
@@ -39,6 +37,45 @@ pub(crate) fn command_response_timeout(cmd: &IpcCommand) -> Duration {
     match cmd {
         IpcCommand::Stop | IpcCommand::PanicRevert => IPC_RECOVERY_RESPONSE_TIMEOUT,
         _ => IPC_DEFAULT_RESPONSE_TIMEOUT,
+    }
+}
+
+pub(crate) fn command_may_move_focus(cmd: &IpcCommand) -> bool {
+    matches!(
+        cmd,
+        IpcCommand::SwitchWorkspace { .. }
+            | IpcCommand::SwitchWorkspaceOnMonitor { .. }
+            | IpcCommand::WorkspaceNext
+            | IpcCommand::WorkspacePrev
+            | IpcCommand::FocusLeft
+            | IpcCommand::FocusRight
+            | IpcCommand::FocusUp
+            | IpcCommand::FocusDown
+            | IpcCommand::FocusStart
+            | IpcCommand::FocusEnd
+            | IpcCommand::FocusMonitorLeft
+            | IpcCommand::FocusMonitorRight
+            | IpcCommand::FocusMonitorUp
+            | IpcCommand::FocusMonitorDown
+    )
+}
+
+pub(crate) fn named_pipe_server_pid(client: &NamedPipeClient) -> Result<u32, String> {
+    let mut pid = 0u32;
+    unsafe {
+        GetNamedPipeServerProcessId(HANDLE(client.as_raw_handle()), &mut pid)
+            .map_err(|e| format!("GetNamedPipeServerProcessId failed: {e}"))?;
+    }
+    if pid == 0 {
+        return Err("GetNamedPipeServerProcessId returned 0".into());
+    }
+    Ok(pid)
+}
+
+fn allow_daemon_foreground(client: &NamedPipeClient) {
+    if let Ok(pid) = named_pipe_server_pid(client) {
+        // Windows requires the foreground CLI to grant the daemon permission to take focus.
+        let _ = unsafe { AllowSetForegroundWindow(pid) };
     }
 }
 
@@ -253,14 +290,12 @@ where
     parse_ipc_response_frame(&frame, max_bytes)
 }
 
-/// Send a command to the daemon and return the response (with timeout).
 pub(crate) async fn send_command(cmd: IpcCommand) -> Result<IpcResponse> {
     let connect_timeout = command_connect_timeout(&cmd);
     let response_timeout = command_response_timeout(&cmd);
     send_command_with_timeouts(cmd, connect_timeout, response_timeout).await
 }
 
-/// Send command with explicit connect/response timeout budgets.
 async fn send_command_with_timeouts(
     cmd: IpcCommand,
     connect_timeout: Duration,
@@ -269,13 +304,15 @@ async fn send_command_with_timeouts(
     send_command_inner(cmd, connect_timeout, response_timeout).await
 }
 
-/// Inner implementation with separate connect/response timeout control.
 async fn send_command_inner(
     cmd: IpcCommand,
     connect_timeout: Duration,
     response_timeout: Duration,
 ) -> Result<IpcResponse> {
     let client = open_pipe_with_retry(connect_timeout, Some(IPC_NOT_FOUND_FAST_FAIL_AFTER)).await?;
+    if command_may_move_focus(&cmd) {
+        allow_daemon_foreground(&client);
+    }
 
     let (reader, mut writer) = tokio::io::split(client);
 

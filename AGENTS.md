@@ -49,6 +49,22 @@ Run commands from the repository root.
 Read `agent_docs/architecture.md` for crate relationships, the daemon module map, and data flow.
 </important>
 
+<important if="adding a timeout or bounded wait to a step of shutdown, quit, or emergency recovery">
+A step that can now give up early changes what every later step sees. Check each later step that assumes the earlier one finished, and add a regression with a slow but responsive owner that finishes just after the wait, alongside the hung one.
+</important>
+
+<important if="writing a test that drives a Win32 failure path with an invalid window or handle">
+Use a handle that can never be valid, such as window id 0. Windows can hand a destroyed window's handle to another window, so a test that probes with one can change a window it doesn't own.
+</important>
+
+<important if="writing a test that records queued-owner or async-position entries, or runs emergency recovery">
+Hold `placement::tests::OWNER_SWEEP.read()` for the whole test. Other tests sweep those process-global maps in parallel and can clear your entry before you assert on it.
+</important>
+
+<important if="writing a test that calls desktop-wide recovery, such as cascade_windows or restore_all_windows_moved_offscreen">
+Enter `FixtureDesktop::enter()` (`crates/daemon/src/display_change_regression.rs`) before spawning fixture windows, and keep them on that desktop. Otherwise the call also moves the user's real windows, including those a running daemon has parked.
+</important>
+
 <important if="creating a release, tagging, or updating CHANGELOG.md">
 Read `agent_docs/release.md` for the release checklist and changelog format.
 </important>

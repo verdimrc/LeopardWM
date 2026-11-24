@@ -1,6 +1,29 @@
+use std::cmp::Reverse;
+
 use crate::*;
 
 use crate::workspace::Workspace;
+
+/// Where focus moves among a workspace's floating windows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FloatingFocus {
+    /// The nearest window whose center lies to the left.
+    Left,
+    /// The nearest window whose center lies to the right.
+    Right,
+    /// The nearest window whose center lies above.
+    Up,
+    /// The nearest window whose center lies below.
+    Down,
+    /// The window whose left edge is furthest left.
+    Leftmost,
+    /// The window whose left edge is furthest right.
+    Rightmost,
+    /// The next window by left edge, then top edge, wrapping at the end.
+    Next,
+    /// The previous window by left edge, then top edge, wrapping at the start.
+    Prev,
+}
 
 impl Workspace {
     /// Insert a new window as a new column to the right of the focused column.
@@ -47,10 +70,7 @@ impl Workspace {
         Ok(())
     }
 
-    /// Insert a window as a new single-window column at `index` (clamped to
-    /// the column count), then focus it. Used to restore a window to the
-    /// column it occupied before being moved away (e.g. releasing a window
-    /// from the scratchpad back to its original position).
+    /// Insert a single-window column at `index` (clamped to the column count), then focus it.
     ///
     /// # Errors
     ///
@@ -74,10 +94,7 @@ impl Workspace {
         Ok(())
     }
 
-    /// Append a window as a new single-window column at the END of the strip
-    /// without changing the current focus. Used to re-home a tiled sticky
-    /// window onto a workspace on switch: it lands at the rightmost position
-    /// but must not steal focus from whatever the user is actually on.
+    /// Append a single-window column without changing focus unless the workspace is empty.
     ///
     /// # Errors
     ///
@@ -91,9 +108,7 @@ impl Workspace {
         let saved_win = self.focused_window_in_column;
         let was_empty = self.columns.is_empty();
         self.insert_window_at_column(window_id, width, self.columns.len())?;
-        // Appending at the end never shifts existing column indices, so the
-        // saved focus is still valid. If the workspace was empty, leave focus
-        // on the new (only) column.
+        // Appending preserves existing focus indices; an empty workspace keeps the new focus.
         if !was_empty {
             self.focused_column = saved_col;
             self.focused_window_in_column = saved_win;
@@ -126,11 +141,7 @@ impl Workspace {
         Ok(())
     }
 
-    /// Insert a window without changing the current focus.
-    ///
-    /// Same as `insert_window`, but preserves `focused_column` and
-    /// `focused_window_in_column` so that the user's keyboard position
-    /// is not stolen by the new window. Used when `focus_new_windows=false`.
+    /// Insert after the focused column, preserving focus unless the workspace is empty.
     ///
     /// # Errors
     ///
@@ -182,10 +193,8 @@ impl Workspace {
             ));
         }
 
-        // Schedule min-size constraint clear for existing windows — the column
-        // composition is changing so constraints learned under the old window
-        // count are invalid. Deferred to apply-time so a timed-out / paused
-        // layout can't strand the column with cleared constraints.
+        // Composition changes invalidate learned constraints; defer clearing so paused or timed-out
+        // layouts retain them.
         for &wid in self.columns[column_index].windows() {
             self.pending_min_size_clears.insert(wid);
         }
@@ -213,10 +222,8 @@ impl Workspace {
             ));
         }
 
-        // Schedule min-size constraint clear for existing windows — the column
-        // composition is changing so constraints learned under the old window
-        // count are invalid. Deferred to apply-time so a timed-out / paused
-        // layout can't strand the column with cleared constraints.
+        // Composition changes invalidate learned constraints; defer clearing so paused or timed-out
+        // layouts retain them.
         for &wid in self.columns[column_index].windows() {
             self.pending_min_size_clears.insert(wid);
         }
@@ -239,9 +246,7 @@ impl Workspace {
     pub fn remove_window(&mut self, window_id: WindowId) -> Result<(), LayoutError> {
         for (col_idx, column) in self.columns.iter_mut().enumerate() {
             if let Some(removed_idx) = column.remove_window(window_id) {
-                // Also clear from minimized, min-width, and min-height sets,
-                // and drop any deferred clear scheduled for this window so
-                // the pending set can't retain references to removed windows.
+                // Removed windows must not remain in the deferred-clear set.
                 self.minimized_windows.remove(&window_id);
                 self.window_min_widths.remove(&window_id);
                 self.window_min_heights.remove(&window_id);
@@ -257,22 +262,17 @@ impl Workspace {
                     self.maximized_column = None;
                 }
 
-                // Schedule min-size constraint clear for remaining siblings —
-                // the column composition changed so constraints learned under
-                // the old window count are invalid. Deferred to apply-time so
-                // a timed-out / paused layout can't strand the column with
-                // cleared constraints.
+                // Composition changes invalidate learned constraints; defer clearing so paused or
+                // timed-out layouts retain them.
                 if !column.is_empty() {
                     for &sibling in column.windows() {
                         self.pending_min_size_clears.insert(sibling);
                     }
                 }
 
-                // If column is now empty, remove it
                 if column.is_empty() {
                     self.columns.remove(col_idx);
                     if self.columns.is_empty() {
-                        // Workspace is now empty - reset all state
                         self.focused_column = 0;
                         self.focused_window_in_column = 0;
                         self.scroll_offset = 0.0;
@@ -282,24 +282,20 @@ impl Workspace {
                         self.focused_column -= 1;
                     }
                 } else {
-                    // Adjust focused window in column if this is the focused column
                     if col_idx == self.focused_column {
                         let col_len = self.columns[self.focused_column].len();
                         match removed_idx.cmp(&self.focused_window_in_column) {
                             std::cmp::Ordering::Less => {
-                                // Removed window was before focused - decrement to stay on same window
                                 self.focused_window_in_column -= 1;
                             }
                             std::cmp::Ordering::Equal => {
-                                // Removed the focused window - move to next (or previous if at end)
                                 if self.focused_window_in_column >= col_len {
                                     self.focused_window_in_column = col_len.saturating_sub(1);
                                 }
-                                // If focus index is still valid, it now points to the "next" window
-                                // (which slid into this position), which is the expected behavior
+                                // The next window slides into the removed window's index.
                             }
                             std::cmp::Ordering::Greater => {
-                                // No adjustment needed
+                                // Later removals preserve the focused index.
                             }
                         }
                     }
@@ -332,13 +328,11 @@ impl Workspace {
         while self.focused_column > 0 {
             self.focused_column -= 1;
             self.land_focus_in_current_column();
-            // Skip columns where every window is minimized
             if self.has_visible_window_in_column(self.focused_column) {
                 self.adjust_focus_to_visible_in_column();
                 break;
             }
         }
-        // If we didn't find a visible column, stay at original
         if !self.has_visible_window_in_column(self.focused_column) {
             self.focused_column = start;
             self.land_focus_in_current_column();
@@ -366,13 +360,11 @@ impl Workspace {
         while self.focused_column + 1 < self.columns.len() {
             self.focused_column += 1;
             self.land_focus_in_current_column();
-            // Skip columns where every window is minimized
             if self.has_visible_window_in_column(self.focused_column) {
                 self.adjust_focus_to_visible_in_column();
                 break;
             }
         }
-        // If we didn't find a visible column, stay at original
         if !self.has_visible_window_in_column(self.focused_column) {
             self.focused_column = start;
             self.land_focus_in_current_column();
@@ -402,8 +394,6 @@ impl Workspace {
         self.focus_to_strip_end(true);
     }
 
-    /// Jump focus to the first or last column with a visible window, scanning
-    /// inward past all-minimized columns. Stays put if none qualify.
     fn focus_to_strip_end(&mut self, last: bool) {
         if self.columns.is_empty() {
             return;
@@ -443,7 +433,6 @@ impl Workspace {
             return;
         };
         if column.is_tabbed() && column.len() >= 2 {
-            // Cycle to the previous tab, wrapping. Skip minimized tabs.
             let n = column.len();
             let cur = self.focused_window_in_column;
             for offset in 1..=n {
@@ -496,12 +485,9 @@ impl Workspace {
         }
     }
 
-    /// Move focus to the next window in linear order across all columns.
-    ///
-    /// Traverses columns left-to-right, windows top-to-bottom. When at the
-    /// last window of a column, wraps to the first window of the next column.
-    /// When at the last window of the last column, wraps to the first window
-    /// of the first column.
+    /// Focus the next non-minimized window, wrapping across columns.
+    /// Entering a tabbed column prefers its active tab; other columns start at the first visible
+    /// window.
     pub fn focus_next(&mut self) {
         if self.columns.is_empty() {
             return;
@@ -509,7 +495,6 @@ impl Workspace {
         let start_col = self.focused_column;
         let start_win = self.focused_window_in_column;
 
-        // Try moving down in the current column first
         if let Some(column) = self.columns.get(start_col) {
             let mut target = start_win;
             while target + 1 < column.len() {
@@ -542,12 +527,9 @@ impl Workspace {
         }
     }
 
-    /// Move focus to the previous window in linear order across all columns.
-    ///
-    /// Traverses columns right-to-left, windows bottom-to-top. When at the
-    /// first window of a column, wraps to the last window of the previous
-    /// column. When at the first window of the first column, wraps to the
-    /// last window of the last column.
+    /// Focus the previous non-minimized window, wrapping across columns.
+    /// Entering a tabbed column prefers its active tab; otherwise it lands on the last visible
+    /// window.
     pub fn focus_prev(&mut self) {
         if self.columns.is_empty() {
             return;
@@ -555,7 +537,6 @@ impl Workspace {
         let start_col = self.focused_column;
         let start_win = self.focused_window_in_column;
 
-        // Try moving up in the current column first
         if let Some(column) = self.columns.get(start_col) {
             let mut target = start_win;
             while target > 0 {
@@ -574,7 +555,6 @@ impl Workspace {
         for offset in 1..=n {
             let col_idx = (start_col + n - offset) % n;
             if let Some(column) = self.columns.get(col_idx) {
-                // Tabbed: jump straight to active tab if visible.
                 if let Some(active_idx) = column.active_tab_idx() {
                     if active_idx < column.len()
                         && !self.minimized_windows.contains(&column.windows[active_idx])
@@ -584,7 +564,6 @@ impl Workspace {
                         return;
                     }
                 }
-                // Vertical (or minimized active tab): find the last visible.
                 for i in (0..column.len()).rev() {
                     if !self.minimized_windows.contains(&column.windows[i]) {
                         self.focused_column = col_idx;
@@ -597,11 +576,8 @@ impl Workspace {
         }
     }
 
-    /// Land `focused_window_in_column` in the current column appropriately:
-    /// for Vertical, clamp to length; for Tabbed, jump to `active_idx`.
-    /// Used by `focus_left`/`focus_right` so entering a Tabbed column shows
-    /// the tab the user last had active there, not whatever index happened
-    /// to be carried over from the source column.
+    /// Enter tabbed columns on their remembered active tab rather than carrying over the source
+    /// index.
     fn land_focus_in_current_column(&mut self) {
         let Some(col) = self.columns.get(self.focused_column) else {
             return;
@@ -619,10 +595,7 @@ impl Workspace {
         }
     }
 
-    /// If the focused column is Tabbed, force its `active_idx` to match
-    /// `focused_window_in_column`. Called at the end of any focus mutation
-    /// to maintain the focused-column invariant: in a focused Tabbed column,
-    /// `active_idx == focused_window_in_column`.
+    /// Maintain the focused tabbed-column invariant: `active_idx == focused_window_in_column`.
     pub(crate) fn sync_active_tab_to_focus(&mut self) {
         let idx = self.focused_window_in_column;
         if let Some(col) = self.columns.get_mut(self.focused_column) {
@@ -630,14 +603,10 @@ impl Workspace {
         }
     }
 
-    /// Toggle the focused column between Vertical and Tabbed display modes.
-    ///
-    /// On entry to Tabbed, `active_idx` is seeded with `focused_window_in_column`
-    /// so the currently-focused window remains active. On exit to Vertical,
-    /// no focus change occurs (focus already points to the active tab).
-    ///
-    /// No-op when there is no focused column or when the column has fewer
-    /// than 2 windows (1-tab tabbed is degenerate).
+    /// Toggle the focused column between Vertical and Tabbed modes without changing the focused
+    /// window.
+    /// Entering Tabbed activates the focused window and requires at least two windows.
+    /// No-op when there is no focused column.
     pub fn toggle_focused_column_tabbed_mode(&mut self) {
         let cur_focus = self.focused_window_in_column;
         let Some(col) = self.columns.get_mut(self.focused_column) else {
@@ -694,7 +663,6 @@ impl Workspace {
         Ok(())
     }
 
-    /// Clamp focus indices to valid column/window bounds.
     pub(crate) fn clamp_focus_indices(&mut self) {
         if self.columns.is_empty() {
             self.focused_column = 0;
@@ -717,7 +685,6 @@ impl Workspace {
         }
     }
 
-    /// Check if a column has at least one non-minimized window.
     fn has_visible_window_in_column(&self, col_idx: usize) -> bool {
         self.columns.get(col_idx).is_some_and(|col| {
             col.windows
@@ -726,38 +693,30 @@ impl Workspace {
         })
     }
 
-    /// If the current `focused_window_in_column` points to a minimized window,
-    /// shift it to the nearest non-minimized window in the same column.
-    /// Searches downward first, then upward.
+    /// Replace minimized focus by searching downward first, then upward within the column.
     fn adjust_focus_to_visible_in_column(&mut self) {
         let col = match self.columns.get(self.focused_column) {
             Some(c) => c,
             None => return,
         };
         let cur = self.focused_window_in_column;
-        // Already pointing at a visible window — nothing to do
         if cur < col.len() && !self.minimized_windows.contains(&col.windows[cur]) {
             return;
         }
-        // Search downward from current index
         for i in cur..col.len() {
             if !self.minimized_windows.contains(&col.windows[i]) {
                 self.focused_window_in_column = i;
                 return;
             }
         }
-        // Search upward from current index
         for i in (0..cur).rev() {
             if !self.minimized_windows.contains(&col.windows[i]) {
                 self.focused_window_in_column = i;
                 return;
             }
         }
-        // All minimized — leave index as is (has_visible_window_in_column
-        // should have prevented us from landing here).
     }
 
-    /// Get the currently focused window ID.
     pub fn focused_window(&self) -> Option<WindowId> {
         self.columns
             .get(self.focused_column)
@@ -765,21 +724,19 @@ impl Workspace {
             .copied()
     }
 
-    /// Get the focused window ID, but only if it is not minimized.
-    /// Falls back to the nearest non-minimized window in the focused column.
-    /// Returns `None` if the workspace is empty or every window is minimized.
+    /// Return a non-minimized window from the focused column, checking the focused index, then
+    /// downward, then upward.
+    /// Returns `None` if that column is absent or has no non-minimized windows.
     pub fn focused_visible_window(&self) -> Option<WindowId> {
         let col = self.columns.get(self.focused_column)?;
         let cur = self.focused_window_in_column;
 
-        // Check the exact focused index first
         if let Some(&wid) = col.windows.get(cur) {
             if !self.minimized_windows.contains(&wid) {
                 return Some(wid);
             }
         }
 
-        // Search downward then upward for a visible window
         for i in cur..col.len() {
             if !self.minimized_windows.contains(&col.windows[i]) {
                 return Some(col.windows[i]);
@@ -793,12 +750,10 @@ impl Workspace {
         None
     }
 
-    /// Get the index of the currently focused column.
     pub fn focused_column_index(&self) -> usize {
         self.focused_column
     }
 
-    /// Get the index of the focused window within the focused column.
     pub fn focused_window_index_in_column(&self) -> usize {
         self.focused_window_in_column
     }
@@ -873,5 +828,62 @@ impl Workspace {
             }
         }
         Err(LayoutError::WindowNotFound(window_id))
+    }
+
+    /// The floating window that `from` should hand focus to, or None to stay put.
+    ///
+    /// Candidates are this workspace's floating windows that are not minimized; `from` must be
+    /// one of them. Directions compare window centers on that axis only and pick the nearest
+    /// window strictly in that direction. Ties go to the window earlier in the floating list.
+    pub fn floating_focus_target(&self, from: WindowId, to: FloatingFocus) -> Option<WindowId> {
+        let candidates: Vec<&FloatingWindow> = self
+            .floating_windows
+            .iter()
+            .filter(|f| !self.minimized_windows.contains(&f.id))
+            .collect();
+        let current = candidates.iter().find(|f| f.id == from)?.rect;
+        // Doubled centers keep odd sizes exact.
+        let center_x = |r: &Rect| 2 * i64::from(r.x) + i64::from(r.width);
+        let center_y = |r: &Rect| 2 * i64::from(r.y) + i64::from(r.height);
+        let distance = |r: &Rect| match to {
+            FloatingFocus::Left => center_x(&current) - center_x(r),
+            FloatingFocus::Right => center_x(r) - center_x(&current),
+            FloatingFocus::Up => center_y(&current) - center_y(r),
+            FloatingFocus::Down => center_y(r) - center_y(&current),
+            _ => 0,
+        };
+
+        let target = match to {
+            FloatingFocus::Left
+            | FloatingFocus::Right
+            | FloatingFocus::Up
+            | FloatingFocus::Down => candidates
+                .iter()
+                .filter_map(|f| {
+                    let d = distance(&f.rect);
+                    (d > 0).then_some((d, f.id))
+                })
+                .min_by_key(|&(d, _)| d)
+                .map(|(_, id)| id),
+            FloatingFocus::Leftmost => candidates.iter().min_by_key(|f| f.rect.x).map(|f| f.id),
+            FloatingFocus::Rightmost => candidates
+                .iter()
+                .min_by_key(|f| Reverse(f.rect.x))
+                .map(|f| f.id),
+            FloatingFocus::Next | FloatingFocus::Prev => {
+                let mut order = candidates;
+                // Stable sort keeps list order among windows sharing a corner.
+                order.sort_by_key(|f| (f.rect.x, f.rect.y));
+                let len = order.len();
+                let pos = order.iter().position(|f| f.id == from)?;
+                let step = if to == FloatingFocus::Next {
+                    1
+                } else {
+                    len - 1
+                };
+                Some(order[(pos + step) % len].id)
+            }
+        };
+        target.filter(|&id| id != from)
     }
 }

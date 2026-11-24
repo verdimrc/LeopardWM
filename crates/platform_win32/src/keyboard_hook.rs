@@ -1,13 +1,9 @@
 //! Global hotkey matching via a low-level keyboard hook.
 //!
-//! A `WH_KEYBOARD_LL` hook is LeopardWM's sole hotkey matcher: it inspects every
-//! key-down, and when the modifiers and key match a configured bind it swallows
-//! the keystroke and re-emits it as a [`HotkeyEvent`] so the daemon runs the
-//! bound command. Matching here (rather than `RegisterHotKey`) lets us tell
-//! left/right modifiers apart, so AltGr (Left Ctrl + Right Alt on international
-//! layouts) types normally instead of firing Ctrl+Alt binds.
-//!
-//! Mirrors the dedicated-thread + message-pump pattern in `gestures.rs`.
+//! A `WH_KEYBOARD_LL` hook inspects key-downs, swallows configured chords, and
+//! emits hotkey or Settings-recorder events. Matching here rather than with
+//! `RegisterHotKey` distinguishes left/right modifiers, so AltGr (Left Ctrl +
+//! Right Alt on international layouts) does not fire Ctrl+Alt binds.
 
 use crate::{
     fn_mod_bit, recover_poisoned_mutex, HotkeyEvent, HotkeyId, Modifiers, Win32Error,
@@ -25,8 +21,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, GetMessageW, PeekMessageW, PostThreadMessageW,
-    SetWindowsHookExW, UnhookWindowsHookEx, KBDLLHOOKSTRUCT, MSG, PM_NOREMOVE, WH_KEYBOARD_LL,
-    WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    SetWindowsHookExW, UnhookWindowsHookEx, KBDLLHOOKSTRUCT, LLKHF_INJECTED, MSG, PM_NOREMOVE,
+    WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
 
 /// A hotkey bind the hook matches: its modifiers, virtual-key code, and the
@@ -48,15 +44,51 @@ pub enum KeyboardHookEvent {
     Recorded { modifiers: Modifiers, vk: u32 },
 }
 
-/// Sender the hook proc uses to deliver matched binds to the daemon.
 static HOOK_SENDER: std::sync::Mutex<Option<mpsc::Sender<KeyboardHookEvent>>> =
     std::sync::Mutex::new(None);
-/// The set of binds the hook should match.
 static HOOK_BINDS: std::sync::Mutex<Vec<HotkeyBind>> = std::sync::Mutex::new(Vec::new());
-/// Virtual-keys of currently-held matched main keys. Lets us fire once per
-/// physical press and swallow auto-repeat, tracking each key independently so a
-/// second matched key held at the same time can't reset the first.
-static HOOK_HELD: std::sync::Mutex<Vec<i32>> = std::sync::Mutex::new(Vec::new());
+#[derive(Default)]
+struct HeldKeys {
+    physical: Vec<i32>,
+    injected: Vec<i32>,
+}
+
+impl HeldKeys {
+    fn source(&mut self, injected: bool) -> &mut Vec<i32> {
+        if injected {
+            &mut self.injected
+        } else {
+            &mut self.physical
+        }
+    }
+
+    fn press(&mut self, vk: i32, injected: bool) -> bool {
+        let held = self.source(injected);
+        if held.contains(&vk) {
+            false
+        } else {
+            held.push(vk);
+            true
+        }
+    }
+
+    fn release(&mut self, vk: i32, injected: bool) {
+        self.source(injected).retain(|&key| key != vk);
+    }
+
+    fn clear(&mut self) {
+        self.physical.clear();
+        self.injected.clear();
+    }
+}
+
+/// Track matched and unmatched keys per source. Hardware repeat is never
+/// injected, so a remapper's injected press is distinct from the physical one;
+/// repeats from the same source remain guarded even if modifiers change.
+static HOOK_HELD: std::sync::Mutex<HeldKeys> = std::sync::Mutex::new(HeldKeys {
+    physical: Vec::new(),
+    injected: Vec::new(),
+});
 // A hotkey consumed over the overview owns its repeats until key-up, even
 // if modifiers change and the next repeat would otherwise reach WM_KEYDOWN.
 static HOOK_OVERVIEW_HELD: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
@@ -73,13 +105,10 @@ static HOOK_SYMMETRIC_MODIFIERS: std::sync::Mutex<bool> = std::sync::Mutex::new(
 /// F13–F24 keys held while Settings recording is active, including keys that
 /// are not configured as normal hotkey modifiers.
 static HOOK_RECORDING_FN_HELD: std::sync::Mutex<u16> = std::sync::Mutex::new(0);
-/// The singleton hook's Settings capture mode.
 static HOOK_RECORDING: AtomicBool = AtomicBool::new(false);
 /// Recorded key whose auto-repeat remains swallowed until its key-up arrives.
 static HOOK_RECORDED_PENDING: std::sync::Mutex<Option<u32>> = std::sync::Mutex::new(None);
 
-// Modifier virtual-key codes (both the generic and left/right variants the
-// low-level hook reports).
 const VK_SHIFT: i32 = 0x10;
 const VK_CONTROL: i32 = 0x11;
 const VK_MENU: i32 = 0x12; // Alt
@@ -157,8 +186,7 @@ enum Action {
     },
 }
 
-// While recording, bare Esc/Tab/Backspace/Delete pass through; representable chords
-// are captured, and unrepresentable chords are swallowed while capture remains armed.
+// Bare Esc/Tab/Backspace/Delete must remain usable as Settings recording controls.
 fn is_recording_control(vk: u32, modifiers: Modifiers) -> bool {
     modifiers == Modifiers::default() && matches!(vk, VK_ESCAPE | VK_TAB | VK_BACK | VK_DELETE)
 }
@@ -620,7 +648,7 @@ unsafe fn keyboard_ll_hook_inner(ncode: i32, wparam: WPARAM, lparam: LPARAM) -> 
             *recording_held &= !bit;
         }
         let mut held = HOOK_HELD.lock().unwrap_or_else(recover_poisoned_mutex);
-        held.retain(|&key| key != vk as i32);
+        held.release(vk as i32, kb.flags.contains(LLKHF_INJECTED));
         drop(held);
         return apply_action(action, ncode, wparam, lparam);
     }
@@ -629,11 +657,33 @@ unsafe fn keyboard_ll_hook_inner(ncode: i32, wparam: WPARAM, lparam: LPARAM) -> 
         return CallNextHookEx(None, ncode, wparam, lparam);
     }
 
-    // Track the physical down-state of every non-modifier key so a bind fires
-    // once per physical press and never on auto-repeat. Recorded for matched and
-    // unmatched keys alike: otherwise a key held bare (e.g. typing it), then
-    // joined by modifiers, would look freshly pressed on its next auto-repeat
-    // and fire the now-matching bind. The key-up handler above clears it.
+    // With symmetric_modifiers, Right Alt counts as Alt; it stays AltGr only
+    // when Left Ctrl is also held (the AltGr chord itself).
+    let symmetric = *HOOK_SYMMETRIC_MODIFIERS
+        .lock()
+        .unwrap_or_else(recover_poisoned_mutex);
+    let right_alt = GetAsyncKeyState(VK_RMENU) < 0;
+    let left_ctrl = GetAsyncKeyState(VK_LCONTROL) < 0;
+    let held = Modifiers {
+        ctrl: left_ctrl || GetAsyncKeyState(VK_RCONTROL) < 0,
+        alt: GetAsyncKeyState(VK_LMENU) < 0 || (symmetric && right_alt),
+        shift: GetAsyncKeyState(VK_LSHIFT) < 0 || GetAsyncKeyState(VK_RSHIFT) < 0,
+        win: GetAsyncKeyState(VK_LWIN) < 0 || GetAsyncKeyState(VK_RWIN) < 0,
+        fn_mods: 0,
+    };
+    let alt_gr = right_alt && (left_ctrl || !symmetric);
+    let action = decide_key_down(kb, recording, held, alt_gr);
+    apply_action(action, ncode, wparam, lparam)
+}
+
+fn decide_key_down(
+    kb: &KBDLLHOOKSTRUCT,
+    recording: bool,
+    mut held: Modifiers,
+    alt_gr: bool,
+) -> Action {
+    let vk = kb.vkCode;
+    let injected = kb.flags.contains(LLKHF_INJECTED);
     let fn_mask = *HOOK_FN_MOD_MASK
         .lock()
         .unwrap_or_else(recover_poisoned_mutex);
@@ -643,24 +693,16 @@ unsafe fn keyboard_ll_hook_inner(ncode: i32, wparam: WPARAM, lparam: LPARAM) -> 
     {
         false
     } else {
-        let mut held = HOOK_HELD.lock().unwrap_or_else(recover_poisoned_mutex);
-        if held.contains(&(vk as i32)) {
-            false
-        } else {
-            held.push(vk as i32);
-            true
-        }
+        HOOK_HELD
+            .lock()
+            .unwrap_or_else(recover_poisoned_mutex)
+            .press(vk as i32, injected)
     };
 
-    if is_new_press {
+    if is_new_press && kb.dwExtraInfo != crate::user_press::SELF_INJECTED_INPUT_TAG {
         crate::user_press::record_user_press();
     }
 
-    let symmetric = *HOOK_SYMMETRIC_MODIFIERS
-        .lock()
-        .unwrap_or_else(recover_poisoned_mutex);
-    let right_alt = GetAsyncKeyState(VK_RMENU) < 0;
-    let left_ctrl = GetAsyncKeyState(VK_LCONTROL) < 0;
     if recording && fn_mod_bit(vk).is_some() {
         let bit = fn_mod_bit(vk).unwrap();
         let mut recording_held = HOOK_RECORDING_FN_HELD
@@ -682,19 +724,13 @@ unsafe fn keyboard_ll_hook_inner(ncode: i32, wparam: WPARAM, lparam: LPARAM) -> 
     let recording_fn_held = *HOOK_RECORDING_FN_HELD
         .lock()
         .unwrap_or_else(recover_poisoned_mutex);
-    let held = Modifiers {
-        ctrl: left_ctrl || GetAsyncKeyState(VK_RCONTROL) < 0,
-        alt: GetAsyncKeyState(VK_LMENU) < 0 || (symmetric && right_alt),
-        shift: GetAsyncKeyState(VK_LSHIFT) < 0 || GetAsyncKeyState(VK_RSHIFT) < 0,
-        win: GetAsyncKeyState(VK_LWIN) < 0 || GetAsyncKeyState(VK_RWIN) < 0,
-        fn_mods: fn_held | recording_fn_held,
-    };
+    held.fn_mods = fn_held | recording_fn_held;
     let binds = HOOK_BINDS.lock().unwrap_or_else(recover_poisoned_mutex);
     let pending_recorded_vk = *HOOK_RECORDED_PENDING
         .lock()
         .unwrap_or_else(recover_poisoned_mutex);
     let action = decide(
-        msg,
+        KeyMsg::Down,
         vk,
         held,
         recording,
@@ -703,12 +739,18 @@ unsafe fn keyboard_ll_hook_inner(ncode: i32, wparam: WPARAM, lparam: LPARAM) -> 
         fn_held,
         recording_fn_held,
         is_new_press,
-        right_alt && (left_ctrl || !symmetric),
+        alt_gr,
         pending_recorded_vk,
     );
     drop(binds);
-
-    apply_action(action, ncode, wparam, lparam)
+    if matches!(action, Action::SwallowHotkey { emit: false, .. }) {
+        tracing::debug!(
+            vk = format_args!("{vk:#x}"),
+            source = if injected { "injected" } else { "physical" },
+            "Hotkey dropped as repeat"
+        );
+    }
+    action
 }
 
 unsafe fn apply_action(action: Action, ncode: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -812,7 +854,7 @@ unsafe fn send_menu_mask(vk: u16) {
                 wScan: 0,
                 dwFlags: flags,
                 time: 0,
-                dwExtraInfo: 0,
+                dwExtraInfo: crate::user_press::SELF_INJECTED_INPUT_TAG,
             },
         },
     };
@@ -836,18 +878,29 @@ mod tests {
         crate::user_press::set_keyboard_observer_installed(keyboard_generation, true);
         crate::user_press::set_mouse_observer_installed(mouse_generation, true);
         let mut expected = crate::user_press_count().unwrap();
-        for (message, vk, counts) in [
-            (WM_KEYUP, 0x41, false),
-            (WM_KEYDOWN, 0x41, true),
-            (WM_KEYDOWN, 0x41, false),
-            (WM_KEYUP, 0x41, false),
-            (WM_SYSKEYDOWN, 0x41, true),
-            (WM_SYSKEYUP, 0x41, false),
-            (WM_KEYDOWN, VK_LSHIFT as u32, false),
-            (WM_KEYUP, VK_LSHIFT as u32, false),
+        for (message, vk, flags, extra_info, counts) in [
+            (WM_KEYUP, 0x41, Default::default(), 0, false),
+            (WM_KEYDOWN, 0x41, Default::default(), 0, true),
+            (WM_KEYDOWN, 0x41, Default::default(), 0, false),
+            (WM_KEYUP, 0x41, Default::default(), 0, false),
+            (WM_SYSKEYDOWN, 0x41, Default::default(), 0, true),
+            (WM_SYSKEYUP, 0x41, Default::default(), 0, false),
+            (WM_KEYDOWN, VK_LSHIFT as u32, Default::default(), 0, false),
+            (WM_KEYUP, VK_LSHIFT as u32, Default::default(), 0, false),
+            (
+                WM_KEYDOWN,
+                0xE8,
+                LLKHF_INJECTED,
+                crate::user_press::SELF_INJECTED_INPUT_TAG,
+                false,
+            ),
+            (WM_KEYDOWN, 0x42, LLKHF_INJECTED, 0, true),
+            (WM_KEYDOWN, 0x43, LLKHF_INJECTED, 123, true),
         ] {
             let kb = KBDLLHOOKSTRUCT {
                 vkCode: vk,
+                flags,
+                dwExtraInfo: extra_info,
                 ..Default::default()
             };
             unsafe {
@@ -861,7 +914,7 @@ mod tests {
             assert_eq!(
                 crate::user_press_count(),
                 Some(expected),
-                "message={message}, vk={vk}"
+                "message={message}, vk={vk}, flags={flags:?}, extra_info={extra_info}"
             );
         }
         reset_held_keys().unwrap();
@@ -878,10 +931,132 @@ mod tests {
         }
     }
 
+    fn test_key(vk: u32, injected: bool) -> KBDLLHOOKSTRUCT {
+        KBDLLHOOKSTRUCT {
+            vkCode: vk,
+            flags: if injected {
+                LLKHF_INJECTED
+            } else {
+                Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    fn release_key(kb: &KBDLLHOOKSTRUCT) {
+        unsafe {
+            keyboard_ll_hook_inner(
+                0,
+                WPARAM(WM_KEYUP as usize),
+                LPARAM(kb as *const _ as isize),
+            );
+        }
+    }
+
+    #[test]
+    fn physical_hold_does_not_block_injected_chord() {
+        let _guard = HOOK_STATE_TEST_LOCK.lock().unwrap();
+        let _counter_guard = crate::user_press::PRESS_COUNT_TEST_LOCK.lock().unwrap();
+        reset_held_keys().unwrap();
+        let modifiers = Modifiers {
+            ctrl: true,
+            alt: true,
+            ..Default::default()
+        };
+        let bind = bind(modifiers, 0x48);
+        *HOOK_BINDS.lock().unwrap() = vec![bind];
+        let physical = test_key(0x48, false);
+        let injected = test_key(0x48, true);
+        assert_eq!(
+            decide_key_down(&physical, false, Modifiers::default(), false),
+            Action::Pass
+        );
+        assert_eq!(
+            decide_key_down(&injected, false, modifiers, false),
+            Action::SwallowHotkey {
+                event: HotkeyEvent { id: bind.id },
+                emit: true,
+                mask: None,
+            }
+        );
+        release_key(&physical);
+        assert!(matches!(
+            decide_key_down(&injected, false, modifiers, false),
+            Action::SwallowHotkey { emit: false, .. }
+        ));
+        release_key(&injected);
+        assert!(matches!(
+            decide_key_down(&injected, false, modifiers, false),
+            Action::SwallowHotkey { emit: true, .. }
+        ));
+        release_key(&injected);
+        assert_eq!(
+            decide_key_down(&injected, false, Modifiers::default(), false),
+            Action::Pass
+        );
+        assert!(matches!(
+            decide_key_down(&injected, false, modifiers, false),
+            Action::SwallowHotkey { emit: false, .. }
+        ));
+        HOOK_BINDS.lock().unwrap().clear();
+        reset_held_keys().unwrap();
+    }
+
+    #[test]
+    fn physical_repeat_fires_only_after_its_own_release() {
+        let _guard = HOOK_STATE_TEST_LOCK.lock().unwrap();
+        let _counter_guard = crate::user_press::PRESS_COUNT_TEST_LOCK.lock().unwrap();
+        reset_held_keys().unwrap();
+        let modifiers = Modifiers {
+            ctrl: true,
+            alt: true,
+            ..Default::default()
+        };
+        *HOOK_BINDS.lock().unwrap() = vec![bind(modifiers, 0x48)];
+        let physical = test_key(0x48, false);
+        let injected = test_key(0x48, true);
+        assert!(matches!(
+            decide_key_down(&physical, false, modifiers, false),
+            Action::SwallowHotkey { emit: true, .. }
+        ));
+        for _ in 0..2 {
+            assert!(matches!(
+                decide_key_down(&physical, false, modifiers, false),
+                Action::SwallowHotkey { emit: false, .. }
+            ));
+        }
+        release_key(&injected);
+        assert!(matches!(
+            decide_key_down(&physical, false, modifiers, false),
+            Action::SwallowHotkey { emit: false, .. }
+        ));
+        release_key(&physical);
+        assert!(matches!(
+            decide_key_down(&physical, false, modifiers, false),
+            Action::SwallowHotkey { emit: true, .. }
+        ));
+        HOOK_BINDS.lock().unwrap().clear();
+        reset_held_keys().unwrap();
+    }
+
     fn win_ctrl() -> Modifiers {
         Modifiers {
             ctrl: true,
             win: true,
+            ..Default::default()
+        }
+    }
+
+    fn win() -> Modifiers {
+        Modifiers {
+            win: true,
+            ..Default::default()
+        }
+    }
+
+    fn alt() -> Modifiers {
+        Modifiers {
+            alt: true,
             ..Default::default()
         }
     }
@@ -896,16 +1071,17 @@ mod tests {
         assert!(owned.is_empty());
 
         let _guard = HOOK_STATE_TEST_LOCK.lock().unwrap();
-        HOOK_HELD.lock().unwrap().extend([0x48, 0x49]);
+        reset_held_keys().unwrap();
+        HOOK_HELD.lock().unwrap().physical.extend([0x48, 0x49]);
         HOOK_OVERVIEW_HELD.lock().unwrap().push(0x48);
         clear_overview_press_ownership();
-        assert_eq!(*HOOK_HELD.lock().unwrap(), [0x48, 0x49]);
+        assert_eq!(HOOK_HELD.lock().unwrap().physical, [0x48, 0x49]);
         assert!(HOOK_OVERVIEW_HELD.lock().unwrap().is_empty());
 
         let modifiers = win_ctrl();
         let binds = [bind(modifiers, 0x48)];
         for expected_emit in [false, true] {
-            let is_new_press = !HOOK_HELD.lock().unwrap().contains(&0x48);
+            let is_new_press = !HOOK_HELD.lock().unwrap().physical.contains(&0x48);
             let action = decide(
                 KeyMsg::Down,
                 0x48,
@@ -952,9 +1128,9 @@ mod tests {
                 ),
                 Action::Pass
             );
-            HOOK_HELD.lock().unwrap().retain(|&key| key != 0x48);
+            HOOK_HELD.lock().unwrap().release(0x48, false);
         }
-        HOOK_HELD.lock().unwrap().clear();
+        reset_held_keys().unwrap();
     }
 
     #[test]
@@ -1021,14 +1197,17 @@ mod tests {
     #[test]
     fn hook_install_reset_clears_every_held_key_tracker() {
         let _guard = HOOK_STATE_TEST_LOCK.lock().unwrap();
-        HOOK_HELD.lock().unwrap().push(0x48);
+        reset_held_keys().unwrap();
+        HOOK_HELD.lock().unwrap().press(0x48, false);
+        HOOK_HELD.lock().unwrap().press(0x49, true);
         HOOK_OVERVIEW_HELD.lock().unwrap().push(0x48);
         *HOOK_FN_HELD.lock().unwrap() = 1;
         *HOOK_RECORDING_FN_HELD.lock().unwrap() = 2;
         *HOOK_RECORDED_PENDING.lock().unwrap() = Some(0x49);
         HOOK_RECORDING.store(true, Ordering::SeqCst);
         reset_held_keys().unwrap();
-        assert!(HOOK_HELD.lock().unwrap().is_empty());
+        assert!(HOOK_HELD.lock().unwrap().physical.is_empty());
+        assert!(HOOK_HELD.lock().unwrap().injected.is_empty());
         assert!(HOOK_OVERVIEW_HELD.lock().unwrap().is_empty());
         assert_eq!(*HOOK_FN_HELD.lock().unwrap(), 0);
         assert_eq!(*HOOK_RECORDING_FN_HELD.lock().unwrap(), 0);
@@ -1039,7 +1218,7 @@ mod tests {
     #[test]
     fn overview_hotkey_press_owns_repeats_until_release() {
         let modifiers = win_ctrl();
-        let binds = [bind(modifiers, 0x25), bind(Modifiers::alt(), 0x25)];
+        let binds = [bind(modifiers, 0x25), bind(alt(), 0x25)];
         let mut owned = Vec::new();
         let first = decide(
             KeyMsg::Down,
@@ -1058,7 +1237,7 @@ mod tests {
             retain_overview_press(KeyMsg::Down, 0x25, first, true, &mut owned),
             Action::SwallowHotkey { emit: true, .. }
         ));
-        for held in [modifiers, Modifiers::default(), Modifiers::alt()] {
+        for held in [modifiers, Modifiers::default(), alt()] {
             let repeat = decide(
                 KeyMsg::Down,
                 0x25,
@@ -1186,7 +1365,6 @@ mod tests {
         let binds = vec![bind(f13, 0x48)]; // F13+H
                                            // Exact F-modifier held -> fires.
         assert!(find_bind(&binds, f13, 0x48).is_some());
-        // No modifier held (bare H) -> no match.
         assert!(find_bind(&binds, Modifiers::default(), 0x48).is_none());
         // A superset F-modifier (F13+F14) does not fire an F13-only bind.
         let f13_f14 = Modifiers {
@@ -1329,10 +1507,7 @@ mod tests {
 
     #[test]
     fn recording_chords_mask_start_and_alt_menus() {
-        for (held, vk, mask) in [
-            (Modifiers::win(), 0x24, Some(VK_CONTROL as u16)),
-            (Modifiers::alt(), 0x4A, Some(VK_MENU_MASK)),
-        ] {
+        for (held, vk, mask) in [(win(), 0x24, Some(0x11)), (alt(), 0x4A, Some(0xE8))] {
             assert_eq!(
                 decide(KeyMsg::Down, vk, held, true, &[], 0, 0, 0, true, true, None,),
                 Action::SwallowRecorded {
@@ -1347,36 +1522,30 @@ mod tests {
     #[test]
     fn hotkeys_mask_menus_only_on_new_presses_without_ctrl() {
         for (modifiers, mask) in [
-            (Modifiers::alt(), Some(VK_MENU_MASK)),
+            (alt(), Some(0xE8)),
             (
                 Modifiers {
                     shift: true,
-                    ..Modifiers::alt()
+                    ..alt()
                 },
-                Some(VK_MENU_MASK),
+                Some(0xE8),
             ),
-            (
-                Modifiers {
-                    win: true,
-                    ..Modifiers::alt()
-                },
-                Some(VK_MENU_MASK),
-            ),
+            (Modifiers { win: true, ..alt() }, Some(0xE8)),
             (
                 Modifiers {
                     fn_mods: fn_mod_bit(0x7C).unwrap(),
-                    ..Modifiers::alt()
+                    ..alt()
                 },
-                Some(VK_MENU_MASK),
+                Some(0xE8),
             ),
             (
                 Modifiers {
                     ctrl: true,
-                    ..Modifiers::alt()
+                    ..alt()
                 },
                 None,
             ),
-            (Modifiers::win(), Some(VK_CONTROL as u16)),
+            (win(), Some(0x11)),
             (win_ctrl(), None),
             (
                 Modifiers {
@@ -1464,7 +1633,7 @@ mod tests {
 
     #[test]
     fn recorded_key_repeat_stays_swallowed_until_key_up() {
-        let held = Modifiers::win();
+        let held = win();
         assert_eq!(
             decide(
                 KeyMsg::Down,

@@ -2,6 +2,45 @@
 
 All notable changes to LeopardWM will be documented in this file.
 
+## 0.3.5
+
+### Fixes
+
+- **Commands no longer act on the tiled window behind a focused floating window.** While a floating window has focus, closing, fullscreen, resizing, scratchpad stash and `lwm query focused` now act on the floating window, and column, focus and move commands leave the tiled windows alone. Contributed by @ShawnChiu. (#162, #163)
+- **Shortcuts sent by key remappers such as kanata now work while the remapped key is still held.** LeopardWM now tracks physical and injected key presses separately. (#164)
+- **Updating no longer replaces a shortcut you assigned to a key that a default shortcut also uses.** Default shortcuts are skipped when you already use the same key combination, even if it is spelled differently in your configuration.
+- **The focus border of a floating window moved to a monitor with a different display scale now uses that monitor's scale.** Its width and rounded corners no longer keep the scale of the monitor where the window started.
+- **A dragged window no longer drops out of tiling when Windows briefly fails to report it at the drop.**
+- **A damaged or hand-edited workspace state file no longer makes startup create an excessive number of workspaces or hang.** Saved workspace indices are limited to the supported nine workspaces.
+
+## 0.3.4
+
+### Features
+
+- **LeopardWM now ships native ARM64 builds.** Each release includes `LeopardWM-x.y.z-arm64-windows.zip` and `LeopardWM-x.y.z-arm64.msi` for Windows on ARM devices. Contributed by @azumafuji. (#131, #149)
+
+### Improvements
+
+- **The overview now centers each workspace row on the screen.** Rows with only a few windows no longer sit against the left edge.
+
+### Fixes
+
+- **Moving a window to another monitor no longer leaves the monitor it left scrolled past its remaining windows.** That monitor now scrolls back so its remaining windows stay in view. (#160)
+- **Shortcuts can now use the `;`, `'`, `/`, `\` and `` ` `` keys.** The Settings shortcut recorder now records these keys too. (#145)
+- **Clicking a status-bar workspace button, such as the Yasb recipe, now stays on an empty workspace instead of flashing back.** The `lwm` command now lets LeopardWM take focus from the command's own console window, so focus cannot return to a window on the previous workspace when the console closes. This needs this version's `lwm`; a status bar running an older `lwm` still flashes back.
+- **The focus border's rounded corners now line up with the window's corners on displays scaled above 100%.** The corner radius now follows the monitor's display scale, as the border width already did. Contributed by @ShawnChiu. (#157)
+
+## 0.3.3
+
+### Fixes
+
+- **LeopardWM no longer crashes when resizing a window's height in a column with 20 or more windows.**
+- **Alt shortcuts no longer count as an extra key press when LeopardWM decides whether to undo an app's startup maximize.** The unused key LeopardWM taps to keep the menu bar inactive is now ignored; key presses sent by other programs, such as AutoHotkey or on-screen keyboards, still count.
+- **Windows that ignore queued moves are now detected even after LeopardWM has been moving them for more than ten seconds.** They now slide with the other windows instead of jumping into place when the scroll ends.
+- **An app's maximize button now returns when the app responds again after stalling during LeopardWM shutdown.** If the app stops answering after its window style is restored, LeopardWM queues the frame refresh instead of leaving it unfinished.
+- **Quitting LeopardWM now brings other windows back on screen even if one app stalls during its recovery move.** Emergency recovery waits briefly for each move instead of letting one blocked app leave the remaining windows off screen.
+- **`lwm move --help` and `lwm doctor windows --help` now describe every option.** `move` mentions moving a column to either end of the strip, and `--delay` says it also waits before `--watch` starts.
+
 ## 0.3.2
 
 ### Fixes
