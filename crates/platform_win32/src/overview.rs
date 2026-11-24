@@ -272,9 +272,6 @@ pub struct OverviewModel {
     /// `draw_shapes` fills it with sentinel alpha so `finish_alpha` can
     /// promote the GDI text pixels to opaque (same mechanism as label strips).
     pub monitor_label_rect: Rect,
-    /// Whether this monitor uses right-to-left column fill; panels and the
-    /// monitor label are right-anchored when true.
-    pub rtl: bool,
 }
 
 /// Win11 default accent #0078D4 in BGR, used when no config color parses.
@@ -303,7 +300,6 @@ impl Default for OverviewModel {
             rows: Vec::new(),
             monitor_label: String::new(),
             monitor_label_rect: Rect::new(0, 0, 0, 0),
-            rtl: false,
         }
     }
 }
@@ -4115,16 +4111,18 @@ unsafe fn draw_row_label(hdc: HDC, row: &OverviewRow, label_font: HFONT) {
     SelectObject(hdc, old_font);
 }
 
-/// Monitor name above the first workspace row, aligned with the panels.
+/// Monitor name above the first workspace row, left-aligned with that row's
+/// workspace number (the same inset as `draw_row_label`).
 unsafe fn draw_monitor_label(hdc: HDC, label: &str, model: &OverviewModel, label_font: HFONT) {
-    let align = if model.rtl { DT_RIGHT } else { DT_LEFT };
+    let rect = model.monitor_label_rect;
+    let inset = Rect::new(rect.x + 12, rect.y, (rect.width - 12).max(1), rect.height);
     let old_font = SelectObject(hdc, label_font.into());
     draw_text_in(
         hdc,
         label,
-        &model.monitor_label_rect,
+        &inset,
         TEXT_SECONDARY,
-        DT_SINGLELINE | DT_VCENTER | align | DT_NOPREFIX,
+        DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
     );
     SelectObject(hdc, old_font);
 }

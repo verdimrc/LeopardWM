@@ -397,10 +397,13 @@ impl AppState {
             .map(|g| g.panel.y - label_h - label_gap)
             .unwrap_or(0)
             .max(0);
+        // The monitor label starts at the first panel, so its text lines up
+        // with that panel's workspace number.
+        let label_x = rows.first().map_or(margin_x, |row| row.panel.x);
         let monitor_label_rect = Rect::new(
-            margin_x,
+            label_x,
             label_y,
-            (work_area.width - 2 * margin_x).max(1),
+            (work_area.width - margin_x - label_x).max(1),
             label_h,
         );
         let model = OverviewModel {
@@ -414,7 +417,6 @@ impl AppState {
             rows,
             monitor_label,
             monitor_label_rect,
-            rtl,
         };
         Some((work_area, model))
     }
@@ -1820,7 +1822,37 @@ mod tests {
             for card in &row.cards {
                 assert!(card.rect.x >= row.panel.x && card.rect.x < panel_right);
             }
+            // The monitor label starts at the first panel, above its
+            // workspace number.
+            assert_eq!(model.monitor_label_rect.x, row.panel.x, "{direction:?}");
         }
+    }
+
+    #[test]
+    fn test_monitor_label_starts_at_first_panel_on_portrait_rtl_monitor() {
+        // Portrait panels are columns centered as a group whatever the
+        // direction; the label starts at the first one.
+        let mut config = Config::default();
+        config.monitor_rules = vec![crate::config::MonitorRule {
+            display: 1,
+            direction: Some(crate::config::MonitorDirection::Rtl),
+            ..Default::default()
+        }];
+        let mut state = AppState::new_with_config(
+            config,
+            vec![MonitorInfo {
+                id: 1,
+                rect: Rect::new(0, 0, 1080, 1920),
+                work_area: Rect::new(0, 0, 1080, 1880),
+                is_primary: true,
+                device_name: "DISPLAY1".to_string(),
+                scale_factor: 1.0,
+            }],
+        );
+        add_windows(&mut state, 0, &[101]);
+
+        let (_, model) = state.build_overview_model().expect("model");
+        assert_eq!(model.monitor_label_rect.x, model.rows[0].panel.x);
     }
 
     #[test]

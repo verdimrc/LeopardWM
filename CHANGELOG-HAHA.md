@@ -95,7 +95,7 @@ Diff between `36574ea` .. HEAD
 
 - Overview improvements:
   - Shows on all monitors simultaneously with Ctrl+Alt+Win+Space (`hotkeys.toggle_overview_all`).
-  - Shows the monitor device name.
+  - Shows the monitor device name above the first workspace panel, left-aligned with its number.
   - Shows empty workspace rows on monitors with no windows.
   - Workspace panels are right-aligned when `direction` is `"rtl"` or `"ltr_right_aligned"`.
 
