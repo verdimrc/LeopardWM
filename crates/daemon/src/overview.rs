@@ -126,8 +126,31 @@ impl StripTransform {
         }
     }
 
+    /// Like `fit`, for a vertical-monitor column: content starts at the top of
+    /// `strip` and is centered across its width, so the panel can wrap the
+    /// content's height as a row wraps its width.
+    fn fit_top(content: &Rect, strip: &Rect) -> Self {
+        let content_w = f64::from(content.width.max(1));
+        let content_h = f64::from(content.height.max(1));
+        let scale = (f64::from(strip.height) / content_h).min(f64::from(strip.width) / content_w);
+        StripTransform {
+            scale,
+            min_x: content.x,
+            min_y: content.y,
+            offset_x: strip.x
+                + ((f64::from(strip.width) - content_w * scale) / 2.0).round() as i32,
+            offset_y: strip.y,
+        }
+    }
+
     fn scaled_width(&self, content: &Rect) -> i32 {
         (f64::from(content.width.max(1)) * self.scale)
+            .round()
+            .max(1.0) as i32
+    }
+
+    fn scaled_height(&self, content: &Rect) -> i32 {
+        (f64::from(content.height.max(1)) * self.scale)
             .round()
             .max(1.0) as i32
     }
@@ -339,36 +362,53 @@ impl AppState {
                 Some(name) => format!("{} {}", ws_idx + 1, name),
                 None => format!("{}", ws_idx + 1),
             };
-            // Empty workspaces (no cards) use a compact width so the label
-            // badge doesn't span the full monitor width. Vertical monitors
-            // keep the full column width (panels are tall columns).
-            let panel_w = if orient.is_vertical() {
-                geom.panel.width
+            // The panel wraps its content along the primary axis (width on
+            // horizontal monitors, height on vertical ones, where the label
+            // strip sits on top). Empty workspaces (no cards) use a compact
+            // length so the label badge doesn't span the whole monitor.
+            let label_h = geom.label_strip.height;
+            let (slot_len, extra) = if orient.is_vertical() {
+                (geom.panel.height, label_h)
             } else {
-                match content_primary {
-                    Some(cw) => (cw + 2 * BODY_INSET).min(geom.panel.width),
-                    None if cards.is_empty() => (8 * LABEL_STRIP_H).min(geom.panel.width),
-                    None => geom.panel.width,
-                }
+                (geom.panel.width, 0)
             };
-            // Center the panel in its row, or right-align it on monitors
-            // whose columns sit against the right edge, matching the strip.
+            let panel_len = match content_primary {
+                Some(len) => (len + 2 * BODY_INSET + extra).min(slot_len),
+                None if cards.is_empty() => (8 * LABEL_STRIP_H).min(slot_len),
+                None => slot_len,
+            };
+            // Center the panel in its slot, or align it with the end (right,
+            // or bottom on vertical monitors) where columns sit against that
+            // edge, matching the strip.
             let shift = if rtl {
-                geom.panel.width - panel_w
+                slot_len - panel_len
             } else {
-                (geom.panel.width - panel_w) / 2
+                (slot_len - panel_len) / 2
             };
-            let panel = Rect::new(
-                geom.panel.x + shift,
-                geom.panel.y,
-                panel_w,
-                geom.panel.height,
-            );
-            for card in &mut cards {
-                card.rect.x += shift;
-            }
-            viewport.x += shift;
-            let label_strip = Rect::new(panel.x, panel.y, panel_w, geom.label_strip.height);
+            let panel = if orient.is_vertical() {
+                for card in &mut cards {
+                    card.rect.y += shift;
+                }
+                viewport.y += shift;
+                Rect::new(
+                    geom.panel.x,
+                    geom.panel.y + shift,
+                    geom.panel.width,
+                    panel_len,
+                )
+            } else {
+                for card in &mut cards {
+                    card.rect.x += shift;
+                }
+                viewport.x += shift;
+                Rect::new(
+                    geom.panel.x + shift,
+                    geom.panel.y,
+                    panel_len,
+                    geom.panel.height,
+                )
+            };
+            let label_strip = Rect::new(panel.x, panel.y, panel.width, label_h);
             rows.push(OverviewRow {
                 workspace_index: ws_idx,
                 label,
@@ -392,9 +432,9 @@ impl AppState {
         let label_h = 24;
         let label_gap = 10; // visual breathing room between label and first row
         let margin_x = geoms.first().map(|g| g.panel.x).unwrap_or(12);
-        let label_y = geoms
+        let label_y = rows
             .first()
-            .map(|g| g.panel.y - label_h - label_gap)
+            .map(|row| row.panel.y - label_h - label_gap)
             .unwrap_or(0)
             .max(0);
         // The monitor label starts at the first panel, so its text lines up
@@ -590,7 +630,11 @@ impl AppState {
         } else {
             Rect::new(strip.x, strip.y, (strip.width - reserve).max(1), strip.height)
         };
-        let mut xform = StripTransform::fit(&content, &fit_strip);
+        let mut xform = if orient.is_vertical() {
+            StripTransform::fit_top(&content, &fit_strip)
+        } else {
+            StripTransform::fit(&content, &fit_strip)
+        };
         if has_left {
             if orient.is_vertical() {
                 xform.offset_y += boundary_gap;
@@ -659,12 +703,13 @@ impl AppState {
                 v.height + 2 * VIEWPORT_RING_PAD,
             )
         };
-        // For vmon column panels, no width wrapping is needed (full column height used).
-        let content_primary = if orient.is_vertical() {
-            None
+        // Content length along the primary axis, so the panel can wrap it:
+        // height on vertical monitors, width on horizontal ones.
+        let content_primary = Some(if orient.is_vertical() {
+            xform.scaled_height(&content) + reserve
         } else {
-            Some(xform.scaled_width(&content) + reserve)
-        };
+            xform.scaled_width(&content) + reserve
+        });
         (cards, marker, content_primary)
     }
 
@@ -1829,15 +1874,82 @@ mod tests {
     }
 
     #[test]
+    fn test_portrait_panels_wrap_content_height_like_landscape_rows() {
+        // A portrait monitor shows one short window per workspace column.
+        // The panel wraps the content's height, as a landscape row wraps its
+        // width: centered vertically, or bottom-aligned when the monitor's
+        // columns sit against the end (RTL).
+        use crate::config::{MonitorDirection, MonitorRule};
+        for direction in [MonitorDirection::Ltr, MonitorDirection::Rtl] {
+            let config = Config {
+                monitor_rules: vec![MonitorRule {
+                    display: 1,
+                    direction: Some(direction),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            let mut state = AppState::new_with_config(
+                config,
+                vec![MonitorInfo {
+                    id: 1,
+                    rect: Rect::new(0, 0, 1080, 1920),
+                    work_area: Rect::new(0, 0, 1080, 1880),
+                    is_primary: true,
+                    device_name: "DISPLAY1".to_string(),
+                    scale_factor: 1.0,
+                }],
+            );
+            add_windows(&mut state, 0, &[101]);
+
+            let (_, model) = state.build_overview_model().expect("model");
+            let row = &model.rows[0];
+            let geom = &layout_overview_columns(1080, 1880, model.rows.len())[0];
+            let case = format!("{direction:?}");
+            assert!(
+                row.panel.height < geom.panel.height,
+                "{case}: panel must wrap"
+            );
+            if direction.pins_right() {
+                assert_eq!(
+                    row.panel.y + row.panel.height,
+                    geom.panel.y + geom.panel.height,
+                    "{case}: bottom-aligned"
+                );
+            } else {
+                let panel_mid = row.panel.y + row.panel.height / 2;
+                let slot_mid = geom.panel.y + geom.panel.height / 2;
+                assert!((panel_mid - slot_mid).abs() <= 1, "{case}: centered");
+            }
+            assert_eq!(row.label_strip.y, row.panel.y, "{case}");
+            for card in &row.cards {
+                assert!(
+                    card.rect.y >= row.label_strip.y + row.label_strip.height
+                        && card.rect.y + card.rect.height <= row.panel.y + row.panel.height,
+                    "{case}: card {:?} escapes panel {:?}",
+                    card.rect,
+                    row.panel
+                );
+            }
+            assert!(
+                model.monitor_label_rect.y + model.monitor_label_rect.height <= row.panel.y,
+                "{case}: monitor label sits above the first panel"
+            );
+        }
+    }
+
+    #[test]
     fn test_monitor_label_starts_at_first_panel_on_portrait_rtl_monitor() {
         // Portrait panels are columns centered as a group whatever the
         // direction; the label starts at the first one.
-        let mut config = Config::default();
-        config.monitor_rules = vec![crate::config::MonitorRule {
-            display: 1,
-            direction: Some(crate::config::MonitorDirection::Rtl),
+        let config = Config {
+            monitor_rules: vec![crate::config::MonitorRule {
+                display: 1,
+                direction: Some(crate::config::MonitorDirection::Rtl),
+                ..Default::default()
+            }],
             ..Default::default()
-        }];
+        };
         let mut state = AppState::new_with_config(
             config,
             vec![MonitorInfo {

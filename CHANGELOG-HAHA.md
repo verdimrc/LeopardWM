@@ -42,7 +42,9 @@ Diff between `36574ea` .. HEAD
     windows stack top to bottom, and left/right navigation moves up/down. Drag-and-drop, column
     resizing, and cross-monitor operations all respect the rotated axis.
   - Overview workspace panels are arranged side by side as tall columns instead of horizontal stripes.
-    Window cards are shown in their physical (portrait) orientation, stacked top to bottom.
+    Window cards are shown in their physical (portrait) orientation, stacked top to bottom. Each panel
+    is as tall as its windows, centered vertically, or bottom-aligned when `direction` is `"rtl"` or
+    `"ltr_right_aligned"`.
 
 ### 1.2. Moving windows between monitors
 
