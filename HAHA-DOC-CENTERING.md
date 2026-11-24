@@ -81,6 +81,8 @@ focus B   [··AAAAAAAABBBBBBBB··]     no scroll: the strip stays centered
 ```
 
 Once the columns are wider than the screen, as with all four, it behaves like `"just_in_view"`.
+Columns that leave at most `full_screen_tolerance_px` pixels free (default 2) count as filling the
+screen.
 
 ## 3. `center_past_edges`
 

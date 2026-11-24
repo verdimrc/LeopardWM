@@ -133,6 +133,59 @@ fn test_monitors() -> Vec<MonitorInfo> {
 }
 
 #[test]
+fn test_center_column_centers_last_window_past_the_edge() {
+    // Display 1's setup: a 2560 px screen, no gaps, centering_mode =
+    // "center_columns_when_narrower", center_past_edges = true. Three windows
+    // with the last one focused: too wide by 170 px, an exact fit, and 2 px
+    // free. Ctrl+Alt+C must center the last window, leaving space after it.
+    let mut config = test_config();
+    config.layout.gap = 0;
+    config.layout.outer_gap_left = 0;
+    config.layout.outer_gap_right = 0;
+    config.layout.outer_gap_top = 0;
+    config.layout.outer_gap_bottom = 0;
+    config.layout.centering_mode = config::CenteringModeConfig::CenterColumnsWhenNarrower;
+    config.layout.center_past_edges = true;
+    config.layout.center_single_column = true;
+    let monitors = vec![MonitorInfo {
+        id: 1,
+        rect: Rect::new(0, 0, 2560, 1600),
+        work_area: Rect::new(0, 0, 2560, 1516),
+        is_primary: true,
+        device_name: "DISPLAY1".to_string(),
+        scale_factor: 1.0,
+    }];
+    // The last window starts at 852 + 1280 = 2132; centered, the scroll
+    // offset is its middle minus half the screen (1280).
+    for (last_width, start) in [(598, 170.0), (428, 0.0), (426, 0.0)] {
+        let case = format!("last window {last_width} px");
+        let mut state = AppState::new_with_config(config.clone(), monitors.clone());
+        state.paused = false;
+        for (id, width) in [(1, 852), (2, 1280), (3, last_width)] {
+            state
+                .injected_window_info
+                .insert(id, make_test_window_info(id));
+            state
+                .focused_workspace_mut()
+                .unwrap()
+                .insert_window(id, Some(width))
+                .unwrap();
+        }
+        let ws = state.focused_workspace_mut().unwrap();
+        ws.ensure_focused_visible(2560);
+        assert_eq!(ws.scroll_offset(), start, "{case}: before");
+
+        let _ = state.handle_command(IpcCommand::CenterColumn);
+        state.tick_animations(10_000);
+        let _ = state.apply_layout();
+
+        let centered = f64::from(2132 + last_width / 2 - 1280);
+        let offset = state.focused_workspace().unwrap().scroll_offset();
+        assert_eq!(offset, centered, "{case}");
+    }
+}
+
+#[test]
 fn test_app_state_new() {
     let state = AppState::new_with_config(test_config(), test_monitors());
     assert_eq!(state.workspaces.len(), 1);

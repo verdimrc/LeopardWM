@@ -108,6 +108,53 @@ mod tests {
     }
 
     #[test]
+    fn test_center_columns_when_narrower_treats_near_full_screen_as_full() {
+        // Columns that leave at most `full_screen_tolerance_px` free count as
+        // a full screen, so Ctrl+Alt+C centers the focused (last) window; more
+        // free space keeps the group centered and Ctrl+Alt+C does nothing.
+        // On a 3840 px screen, 1/3 + 2/3 rounds down to 1278 + 2561 (1 px
+        // free), and three 0.333 windows to 3 x 1278 (6 px free).
+        for (widths, tolerance, ctrl_alt_c_centers) in [
+            (vec![1278, 2561], 2, true),
+            (vec![1278, 2560], 2, true),
+            (vec![1278, 2559], 2, false),
+            (vec![1278, 1278, 1278], 2, false),
+            (vec![1278, 1278, 1278], 8, true),
+        ] {
+            for reduce_motion in [true, false] {
+                let case = format!(
+                    "widths={widths:?}, tolerance={tolerance}, reduce_motion={reduce_motion}"
+                );
+                let mut ws = gapless_workspace();
+                ws.set_centering_mode(CenteringMode::CenterColumnsWhenNarrower);
+                ws.set_center_past_edges(true);
+                ws.set_full_screen_tolerance_px(tolerance);
+                ws.set_reduce_motion(reduce_motion);
+                for (id, &width) in widths.iter().enumerate() {
+                    ws.insert_window(id as u64 + 1, Some(width)).unwrap();
+                }
+                ws.ensure_focused_visible_animated(3840);
+                ws.stop_animation();
+                ws.reconcile_scroll_bounds(3840);
+                let before = ws.scroll_offset();
+
+                ws.center_focused_column_animated(3840);
+                ws.stop_animation();
+                ws.reconcile_scroll_bounds(3840);
+                if ctrl_alt_c_centers {
+                    // The last window's middle, minus half the screen.
+                    let last = *widths.last().unwrap();
+                    let last_x: i32 = widths.iter().sum::<i32>() - last;
+                    let centered = (last_x + last / 2 - 1920) as f64;
+                    assert_eq!(ws.scroll_offset(), centered, "{case}");
+                } else {
+                    assert_eq!(ws.scroll_offset(), before, "{case}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn test_rtl_and_right_aligned_pin_fitting_columns_right() {
         // Three 300px columns on a 1000px screen, no gaps: 900px, so pinned
         // right they start at x = 100.

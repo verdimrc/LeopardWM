@@ -62,6 +62,10 @@ centering_mode = "{centering_mode}"
 # Center the only active tiled column when it fits, regardless of centering mode.
 center_single_column = false
 
+# With center_columns_when_narrower, columns that leave at most this many
+# pixels free count as filling the screen.
+# full_screen_tolerance_px = 2
+
 [appearance]
 # Settings, tray, and daemon notification language: bundled locale filename stem (default "en")
 language = "en"
@@ -208,7 +212,7 @@ reduce_motion_on_battery = true
 #   against the right edge), or "ltr_right_aligned" (new columns open to the
 #   right but fit against the right edge).
 # - default_width_preset, centering_mode, center_past_edges,
-#   center_single_column: override [layout].
+#   center_single_column, full_screen_tolerance_px: override [layout].
 # Options left out keep their default; the first rule for a display wins.
 # [[monitor_rules]]
 # display = 3
@@ -217,6 +221,7 @@ reduce_motion_on_battery = true
 # centering_mode = "center"
 # center_past_edges = false
 # center_single_column = false
+# full_screen_tolerance_px = 2
 
 # Built-in example: Firefox / Zen Picture-in-Picture popups draw their own
 # square frame, so we override the focus-border corner style to match. Edit

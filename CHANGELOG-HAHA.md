@@ -17,6 +17,7 @@ Diff between `36574ea` .. HEAD
   centering_mode = "center"
   center_past_edges = false
   center_single_column = false
+  full_screen_tolerance_px = 2
   ```
 
   - `direction`:
@@ -31,8 +32,9 @@ Diff between `36574ea` .. HEAD
     sweep. RTL clusters windows toward the right edge of the external monitor, right next to the center
     display, so your eyes barely move between the two screens.
   - `default_width_preset`: the width preset new columns open at on this monitor.
-  - `centering_mode`, `center_past_edges`, `center_single_column`: this monitor's centering. On a
-    monitor whose rule sets `centering_mode`, choosing a centering mode from the tray has no effect.
+  - `centering_mode`, `center_past_edges`, `center_single_column`, `full_screen_tolerance_px`: this
+    monitor's centering. On a monitor whose rule sets `centering_mode`, choosing a centering mode from
+    the tray has no effect.
 - Vertical monitor support:
   - Automatically detected from portrait orientation (height > width) — no configuration required; rotate
     the monitor in Windows Display Settings.
@@ -86,7 +88,8 @@ Diff between `36574ea` .. HEAD
 
 - `layout.centering_mode = "center_columns_when_narrower"` centers all columns together when they are
   narrower than the screen. When they are wider, they start at the left edge (right edge with RTL) and
-  the screen scrolls like `"just_in_view"`.
+  the screen scrolls like `"just_in_view"`. Columns that leave at most
+  `layout.full_screen_tolerance_px` pixels free (default 2) count as filling the screen.
 
 ### 1.5. Overview
 
@@ -128,6 +131,7 @@ Diff between `36574ea` .. HEAD
 |---|---|---|---|
 | `layout.centering_mode` (extended) | `"center"` \| `"just_in_view"` \| `"on_overflow"` \| ✨`"center_columns_when_narrower"` | `"center"` | Adds `"center_columns_when_narrower"`: center all columns together when they are narrower than the screen. ⚠️ [Known issue with GUI settings](#4-known-issues-with-gui-settings) |
 | `layout.desktop_peek_min_width` | `f64` | `0.25` | Minimum ghost column width as a fraction of monitor width. ⚠️ [Known issue with GUI settings](#4-known-issues-with-gui-settings) |
+| `layout.full_screen_tolerance_px` | `i32` | `2` | With `"center_columns_when_narrower"`, columns that leave at most this many pixels free count as filling the screen. ⚠️ [Known issue with GUI settings](#4-known-issues-with-gui-settings) |
 | `behavior.new_window_monitor` (extended) | `"opening"` \| `"focused"` \| ✨`"cursor"` | `"opening"` | Adds `"cursor"`: open new windows on the monitor under the mouse cursor. |
 | `behavior.new_width_on_monitor_move` | `"upstream" \| "same_proportion_as_source_monitor" \| "window_rule_width_or_default_width"` | `"upstream"` | Width of a tiled window moved to another monitor. ⚠️ [Known issue with GUI settings](#4-known-issues-with-gui-settings) |
 | `behavior.notify_elevation_blocked` | `bool` | `true` | Show a toast when a privilege-elevated window is excluded from tiling. Set to `false` to silence it. ⚠️ [Known issue with GUI settings](#4-known-issues-with-gui-settings) |
@@ -136,7 +140,7 @@ Diff between `36574ea` .. HEAD
 | `hotkeys.toggle_desktop_peek_anchored` | `string` | `"Ctrl+Alt+'"` | Reveal desktop; focused window stays in place. |
 | `hotkeys.toggle_desktop_peek` | `string` | `"Ctrl+Alt+Shift+'"` | Reveal desktop; focused window moves to the minimum-width mark. |
 | `hotkeys.toggle_new_window_placement_once` | `string` | `"Ctrl+Alt+Shift+N"` | Activate a one-shot new-window-placement override for the next window only. |
-| `[[monitor_rules]]` | `display = u32`, plus optional `direction`, `default_width_preset`, `centering_mode`, `center_past_edges`, `center_single_column` | (none) | Per-monitor column direction, default width preset, and centering settings. ⚠️ [Known issue with GUI settings](#4-known-issues-with-gui-settings) |
+| `[[monitor_rules]]` | `display = u32`, plus optional `direction`, `default_width_preset`, `centering_mode`, `center_past_edges`, `center_single_column`, `full_screen_tolerance_px` | (none) | Per-monitor column direction, default width preset, and centering settings. ⚠️ [Known issue with GUI settings](#4-known-issues-with-gui-settings) |
 | Window rule: `new_window_monitor` | `"opening" \| "focused" \| "cursor"` | (none) | Overrides `behavior.new_window_monitor` for matching windows. |
 | Window rule: `column_width` (extended) | `f64` \| ✨`u32` \| ✨`{ "N" = f64\|u32 }` | (none) | Now accepts a preset index or a per-display-number map in addition to a viewport fraction. ⚠️ [Known issue with GUI settings](#4-known-issues-with-gui-settings) |
 
@@ -168,6 +172,7 @@ doesn't show are reset or removed:
 |---|---|
 | `layout.centering_mode = "center_columns_when_narrower"` | Kept, but the settings window shows "Center" and the tray menu checks no centering mode. Picking another mode in either replaces it. |
 | `layout.desktop_peek_min_width` | Reset to `0.25`. |
+| `layout.full_screen_tolerance_px` | Reset to `2`. |
 | `behavior.new_width_on_monitor_move` | Reset to `"upstream"`. |
 | `behavior.notify_elevation_blocked` | Reset to `true`. |
 | `behavior.symmetric_modifiers` | Reset to `false`. |

@@ -49,9 +49,17 @@ impl Workspace {
         max_scroll: f64,
     ) -> (f64, f64) {
         if let Some(width) = self.centered_content_width() {
-            let visible_width = self.visible_width(viewport_width);
-            if width <= visible_width {
-                let offset = (-(visible_width - width) / 2) as f64;
+            let free = self.visible_width(viewport_width) - width;
+            // Columns that leave at most `full_screen_tolerance_px` free
+            // (rounded-down presets such as 1/3 + 2/3) fill the screen, so the
+            // center-column command can still center the focused one.
+            let fits = if self.centering_mode == CenteringMode::CenterColumnsWhenNarrower {
+                free > self.full_screen_tolerance_px
+            } else {
+                free >= 0
+            };
+            if fits {
+                let offset = (-free / 2) as f64;
                 return (offset, offset);
             }
         }

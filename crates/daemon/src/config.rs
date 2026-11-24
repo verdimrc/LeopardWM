@@ -81,6 +81,8 @@ pub struct MonitorRule {
     pub center_past_edges: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub center_single_column: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_screen_tolerance_px: Option<i32>,
 }
 
 /// Centering settings in effect on one monitor (see `Config::centering_for`).
@@ -89,6 +91,7 @@ pub struct MonitorCentering {
     pub centering_mode: CenteringModeConfig,
     pub center_past_edges: bool,
     pub center_single_column: bool,
+    pub full_screen_tolerance_px: i32,
 }
 
 impl MonitorCentering {
@@ -96,6 +99,7 @@ impl MonitorCentering {
         workspace.set_centering_mode(self.centering_mode.into());
         workspace.set_center_past_edges(self.center_past_edges);
         workspace.set_center_single_column(self.center_single_column);
+        workspace.set_full_screen_tolerance_px(self.full_screen_tolerance_px);
     }
 }
 
@@ -158,6 +162,9 @@ impl Config {
             center_single_column: rule
                 .and_then(|r| r.center_single_column)
                 .unwrap_or(self.layout.center_single_column),
+            full_screen_tolerance_px: rule
+                .and_then(|r| r.full_screen_tolerance_px)
+                .unwrap_or(self.layout.full_screen_tolerance_px),
         }
     }
 }
@@ -243,6 +250,11 @@ pub struct LayoutConfig {
     #[serde(default)]
     pub center_single_column: bool,
 
+    /// With `centering_mode = "center_columns_when_narrower"`, columns that
+    /// leave at most this many pixels free count as filling the screen.
+    #[serde(default = "default_full_screen_tolerance_px")]
+    pub full_screen_tolerance_px: i32,
+
     /// Whether center-column can scroll past content edges.
     /// When true, the first/last column will be truly centered with empty space.
     /// When false (default), scroll is clamped to content boundaries.
@@ -286,6 +298,10 @@ fn default_desktop_peek_min_width() -> f64 {
     0.25
 }
 
+fn default_full_screen_tolerance_px() -> i32 {
+    2
+}
+
 fn default_width_presets() -> Vec<f64> {
     vec![0.333, 0.5, 0.667]
 }
@@ -309,6 +325,7 @@ impl Default for LayoutConfig {
             centering_mode: CenteringModeConfig::default(),
             center_past_edges: false,
             center_single_column: false,
+            full_screen_tolerance_px: default_full_screen_tolerance_px(),
             width_presets: default_width_presets(),
             default_width_preset: default_width_preset(),
             height_presets: default_height_presets(),
@@ -2082,6 +2099,7 @@ mod tests {
             display = 2
             centering_mode = "center_columns_when_narrower"
             center_past_edges = true
+            full_screen_tolerance_px = 8
 
             [[monitor_rules]]
             display = 2
@@ -2094,6 +2112,7 @@ mod tests {
             centering_mode: CenteringModeConfig::JustInView,
             center_past_edges: false,
             center_single_column: true,
+            full_screen_tolerance_px: 2,
         };
         assert_eq!(config.centering_for(r"\\.\DISPLAY1"), layout);
         assert_eq!(config.centering_for(""), layout);
@@ -2104,6 +2123,7 @@ mod tests {
                 centering_mode: CenteringModeConfig::CenterColumnsWhenNarrower,
                 center_past_edges: true,
                 center_single_column: true,
+                full_screen_tolerance_px: 8,
             }
         );
 

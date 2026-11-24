@@ -100,6 +100,10 @@ pub struct Workspace {
     /// Outside fullscreen, pins scroll to center when exactly one active column fits.
     #[serde(skip)]
     pub(crate) center_single_column: bool,
+    /// Free space, in pixels, that `CenterColumnsWhenNarrower` still treats
+    /// as a full screen.
+    #[serde(skip)]
+    pub(crate) full_screen_tolerance_px: i32,
     /// One entry per maximized column, each restored on its own.
     #[serde(skip)]
     pub(crate) maximized_columns: Vec<MaximizedColumnState>,
@@ -155,6 +159,7 @@ impl Default for Workspace {
             scroll_easing: Easing::default(),
             center_past_edges: false,
             center_single_column: false,
+            full_screen_tolerance_px: 2,
             maximized_columns: Vec::new(),
             tab_strip_reserve_px: 0,
             rtl: false,
@@ -481,6 +486,12 @@ impl Workspace {
     /// Center the only active tiled column when it fits inside the viewport.
     pub fn set_center_single_column(&mut self, center: bool) {
         self.center_single_column = center;
+    }
+
+    /// Set the free space, in pixels, that `CenterColumnsWhenNarrower` still
+    /// treats as a full screen (at least 0).
+    pub fn set_full_screen_tolerance_px(&mut self, px: i32) {
+        self.full_screen_tolerance_px = px.max(0);
     }
 
     pub fn center_single_column(&self) -> bool {
