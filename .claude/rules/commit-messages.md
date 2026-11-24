@@ -7,8 +7,16 @@ rules **before** showing it — don't draft and wait to be corrected.
 
 Draft only from the staged changes: `git diff --cached --stat` and `git diff --cached`. If nothing
 is staged, say so and stop — don't fall back to unstaged changes. Never draft from what was
-discussed in the session. If unstaged changes also exist, say the draft covers only the staged
-part.
+discussed in the session.
+
+Every draft, with no exceptions, comes with these reminders next to it (the user sometimes forgets
+to stage in a separate terminal):
+
+1. State explicitly that the draft is based on the staged changes.
+2. If unstaged or untracked changes exist (`git status --short`), say so in one short line —
+   don't list or describe them — and remind the user they may want to check and stage them. E.g.
+   "Note: there are also unstaged changes. You may want to check and stage them."
+3. If everything is staged, say nothing about unstaged changes.
 
 If the staged diff mixes unrelated changes (e.g. a code fix plus `.claude/` tooling), they belong
 in separate commits: draft for the main change, name the other paths, and give the exact

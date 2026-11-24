@@ -21,8 +21,8 @@ is the single source of truth; follow it exactly. This skill is the procedure ar
    fix-ups. Describe each by what the user sees. Skip steps 2–4.
 2. `git diff --cached --stat` and `git diff --cached` — the staged changes are the only input.
    If nothing is staged, tell the user to stage what they want to commit, and stop.
-3. `git diff --stat` — only to detect unstaged changes. Never draft from them; if any exist,
-   say the draft covers only the staged part.
+3. `git status --short` — only to detect unstaged or untracked changes. Never draft from them;
+   if any exist, the output (step 5) must flag them.
 4. Look at the staged paths: if they mix unrelated changes (e.g. a code fix plus `.claude/`
    tooling), draft for the main change, name the other paths, and give the exact
    `git restore --staged <paths>` to split them off. Don't join unrelated changes with `;`.
@@ -97,6 +97,12 @@ Show each version in its own code block, ready to paste:
 - **Version B (with detail)**, only if it exists, with a few words on what the body adds that
   the subject doesn't.
 
-Then one line saying what they cover (staged changes, or staged-only if unstaged changes also
-exist). If unrelated changes are staged, add the
-`git restore --staged <paths>` command to split them off. Nothing else.
+Then, every time, these reminders (per the rules' Source section):
+
+1. One line stating that the draft is based on the staged changes.
+2. If step 3 found unstaged or untracked changes: one short line saying so, without listing
+   them, and reminding the user they may want to check and stage them. If everything is staged,
+   say nothing about unstaged changes.
+
+If unrelated changes are staged, add the `git restore --staged <paths>` command to split them
+off. Nothing else.
