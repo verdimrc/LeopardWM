@@ -46,7 +46,9 @@ If the user-visible effect isn't clear from the diff, say so and ask rather than
 Follow `.claude/rules/commit-messages.md` and the session's attribution trailer. Produce one or
 two versions with the same first line:
 
-- **Version A — one-liner.** Always. `type(scope): subject` plus the trailer, no body.
+- **Version A — one-liner.** Always, except for a commit that adds a config key or value: its
+  body is required (it is the only place the key appears), so show only version B.
+  `type(scope): subject` plus the trailer, no body.
 - **Version B — with a detail message.** Only if a body is warranted: the reader couldn't
   predict it from the subject (an unguessable cause or fix, an unfamiliar term, the steps that
   trigger the bug, the parts of one feature, or a new config key's syntax). If nothing
@@ -59,8 +61,8 @@ checks decide whether version B exists at all.
 
 - [ ] Subject describes what the user experiences, in plain language — not mechanics.
 - [ ] Subject has no internal names (structs, functions, config keys, IPC variants) or internal
-      concepts ("placeholder", "sentinel", "override") — except a new feature turned on by a
-      config key, which names the key and what it gives the user.
+      concepts ("placeholder", "sentinel", "override"). A new config key or value is no
+      exception: the subject says what the user gets, and the key goes in the body.
 - [ ] The first line is as short as it can be while staying plain; no word that doesn't carry
       what the user gets or how they turn it on.
 - [ ] A bug fix reads "<thing> no longer <bad behavior>".
@@ -77,8 +79,8 @@ checks decide whether version B exists at all.
       in the first line, no bullet of its own.
 - [ ] Version B: could I have guessed this body from the subject? If yes, drop version B —
       regardless of diff size.
-- [ ] A new config key: version B's body is its example syntax only — no fallbacks,
-      validation, or settings-window behavior.
+- [ ] A new config key or value: only version B, and its body shows the example syntax only —
+      no fallbacks, validation, or settings-window behavior.
 - [ ] Version B's body only defines unfamiliar terms, gives the steps that trigger the bug
       (naming a setting it depends on is fine), gives "Previously, …" / "This fix …" for a
       cause or approach a reader couldn't predict, or gives one bullet per part ("X changed:

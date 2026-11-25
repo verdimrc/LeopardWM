@@ -40,9 +40,9 @@ plain and humane: every word should carry what the user gets, or how they turn i
   sounds like a spec, rewrite it.
 - No internal names: struct/function names, config keys, IPC variants, or internal concepts
   ("placeholder", "sentinel", "override", "fraction cache").
-- Exception: a new feature the user turns on with a config key. The subject names the key and
-  what it gives the user, e.g.
-  `feat(daemon): layout.default_width_preset_monitor_overrides to set the per-monitor width preset`.
+- A new config key or value: the subject says what the user gets, in plain words, without the
+  key, e.g. `feat(daemon): snap windows to the left edge`. The key goes in the body (see Body).
+  Naming it in the subject makes the first line too long.
 - Bug fix shape: "<thing> no longer <bad behavior>". The thing can be the action that goes
   wrong, e.g. `fix(daemon): exiting desktop peek no longer hides a newly focused window`.
 - If the bug only happens under a condition, the condition is part of the subject:
@@ -70,6 +70,9 @@ plain and humane: every word should carry what the user gets, or how they turn i
 Default to a one-liner. Add a body only if a reader couldn't predict it from the subject —
 if the body's content is guessable from the subject, delete it. Diff size is irrelevant.
 
+Exception: a commit that adds a config key or value always has a body that shows its syntax
+(see below). The subject doesn't name the key, so without the body nothing would.
+
 - Body needed: `moving a window between monitors no longer gains or loses pixels` — nobody can
   guess from that how a move changes a width (repeated rounding) or how it was fixed
   (remembering the proportion).
@@ -87,7 +90,7 @@ When a body is needed, keep it short:
 - Give the steps that trigger a bug when a reader couldn't guess them, e.g. "Triggered by
   opening a window while desktop peek is on, e.g. double-clicking a file on the revealed
   desktop, with "focus new windows" enabled."
-- For a new config key, show its syntax with an example value, e.g.
+- For a new config key or value, show its syntax with an example value, e.g.
   `default_width_preset_monitor_overrides = { "2" = 3 }`. Nothing else: fallbacks, validation,
   and settings-window behavior are mechanics.
 - For a fix whose cause or approach a reader couldn't predict, use two short paragraphs:
