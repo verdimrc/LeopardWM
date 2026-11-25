@@ -155,6 +155,46 @@ mod tests {
     }
 
     #[test]
+    fn test_aligned_ltr_snaps_back_after_center_command_on_column_operation() {
+        // Two 300px windows on a 1000px screen fit. With center_past_edges,
+        // Ctrl+Alt+C centers the second one in every direction. A column
+        // operation then snaps left- and right-aligned strips back to their
+        // edge; plain LTR keeps the centered position.
+        for (left_aligned, right_aligned, after_resize) in [
+            (false, false, -50.0), // plain LTR: stays where Ctrl+Alt+C put it
+            (true, false, 0.0),    // ltr_left_aligned: back at the left edge
+            (false, true, -390.0), // ltr_right_aligned: 300 + 310 against the right edge
+        ] {
+            for reduce_motion in [true, false] {
+                let case = format!(
+                    "left={left_aligned}, right={right_aligned}, reduce_motion={reduce_motion}"
+                );
+                let mut ws = gapless_workspace();
+                ws.set_centering_mode(CenteringMode::JustInView);
+                ws.set_center_past_edges(true);
+                ws.set_left_aligned(left_aligned);
+                ws.set_right_aligned(right_aligned);
+                ws.set_reduce_motion(reduce_motion);
+                ws.insert_window(1, Some(300)).unwrap();
+                ws.insert_window(2, Some(300)).unwrap();
+                ws.ensure_focused_visible_animated(1000);
+                ws.stop_animation();
+
+                // The second window spans 300..600; centered, its middle (450)
+                // sits at 500.
+                ws.center_focused_column_animated(1000);
+                ws.stop_animation();
+                assert_eq!(ws.scroll_offset(), -50.0, "Ctrl+Alt+C: {case}");
+
+                ws.resize_focused_column(10);
+                ws.ensure_focused_visible_animated(1000);
+                ws.stop_animation();
+                assert_eq!(ws.scroll_offset(), after_resize, "after resize: {case}");
+            }
+        }
+    }
+
+    #[test]
     fn test_rtl_and_right_aligned_pin_fitting_columns_right() {
         // Three 300px columns on a 1000px screen, no gaps: 900px, so pinned
         // right they start at x = 100.

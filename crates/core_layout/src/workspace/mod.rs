@@ -121,6 +121,11 @@ pub struct Workspace {
     /// right edge (as with `rtl`).
     #[serde(skip)]
     pub(crate) right_aligned: bool,
+    /// Left-aligned LTR: content narrower than the viewport is held against
+    /// the left edge, so a column operation after the center-column command
+    /// snaps it back there (as `right_aligned` does for the right edge).
+    #[serde(skip)]
+    pub(crate) left_aligned: bool,
 }
 
 /// State saved when a column is maximized to fill the viewport width.
@@ -164,6 +169,7 @@ impl Default for Workspace {
             tab_strip_reserve_px: 0,
             rtl: false,
             right_aligned: false,
+            left_aligned: false,
         }
     }
 }
@@ -536,6 +542,12 @@ impl Workspace {
     /// (RTL or right-aligned LTR).
     pub fn pins_right(&self) -> bool {
         self.rtl || self.right_aligned
+    }
+
+    /// Set left-aligned LTR: content that fits in the viewport is held against
+    /// the left edge.
+    pub fn set_left_aligned(&mut self, left_aligned: bool) {
+        self.left_aligned = left_aligned;
     }
 
     /// A column is active when at least one window is not minimized.

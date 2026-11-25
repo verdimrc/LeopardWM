@@ -209,8 +209,10 @@ reduce_motion_on_battery = true
 
 # Per-monitor settings for one Windows display number (3 = \\.\DISPLAY3):
 # - direction: "ltr" (default), "rtl" (new columns open to the left and fit
-#   against the right edge), or "ltr_right_aligned" (new columns open to the
-#   right but fit against the right edge).
+#   against the right edge), "ltr_right_aligned" (new columns open to the
+#   right but fit against the right edge), or "ltr_left_aligned" (like "ltr",
+#   but columns that fit snap back to the left edge after Ctrl+Alt+C centered
+#   a window).
 # - default_width_preset, centering_mode, center_past_edges,
 #   center_single_column, full_screen_tolerance_px: override [layout].
 # Options left out keep their default; the first rule for a display wins.

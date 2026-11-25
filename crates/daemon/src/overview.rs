@@ -327,7 +327,8 @@ impl AppState {
             .get(&monitor)
             .map(|m| m.device_name.as_str())
             .unwrap_or("");
-        let rtl = self.config.direction_for(device_name).pins_right();
+        let direction = self.config.direction_for(device_name);
+        let rtl = direction.pins_right();
 
         let mut rows = Vec::with_capacity(ws_vec.len());
         for (ws_idx, ws) in ws_vec.iter().enumerate() {
@@ -377,11 +378,13 @@ impl AppState {
                 None if cards.is_empty() => (8 * LABEL_STRIP_H).min(slot_len),
                 None => slot_len,
             };
-            // Center the panel in its slot, or align it with the end (right,
-            // or bottom on vertical monitors) where columns sit against that
-            // edge, matching the strip.
+            // Center the panel in its slot, or align it with the edge the
+            // monitor holds its columns against (the end: right, or bottom on
+            // vertical monitors; the start: left or top), matching the strip.
             let shift = if rtl {
                 slot_len - panel_len
+            } else if direction.pins_left() {
+                0
             } else {
                 (slot_len - panel_len) / 2
             };
@@ -1840,6 +1843,7 @@ mod tests {
             MonitorDirection::Ltr,
             MonitorDirection::Rtl,
             MonitorDirection::LtrRightAligned,
+            MonitorDirection::LtrLeftAligned,
         ] {
             let mut state = test_state();
             state.config.monitor_rules = vec![MonitorRule {
@@ -1857,6 +1861,11 @@ mod tests {
                 assert!(
                     (panel_right - (1920 - margin_x)).abs() <= 1,
                     "{direction:?}: row must touch the right margin, right edge {panel_right}"
+                );
+            } else if direction.pins_left() {
+                assert_eq!(
+                    row.panel.x, margin_x,
+                    "{direction:?}: row must touch the left margin"
                 );
             } else {
                 assert!(

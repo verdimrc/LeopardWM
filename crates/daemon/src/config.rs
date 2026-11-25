@@ -360,18 +360,28 @@ pub enum MonitorDirection {
     Rtl,
     /// New columns open to the right; content fits against the right edge.
     LtrRightAligned,
+    /// New columns open to the right; content that fits is held against the
+    /// left edge, even after the center-column command centered a window.
+    LtrLeftAligned,
 }
 
 impl MonitorDirection {
     /// Whether columns that fit sit against the right edge (`Rtl` or
     /// `LtrRightAligned`), as `Workspace::pins_right`.
     pub fn pins_right(self) -> bool {
-        self != Self::Ltr
+        matches!(self, Self::Rtl | Self::LtrRightAligned)
+    }
+
+    /// Whether columns that fit are held against the left edge
+    /// (`LtrLeftAligned`).
+    pub fn pins_left(self) -> bool {
+        self == Self::LtrLeftAligned
     }
 
     pub fn apply_to(self, workspace: &mut leopardwm_core_layout::Workspace) {
         workspace.set_rtl(self == Self::Rtl);
         workspace.set_right_aligned(self == Self::LtrRightAligned);
+        workspace.set_left_aligned(self == Self::LtrLeftAligned);
     }
 }
 
@@ -2058,6 +2068,10 @@ mod tests {
             direction = "ltr_right_aligned"
 
             [[monitor_rules]]
+            display = 5
+            direction = "ltr_left_aligned"
+
+            [[monitor_rules]]
             display = 4
             centering_mode = "center"
             "#,
@@ -2067,6 +2081,7 @@ mod tests {
         assert_eq!(direction(1), MonitorDirection::Ltr);
         assert_eq!(direction(2), MonitorDirection::Rtl);
         assert_eq!(direction(3), MonitorDirection::LtrRightAligned);
+        assert_eq!(direction(5), MonitorDirection::LtrLeftAligned);
         // A rule without direction keeps the default.
         assert_eq!(direction(4), MonitorDirection::Ltr);
 

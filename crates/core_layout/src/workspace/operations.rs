@@ -108,17 +108,31 @@ impl Workspace {
         }
     }
 
+    /// The scroll offset that holds content narrower than the viewport against
+    /// an edge, or `None` when it overflows or is not held. `raw_max` is the
+    /// content length minus the visible length (at most 0 when it fits).
+    /// Right-pinned (RTL, right-aligned) uses a negative offset that shifts
+    /// the strip's right edge onto the viewport's; left-aligned uses 0.
+    fn pinned_fit_offset(&self, raw_max: f64) -> Option<f64> {
+        if raw_max > 0.0 {
+            None
+        } else if self.pins_right() {
+            Some(raw_max)
+        } else if self.left_aligned {
+            Some(0.0)
+        } else {
+            None
+        }
+    }
+
     /// Scroll range from the content edges, widened with `center_past_edges`
     /// to the offsets that center the first and last active columns (where
     /// the center-column command can put them).
     fn edge_scroll_bounds(&self, vis_w: i32) -> (f64, f64) {
         let raw_max = (self.total_width() - vis_w) as f64;
-        if self.pins_right() && raw_max <= 0.0 {
-            // Content fits — right-anchor by allowing negative scroll_offset.
-            // Negative viewport_left shifts all columns right on screen, so
-            // the strip's right edge aligns with the viewport's right edge.
+        if let Some(pinned) = self.pinned_fit_offset(raw_max) {
             // center_single_column still wins via clamp_scroll_offset.
-            return (raw_max, raw_max);
+            return (pinned, pinned);
         }
         let mut min_scroll = 0.0_f64;
         let mut max_scroll = raw_max.max(0.0);
@@ -148,8 +162,8 @@ impl Workspace {
     /// any amount of space before the first column.
     fn reveal_scroll_bounds(&self, vis_w: i32, centered: bool) -> (f64, f64) {
         let raw_max = (self.total_width() - vis_w) as f64;
-        let pinned_right = self.pins_right() && raw_max <= 0.0;
-        if centered && self.center_past_edges && !pinned_right {
+        let pinned = self.pinned_fit_offset(raw_max).is_some();
+        if centered && self.center_past_edges && !pinned {
             (f64::NEG_INFINITY, raw_max.max(0.0))
         } else {
             self.edge_scroll_bounds(vis_w)
@@ -633,9 +647,8 @@ impl Workspace {
         let raw_max = self.total_width() - vis_w;
         let centered = self.should_center(col_width, vis_w);
 
-        let target_offset = if self.pins_right() && raw_max <= 0 {
-            // Content fits — right-anchor target (may be negative).
-            let target = raw_max as f64;
+        let target_offset = if let Some(target) = self.pinned_fit_offset(f64::from(raw_max)) {
+            // Content fits and is held against an edge.
             let current = self.effective_scroll_offset();
             if (current - target).abs() < 0.5 {
                 return;

@@ -26,6 +26,8 @@ Diff between `36574ea` .. HEAD
       columns open to the left of the focused column.
     - `"ltr_right_aligned"`: new columns open to the right of the focused column as usual, but columns
       narrower than the screen sit against the right edge.
+    - `"ltr_left_aligned"`: like `"ltr"`, but columns narrower than the screen are held against the left
+      edge: after Ctrl+Alt+C centers a window, the next column operation or focus move snaps them back.
 
     The motivating setup: a wide external monitor sitting to the left of a center main display. LTR
     places new windows at the far left of that monitor — far from the center display, forcing a wide eye
@@ -43,8 +45,8 @@ Diff between `36574ea` .. HEAD
     resizing, and cross-monitor operations all respect the rotated axis.
   - Overview workspace panels are arranged side by side as tall columns instead of horizontal stripes.
     Window cards are shown in their physical (portrait) orientation, stacked top to bottom. Each panel
-    is as tall as its windows, centered vertically, or bottom-aligned when `direction` is `"rtl"` or
-    `"ltr_right_aligned"`.
+    is as tall as its windows, centered vertically, bottom-aligned when `direction` is `"rtl"` or
+    `"ltr_right_aligned"`, or top-aligned when it is `"ltr_left_aligned"`.
 
 ### 1.2. Moving windows between monitors
 
@@ -99,7 +101,8 @@ Diff between `36574ea` .. HEAD
   - Shows on all monitors simultaneously with Ctrl+Alt+Win+Space (`hotkeys.toggle_overview_all`).
   - Shows the monitor device name above the first workspace panel, left-aligned with its number.
   - Shows empty workspace rows on monitors with no windows.
-  - Workspace panels are right-aligned when `direction` is `"rtl"` or `"ltr_right_aligned"`.
+  - Workspace panels are right-aligned when `direction` is `"rtl"` or `"ltr_right_aligned"`, and
+    left-aligned when it is `"ltr_left_aligned"`.
 
 ### 1.6. Desktop peek
 
@@ -116,7 +119,7 @@ Diff between `36574ea` .. HEAD
   - Peek is monitor-local — operations on other monitors leave it intact. Any window operation on the
     peeked monitor (focus change, move, close, minimize, maximize, fullscreen) exits peek and restores
     the previous scroll position.
-  - Only available on horizontal monitors with the usual `"ltr"` direction.
+  - Only available on horizontal monitors whose `direction` is `"ltr"` or `"ltr_left_aligned"`.
 
 ### 1.7. Input and notifications
 
