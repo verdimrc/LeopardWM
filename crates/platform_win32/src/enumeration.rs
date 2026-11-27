@@ -2,9 +2,9 @@
 
 use crate::event_hooks::{
     EVENT_OBJECT_CREATE, EVENT_OBJECT_DESTROY, EVENT_OBJECT_FOCUS, EVENT_OBJECT_HIDE,
-    EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_SHOW, EVENT_SYSTEM_FOREGROUND,
-    EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MOVESIZEEND,
-    EVENT_SYSTEM_MOVESIZESTART,
+    EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_SHOW, EVENT_OBJECT_UNCLOAKED,
+    EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART,
+    EVENT_SYSTEM_MOVESIZEEND, EVENT_SYSTEM_MOVESIZESTART,
 };
 use crate::types::{MonitorId, MonitorInfo, Win32Error, WindowInfo};
 use leopardwm_core_layout::{Rect, WindowId};
@@ -73,6 +73,18 @@ pub fn is_excluded_window_class_hwnd(hwnd: WindowId) -> bool {
     should_skip_window_by_class(&String::from_utf16_lossy(&class_buf[..class_len as usize]))
 }
 
+/// Read a window title without admission or visibility filtering.
+pub fn get_window_title(hwnd_id: WindowId) -> String {
+    let hwnd = HWND(hwnd_id as *mut c_void);
+    let title_len = unsafe { GetWindowTextLengthW(hwnd) };
+    if title_len <= 0 {
+        return String::new();
+    }
+    let mut title_buf = vec![0; (title_len + 1) as usize];
+    let actual_len = unsafe { GetWindowTextW(hwnd, &mut title_buf) };
+    String::from_utf16_lossy(&title_buf[..actual_len as usize])
+}
+
 /// Get info for a single window handle with relaxed filters.
 ///
 /// Unlike `enumerate_windows`, this does not filter out cloaked windows
@@ -110,14 +122,7 @@ pub fn get_window_info(hwnd_id: WindowId) -> Option<WindowInfo> {
         }
 
         // Get title (allow empty for UWP apps still loading)
-        let title_len = GetWindowTextLengthW(hwnd);
-        let title = if title_len > 0 {
-            let mut title_buf: Vec<u16> = vec![0; (title_len + 1) as usize];
-            let actual_len = GetWindowTextW(hwnd, &mut title_buf);
-            String::from_utf16_lossy(&title_buf[..actual_len as usize])
-        } else {
-            String::new()
-        };
+        let title = get_window_title(hwnd_id);
 
         let mut class_buf: Vec<u16> = vec![0; 256];
         let class_len = GetClassNameW(hwnd, &mut class_buf);
@@ -253,6 +258,48 @@ pub fn monitor_to_right(monitors: &[MonitorInfo], current_id: MonitorId) -> Opti
 
 fn monitor_center(m: &MonitorInfo) -> (i32, i32) {
     (m.rect.x + m.rect.width / 2, m.rect.y + m.rect.height / 2)
+}
+
+fn horizontal_monitor(
+    monitors: &[MonitorInfo],
+    current_id: MonitorId,
+    left: bool,
+) -> Option<&MonitorInfo> {
+    let current = monitors.iter().find(|m| m.id == current_id)?;
+    let (cx, cy) = monitor_center(current);
+    monitors
+        .iter()
+        .filter(|m| {
+            let mx = monitor_center(m).0;
+            if left {
+                mx < cx
+            } else {
+                mx > cx
+            }
+        })
+        .min_by_key(|m| {
+            let (mx, my) = monitor_center(m);
+            let top = i64::from(current.rect.y).max(i64::from(m.rect.y));
+            let bottom = (i64::from(current.rect.y) + i64::from(current.rect.height))
+                .min(i64::from(m.rect.y) + i64::from(m.rect.height));
+            let overlap = (bottom - top).max(0);
+            (
+                (i64::from(mx) - i64::from(cx)).abs(),
+                std::cmp::Reverse(overlap),
+                (i64::from(my) - i64::from(cy)).abs(),
+                m.id,
+            )
+        })
+}
+
+/// Find the closest monitor whose center is to the left, preferring vertical overlap.
+pub fn monitor_left_of(monitors: &[MonitorInfo], current_id: MonitorId) -> Option<&MonitorInfo> {
+    horizontal_monitor(monitors, current_id, true)
+}
+
+/// Find the closest monitor whose center is to the right, preferring vertical overlap.
+pub fn monitor_right_of(monitors: &[MonitorInfo], current_id: MonitorId) -> Option<&MonitorInfo> {
+    horizontal_monitor(monitors, current_id, false)
 }
 
 /// Find the monitor above the given one: of those whose center sits higher
@@ -561,11 +608,7 @@ pub(crate) fn should_emit_window_event_with_policy(
         String::new()
     };
 
-    if should_skip_window_by_class(&class_name) {
-        return false;
-    }
-
-    true
+    !should_skip_window_by_class(&class_name)
 }
 
 pub(crate) fn should_emit_window_event(hwnd: HWND) -> bool {
@@ -580,7 +623,7 @@ pub(crate) fn should_emit_window_event_for(event: u32, hwnd: HWND) -> bool {
     match event {
         // Creation can happen before title is set; keep manageability checks but
         // allow empty title and cloaked transitional states.
-        EVENT_OBJECT_CREATE | EVENT_OBJECT_SHOW => {
+        EVENT_OBJECT_CREATE | EVENT_OBJECT_SHOW | EVENT_OBJECT_UNCLOAKED => {
             should_emit_window_event_with_policy(hwnd, true, false, false)
         }
         // Focus must not be blocked by cloaked-state checks or empty titles.
@@ -607,6 +650,7 @@ pub(crate) fn should_filter_window_event_by_manageability(event: u32) -> bool {
         EVENT_OBJECT_CREATE
             | EVENT_OBJECT_DESTROY
             | EVENT_OBJECT_SHOW
+            | EVENT_OBJECT_UNCLOAKED
             | EVENT_OBJECT_HIDE
             | EVENT_SYSTEM_FOREGROUND
             | EVENT_SYSTEM_MINIMIZESTART
@@ -956,6 +1000,105 @@ mod tests {
 
         let no_right = monitor_to_right(&monitors, 2);
         assert!(no_right.is_none());
+    }
+
+    #[test]
+    fn horizontal_neighbors_use_distance_then_overlap_and_vertical_distance() {
+        let cases = [
+            (
+                "side by side",
+                vec![Rect::new(0, 0, 100, 100), Rect::new(100, 0, 100, 100)],
+                vec![(1, None, Some(2)), (2, Some(1), None)],
+            ),
+            (
+                "stacked",
+                vec![Rect::new(0, 0, 100, 100), Rect::new(0, 100, 100, 100)],
+                vec![(1, None, None), (2, None, None)],
+            ),
+            (
+                "l shape",
+                vec![
+                    Rect::new(0, 0, 100, 100),
+                    Rect::new(0, 100, 100, 100),
+                    Rect::new(100, 0, 100, 100),
+                ],
+                vec![(1, None, Some(3)), (2, None, Some(3)), (3, Some(1), None)],
+            ),
+            (
+                "grid",
+                vec![
+                    Rect::new(0, 0, 100, 100),
+                    Rect::new(0, 100, 100, 100),
+                    Rect::new(100, 0, 100, 100),
+                    Rect::new(100, 100, 100, 100),
+                ],
+                vec![
+                    (1, None, Some(3)),
+                    (2, None, Some(4)),
+                    (3, Some(1), None),
+                    (4, Some(2), None),
+                ],
+            ),
+            (
+                "overlap before vertical distance",
+                vec![
+                    Rect::new(0, 0, 1000, 1000),
+                    Rect::new(1300, 0, 400, 200),
+                    Rect::new(1000, 700, 1000, 600),
+                ],
+                vec![(1, None, Some(3))],
+            ),
+            (
+                "vertical distance breaks overlap tie",
+                vec![
+                    Rect::new(0, 0, 1000, 1000),
+                    Rect::new(1000, -400, 1000, 600),
+                    Rect::new(1000, 800, 1000, 300),
+                ],
+                vec![(1, None, Some(3))],
+            ),
+            (
+                "horizontal distance first",
+                vec![
+                    Rect::new(0, 0, 1000, 1000),
+                    Rect::new(1100, 1200, 400, 400),
+                    Rect::new(1000, 0, 1000, 1000),
+                ],
+                vec![(1, None, Some(2))],
+            ),
+            (
+                "single",
+                vec![Rect::new(0, 0, 100, 100)],
+                vec![(1, None, None)],
+            ),
+        ];
+        for (name, rects, expected) in cases {
+            let monitors: Vec<_> = (1_isize..)
+                .zip(rects)
+                .map(|(id, rect)| MonitorInfo {
+                    id,
+                    rect,
+                    work_area: rect,
+                    is_primary: id == 1,
+                    device_name: String::new(),
+                    scale_factor: 1.0,
+                })
+                .collect();
+            for (current, left, right) in expected {
+                assert_eq!(
+                    monitor_left_of(&monitors, current).map(|m| m.id),
+                    left,
+                    "{name} left from {current}"
+                );
+                assert_eq!(
+                    monitor_right_of(&monitors, current).map(|m| m.id),
+                    right,
+                    "{name} right from {current}"
+                );
+            }
+            assert!(monitor_left_of(&monitors, 99).is_none());
+            assert!(monitor_right_of(&monitors, 99).is_none());
+        }
     }
 
     #[test]

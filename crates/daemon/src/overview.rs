@@ -320,7 +320,9 @@ impl AppState {
         } else {
             layout_overview_rows(work_area.width, work_area.height, ws_vec.len())
         };
-        let focused_wid = ws_vec.get(active_idx).and_then(|ws| ws.focused_window());
+        let focused_wid = self
+            .focused_floating_window()
+            .or_else(|| ws_vec.get(active_idx).and_then(|ws| ws.focused_window()));
         let accent_width = self.config.appearance.active_border_width.max(1);
         let device_name = self
             .monitors
@@ -490,10 +492,9 @@ impl AppState {
         u32::try_from(self.config.animation.overview_duration_ms).unwrap_or(0)
     }
 
-    // Include scrolled-out columns in one uniform strip transform. Floating
-    // windows are viewport-anchored, so translate them by the scroll offset.
-    // Fullscreen collapses to one viewport-sized card unless selection follows
-    // another window in its underlying strip. Return content width for panel wrap.
+    // Include scrolled-out columns and packed floats in one uniform transform,
+    // rotated to physical space on portrait monitors. Return content length
+    // along the scroll axis for panel wrap.
     #[allow(clippy::too_many_arguments)]
     fn overview_cards_for(
         &self,
@@ -510,8 +511,12 @@ impl AppState {
         let virtual_viewport = Rect::new(0, 0, full_w, layout_vp.height);
         let scroll = ws.scroll_offset().round() as i32;
         let viewport_region_layout = Rect::new(scroll, 0, layout_vp.width, layout_vp.height);
+        // Strip space starts at 0 like the overlay's client area, so rotate
+        // about a zero origin: the work area's own origin would offset tiles
+        // from floats on a portrait monitor that is not at (0, 0).
+        let strip_origin = Rect::new(0, 0, work_area.width, work_area.height);
         let viewport_region = if orient.is_vertical() {
-            crate::monitors::rotate_layout_rect(viewport_region_layout, work_area)
+            crate::monitors::rotate_layout_rect(viewport_region_layout, strip_origin)
         } else {
             viewport_region_layout
         };
@@ -519,12 +524,13 @@ impl AppState {
         let fullscreen = ws
             .fullscreen_window_id()
             .filter(|&wid| ws.contains_window(wid) && !ws.is_minimized(wid))
-            .filter(|&wid| selected_wid.is_none_or(|selected| selected == wid));
+            .filter(|&wid| {
+                selected_wid.is_none_or(|selected| selected == wid || ws.is_floating(selected))
+            });
         let sources: Vec<(u64, Rect, Option<usize>)> = if let Some(fs_wid) = fullscreen {
             vec![(fs_wid, viewport_region, None)]
         } else {
-            let mut sources: Vec<(u64, Rect, Option<usize>)> = ws
-                .placements_for_full_strip(virtual_viewport)
+            ws.placements_for_full_strip(virtual_viewport)
                 .into_iter()
                 .filter(|p| {
                     p.visibility == Visibility::Visible
@@ -532,45 +538,40 @@ impl AppState {
                         && p.column_index != usize::MAX // floats handled below
                 })
                 .map(|p| {
+                    let row_scroll = ws.scroll_offset_for_row(p.row_index).round() as i32;
+                    let rect = Rect::new(
+                        p.rect.x - row_scroll + scroll,
+                        p.rect.y,
+                        p.rect.width,
+                        p.rect.height,
+                    );
                     // Rotate layout-space rects to physical for vertical monitors.
-                    let r = if orient.is_vertical() {
-                        crate::monitors::rotate_layout_rect(p.rect, work_area)
+                    let rect = if orient.is_vertical() {
+                        crate::monitors::rotate_layout_rect(rect, strip_origin)
                     } else {
-                        p.rect
+                        rect
                     };
                     let tab_count = ws
-                        .column(p.column_index)
+                        .rows()
+                        .get(p.row_index)
+                        .and_then(|r| r.column(p.column_index))
                         .filter(|c| c.is_tabbed() && c.len() > 1)
                         .map(leopardwm_core_layout::Column::len);
-                    (p.window_id, r, tab_count)
+                    (p.window_id, rect, tab_count)
                 })
-                .collect();
-            for f in ws.floating_windows() {
-                if ws.is_minimized(f.id) {
-                    continue; // matches the tiled path's visibility filter
-                }
-                // Floating windows are in physical space. For hmon the scroll
-                // offset is on X; for vmon it maps to Y (layout X = physical Y).
-                let strip_rect = if orient.is_vertical() {
-                    Rect::new(
-                        f.rect.x - work_area.x,
-                        f.rect.y - work_area.y + scroll,
-                        f.rect.width,
-                        f.rect.height,
-                    )
-                } else {
-                    Rect::new(
-                        f.rect.x - work_area.x + scroll,
-                        f.rect.y - work_area.y,
-                        f.rect.width,
-                        f.rect.height,
-                    )
-                };
-                sources.push((f.id, strip_rect, None));
-            }
-            sources
+                .collect()
         };
-        if sources.is_empty() {
+        let mut floats: Vec<_> = ws
+            .floating_windows()
+            .iter()
+            .filter(|f| !ws.is_minimized(f.id) && Some(f.id) != fullscreen)
+            .collect();
+        if orient.is_vertical() {
+            floats.sort_by_key(|f| (f.rect.y, f.rect.x, f.id));
+        } else {
+            floats.sort_by_key(|f| (f.rect.x, f.rect.y, f.id));
+        }
+        if sources.is_empty() && floats.is_empty() {
             return (Vec::new(), Rect::new(strip.x, strip.y, 0, 0), None);
         }
 
@@ -612,28 +613,107 @@ impl AppState {
         // omit it (and its reserve) so the panel hugs the cards instead
         // of carrying phantom viewport width at the workspace edge.
         let any_out = has_left || has_right;
-        let reserve = boundary_gap * (i32::from(has_left) + i32::from(has_right));
-
-        // With the ring shown, content bounds include the viewport region
-        // so the ring never escapes the row even when the strip is
-        // narrower than the screen.
-        let content = if any_out {
+        let tiled_content = (!sources.is_empty()).then(|| {
             bounding_box(
                 sources
                     .iter()
                     .map(|(_, r, _)| *r)
-                    .chain(std::iter::once(viewport_region)),
+                    .chain(any_out.then_some(viewport_region)),
+            )
+        });
+        let vertical = orient.is_vertical();
+        let boundary_reserve = boundary_gap * (i32::from(has_left) + i32::from(has_right));
+        let has_group_gap = !floats.is_empty() && tiled_content.is_some();
+        let gap_units = floats.len().saturating_sub(1) as i32 + 3 * i32::from(has_group_gap);
+        let mut float_gap =
+            VIEWPORT_RING_PAD + self.config.appearance.active_border_width.max(1) as i32 + 4;
+        if gap_units > 0 {
+            float_gap = float_gap
+                .min((orient.primary_size(strip) - boundary_reserve - 1).max(0) / gap_units);
+        }
+        let group_gap = 3 * float_gap * i32::from(has_group_gap);
+        let packed_gaps = floats.len().saturating_sub(1) as i32 * float_gap;
+        let reserve = boundary_reserve + group_gap + packed_gaps;
+
+        // DWM thumbnails cover painted cards, so floats must not overlap tiles.
+        // They pack before the tiles along the scroll axis: to the left on
+        // landscape monitors, above on portrait ones.
+        let floats: Vec<_> = floats
+            .into_iter()
+            .map(|f| {
+                let width = f.rect.width.max(1);
+                let height = f.rect.height.max(1);
+                let scale = 1.0_f64
+                    .min(f64::from(work_area.width.max(1)) / f64::from(width))
+                    .min(f64::from(work_area.height.max(1)) / f64::from(height));
+                (
+                    f,
+                    (f64::from(width) * scale).round().max(1.0) as i32,
+                    (f64::from(height) * scale).round().max(1.0) as i32,
+                )
+            })
+            .collect();
+        let group_len: i32 = floats
+            .iter()
+            .map(|(_, width, height)| if vertical { *height } else { *width })
+            .sum();
+        let mut pos = tiled_content.map_or(0, |r| orient.primary(r)) - group_len;
+        let packed_floats: Vec<_> = floats
+            .into_iter()
+            .map(|(f, width, height)| {
+                // Floating windows are in physical space; the scroll offset
+                // lies on X for landscape and on Y for portrait monitors.
+                let (scroll_x, scroll_y) = if vertical { (0, scroll) } else { (scroll, 0) };
+                let real = Rect::new(
+                    f.rect.x - work_area.x + scroll_x,
+                    f.rect.y - work_area.y + scroll_y,
+                    f.rect.width,
+                    f.rect.height,
+                );
+                let packed = if vertical {
+                    let x = real.x.clamp(0, (work_area.width - width).max(0));
+                    Rect::new(x, pos, width, height)
+                } else {
+                    let y = real.y.clamp(0, (work_area.height - height).max(0));
+                    Rect::new(pos, y, width, height)
+                };
+                pos += if vertical { height } else { width };
+                (f.id, real, packed)
+            })
+            .collect();
+        let mut content = bounding_box(
+            tiled_content
+                .into_iter()
+                .chain(packed_floats.iter().map(|(_, _, packed)| *packed)),
+        );
+        if !packed_floats.is_empty() {
+            if vertical {
+                let right = (content.x + content.width).max(work_area.width);
+                content.x = content.x.min(0);
+                content.width = right - content.x;
+            } else {
+                let bottom = (content.y + content.height).max(work_area.height);
+                content.y = content.y.min(0);
+                content.height = bottom - content.y;
+            }
+        }
+        // Reserve space from the primary axis of the strip for the gaps.
+        let fit_strip = if vertical {
+            Rect::new(
+                strip.x,
+                strip.y,
+                strip.width,
+                (strip.height - reserve).max(1),
             )
         } else {
-            bounding_box(sources.iter().map(|(_, r, _)| *r))
+            Rect::new(
+                strip.x,
+                strip.y,
+                (strip.width - reserve).max(1),
+                strip.height,
+            )
         };
-        // Reserve space from the primary axis of the strip for boundary gaps.
-        let fit_strip = if orient.is_vertical() {
-            Rect::new(strip.x, strip.y, strip.width, (strip.height - reserve).max(1))
-        } else {
-            Rect::new(strip.x, strip.y, (strip.width - reserve).max(1), strip.height)
-        };
-        let mut xform = if orient.is_vertical() {
+        let mut xform = if vertical {
             StripTransform::fit_top(&content, &fit_strip)
         } else {
             StripTransform::fit(&content, &fit_strip)
@@ -654,10 +734,20 @@ impl AppState {
         let snapshots = self.config.overview.render == crate::config::OverviewRender::Snapshot;
         let cards = sources
             .into_iter()
-            .map(|(wid, r, tab_count)| {
-                let mut rect = xform.apply(&r);
-                let shift = out_dir(&r) * boundary_gap;
-                if orient.is_vertical() {
+            .map(|(wid, r, tab_count)| (wid, r, r, tab_count, None))
+            .chain(
+                packed_floats
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, (wid, real, packed))| (wid, real, packed, None, Some(index))),
+            )
+            .map(|(wid, r, display, tab_count, float_index)| {
+                let mut rect = xform.apply(&display);
+                let shift = match float_index {
+                    Some(index) => index as i32 * float_gap - i32::from(has_left) * boundary_gap,
+                    None => group_gap + packed_gaps + out_dir(&r) * boundary_gap,
+                };
+                if vertical {
                     rect.y += shift;
                 } else {
                     rect.x += shift;
@@ -699,9 +789,14 @@ impl AppState {
             Rect::new(strip.x, strip.y, 0, 0)
         } else {
             let v = xform.apply(&viewport_region);
+            let (shift_x, shift_y) = if vertical {
+                (0, group_gap + packed_gaps)
+            } else {
+                (group_gap + packed_gaps, 0)
+            };
             Rect::new(
-                v.x - VIEWPORT_RING_PAD,
-                v.y - VIEWPORT_RING_PAD,
+                v.x + shift_x - VIEWPORT_RING_PAD,
+                v.y + shift_y - VIEWPORT_RING_PAD,
                 v.width + 2 * VIEWPORT_RING_PAD,
                 v.height + 2 * VIEWPORT_RING_PAD,
             )
@@ -856,6 +951,68 @@ impl AppState {
         }
     }
 
+    pub(crate) fn activate_overview_window(&mut self, wid: u64) {
+        // Resolve the target workspace BEFORE hiding so the close
+        // animation zooms toward the activated workspace's row.
+        let target = self.find_window_workspace(wid);
+        self.hide_overview_animated(target.map(|(_, ws_idx)| ws_idx));
+        let Some((monitor, ws_idx)) = target else {
+            tracing::debug!("Overview activate: window {} no longer managed", wid);
+            return;
+        };
+        let viewport_width = self.viewport_width_for(monitor);
+        let follows_focus = self.config.behavior.fullscreen_follows_focus;
+        let workspace = &mut self.workspaces.get_mut(&monitor).unwrap()[ws_idx];
+        let floating = workspace.is_floating(wid);
+        if !floating {
+            let _ = workspace.focus_window(wid);
+        }
+        let switching = ws_idx != self.active_workspace_idx(monitor);
+        self.focused_monitor = monitor;
+        if switching {
+            if !floating {
+                let workspace = &mut self.workspaces.get_mut(&monitor).unwrap()[ws_idx];
+                workspace.stop_animation();
+                workspace.ensure_focused_visible(viewport_width);
+            }
+            let resp = self.switch_workspace_on_monitor(
+                monitor,
+                (ws_idx + 1) as u8,
+                None,
+                false,
+                Some(wid),
+            );
+            if let leopardwm_ipc::IpcResponse::Error { message } = resp {
+                warn!(
+                    "Overview workspace switch failed: {}",
+                    leopardwm_ipc::log_text::text(message)
+                );
+                return;
+            }
+        } else {
+            let workspace = self.focused_workspace_mut().unwrap();
+            let revealed = crate::command_handler::prepare_workspace_for_focus(
+                workspace,
+                wid,
+                follows_focus,
+                viewport_width,
+            );
+            if !floating && !revealed {
+                workspace.ensure_focused_visible_animated(viewport_width);
+            }
+            if let Err(error) = self.apply_layout() {
+                warn!("Overview layout application failed: {}", error);
+                return;
+            }
+            self.sync_taskbar_buttons();
+        }
+        // Tiled focus flows through the workspace; floating focus is
+        // tracked via previous_focused_hwnd (same split as elsewhere).
+        self.previous_focused_hwnd = floating.then_some(wid);
+        let _ = leopardwm_platform_win32::set_foreground_window(wid);
+        self.sync_foreground_window();
+    }
+
     pub(crate) fn refresh_overview_model(&mut self) {
         if !self.overview_open {
             return;
@@ -889,7 +1046,7 @@ mod tests {
     use leopardwm_platform_win32::MonitorInfo;
 
     fn test_state() -> AppState {
-        AppState::new_with_config(
+        let mut state = AppState::new_with_config(
             Config::default(),
             vec![MonitorInfo {
                 id: 1,
@@ -899,7 +1056,14 @@ mod tests {
                 device_name: "DISPLAY1".to_string(),
                 scale_factor: 1.0,
             }],
-        )
+        );
+        state.reduce_motion = false;
+        for ws_vec in state.workspaces.values_mut() {
+            for ws in ws_vec.iter_mut() {
+                ws.set_reduce_motion(false);
+            }
+        }
+        state
     }
 
     fn add_windows(state: &mut AppState, ws_idx: usize, wids: &[u64]) {
@@ -907,6 +1071,177 @@ mod tests {
         for &wid in wids {
             ws.insert_window(wid, None).unwrap();
         }
+    }
+
+    #[test]
+    fn overview_activation_resolves_fullscreen_for_selected_window() {
+        use windows::core::w;
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, WINDOW_EX_STYLE, WINDOW_STYLE,
+        };
+
+        struct TestWindow(HWND);
+        impl Drop for TestWindow {
+            fn drop(&mut self) {
+                let _ = unsafe { DestroyWindow(self.0) };
+            }
+        }
+
+        let fullscreen = TestWindow(unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                w!("STATIC"),
+                w!(""),
+                WINDOW_STYLE::default(),
+                0,
+                0,
+                200,
+                100,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+        });
+        let fullscreen_hwnd = fullscreen.0 .0 as u64;
+        for (
+            floating,
+            pinned,
+            fullscreen_float,
+            follows_focus,
+            destination,
+            animated,
+            expected_fullscreen,
+        ) in [
+            (true, false, false, false, 0, false, None),
+            (true, false, false, true, 1, false, None),
+            (true, false, false, true, 1, true, None),
+            (true, true, false, true, 0, false, Some(fullscreen_hwnd)),
+            (false, false, false, false, 0, false, None),
+            (false, false, false, true, 1, true, Some(0)),
+            (false, false, true, true, 0, false, None),
+        ] {
+            let mut state = test_state();
+            state.paused = false;
+            state.reduce_motion = !animated;
+            state.injected_apply_placements_behavior =
+                Some(crate::state::TestApplyPlacementsBehavior::SleepAndSucceed(
+                    std::time::Duration::ZERO,
+                ));
+            let ws = state.ensure_workspace_exists(1, destination).unwrap();
+            if fullscreen_float {
+                ws.add_floating(fullscreen_hwnd, Rect::new(0, 0, 300, 300))
+                    .unwrap();
+            } else {
+                ws.insert_window(fullscreen_hwnd, Some(800)).unwrap();
+            }
+            if floating {
+                ws.add_floating(0, Rect::new(40, 50, 300, 400)).unwrap();
+                ws.set_floating_pinned(0, pinned);
+            } else {
+                ws.insert_window(0, Some(800)).unwrap();
+            }
+            if !fullscreen_float {
+                ws.focus_window(fullscreen_hwnd).unwrap();
+            }
+            assert!(ws.toggle_fullscreen_window(fullscreen_hwnd));
+            if pinned {
+                state.sticky_windows.insert(0);
+            }
+            state.config.behavior.fullscreen_follows_focus = follows_focus;
+            state.overview_open = true;
+            state.activate_overview_window(0);
+            if animated {
+                assert!(state.layout_transition.is_some());
+                state.tick_animations(10_000);
+                state.apply_layout().unwrap();
+            }
+
+            let ws = state.focused_workspace().unwrap();
+            assert_eq!(state.active_workspace_idx(1), destination);
+            assert_eq!(ws.fullscreen_window_id(), expected_fullscreen, "floating={floating}, pinned={pinned}, follows_focus={follows_focus}, destination={destination}");
+            assert_eq!(state.previous_focused_hwnd, Some(0));
+            let placement = state
+                .workspace_placements(1, destination)
+                .into_iter()
+                .find(|p| p.window_id == 0)
+                .unwrap();
+            assert_eq!(placement.visibility, Visibility::Visible);
+            assert!(state.last_placed_layout_rects.contains_key(&0));
+        }
+    }
+
+    #[test]
+    fn overview_activation_reveals_offscreen_tiled_window() {
+        use crate::state::TestApplyPlacementsBehavior;
+        use std::time::Duration;
+
+        for destination in [0, 1] {
+            for fullscreen in [false, true] {
+                for follows_focus in [false, true] {
+                    let mut state = test_state();
+                    state.paused = false;
+                    state.reduce_motion = true;
+                    state.config.behavior.fullscreen_follows_focus = follows_focus;
+                    state.injected_apply_placements_behavior =
+                        Some(TestApplyPlacementsBehavior::SleepAndSucceed(Duration::ZERO));
+                    let ws = state.ensure_workspace_exists(1, destination).unwrap();
+                    ws.set_reduce_motion(true);
+                    for wid in [101, 201, 301] {
+                        ws.insert_window(wid, Some(1100)).unwrap();
+                    }
+                    ws.focus_window(101).unwrap();
+                    ws.set_scroll_offset(0.0);
+                    if fullscreen {
+                        assert!(ws.toggle_fullscreen_window(101));
+                    } else {
+                        let placement = state
+                            .workspace_placements(1, destination)
+                            .into_iter()
+                            .find(|p| p.window_id == 301)
+                            .unwrap();
+                        assert_eq!(placement.visibility, Visibility::OffScreenRight);
+                    }
+                    state.activate_overview_window(301);
+                    let placement = state
+                        .workspace_placements(1, destination)
+                        .into_iter()
+                        .find(|p| p.window_id == 301)
+                        .unwrap();
+                    assert_eq!(placement.visibility, Visibility::Visible,
+                        "destination={destination}, fullscreen={fullscreen}, follows_focus={follows_focus}");
+                    assert_eq!(state.active_workspace_idx(1), destination);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn overview_activation_does_not_sync_focus_after_layout_failure() {
+        use crate::state::TestApplyPlacementsBehavior;
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+
+        let mut state = test_state();
+        state.paused = false;
+        state.reduce_motion = true;
+        state.workspaces.get_mut(&1).unwrap()[0].set_reduce_motion(true);
+        add_windows(&mut state, 0, &[101, 201]);
+        state.previous_focused_hwnd = Some(101);
+        state.injected_apply_placements_behavior =
+            Some(TestApplyPlacementsBehavior::SleepAndFail(Duration::ZERO));
+
+        state.activate_overview_window(201);
+
+        assert!(
+            state
+                .injected_apply_placements_call_count
+                .load(Ordering::SeqCst)
+                > 0
+        );
+        assert_eq!(state.previous_focused_hwnd, Some(101));
     }
 
     #[test]
@@ -1977,6 +2312,62 @@ mod tests {
     }
 
     #[test]
+    fn test_portrait_floats_stack_above_tiles_inside_the_panel() {
+        // The second monitor sits right of and above the primary one.
+        for (x, y) in [(0, 0), (1920, -400)] {
+            let mut state = AppState::new_with_config(
+                Config::default(),
+                vec![MonitorInfo {
+                    id: 1,
+                    rect: Rect::new(x, y, 1080, 1920),
+                    work_area: Rect::new(x, y, 1080, 1880),
+                    is_primary: true,
+                    device_name: "DISPLAY1".to_string(),
+                    scale_factor: 1.0,
+                }],
+            );
+            add_windows(&mut state, 0, &[101]);
+            let ws = &mut state.workspaces.get_mut(&1).unwrap()[0];
+            ws.add_floating(302, Rect::new(x + 100, y + 900, 500, 400))
+                .unwrap();
+            ws.add_floating(301, Rect::new(x + 300, y + 100, 500, 400))
+                .unwrap();
+
+            let (_, model) = state.build_overview_model().expect("model");
+            let row = &model.rows[0];
+            let card = |wid: u64| row.cards.iter().find(|c| c.window_id == wid).unwrap();
+            let (tile, top, bottom) = (card(101).rect, card(301).rect, card(302).rect);
+            let case = format!("monitor at ({x}, {y})");
+            assert!(
+                top.y + top.height < bottom.y,
+                "{case}: sorted top to bottom"
+            );
+            assert!(
+                bottom.y + bottom.height < tile.y,
+                "{case}: floats sit above the tile"
+            );
+            for rect in [tile, top, bottom] {
+                assert!(
+                    rect.x >= row.panel.x
+                        && rect.x + rect.width <= row.panel.x + row.panel.width
+                        && rect.y >= row.label_strip.y + row.label_strip.height
+                        && rect.y + rect.height <= row.panel.y + row.panel.height,
+                    "{case}: card {rect:?} escapes panel {:?}",
+                    row.panel
+                );
+            }
+            // Real placements are in overlay client coords, whatever the
+            // monitor's position.
+            let from = card(101).from_rect.unwrap();
+            assert!(
+                from.x >= 0 && from.x + from.width <= 1080,
+                "{case}: {from:?}"
+            );
+            assert_eq!(card(301).from_rect, Some(Rect::new(300, 100, 500, 400)));
+        }
+    }
+
+    #[test]
     fn test_centered_rows_keep_cards_and_viewport_inside_panel_body() {
         for overflow in [false, true] {
             let mut state = test_state();
@@ -2314,7 +2705,7 @@ mod tests {
         add_windows(&mut state, 0, &[101]);
         let ws = &mut state.workspaces.get_mut(&1).unwrap()[0];
         ws.set_all_column_widths(400);
-        ws.set_center_single_column(true);
+        ws.set_center_columns(leopardwm_core_layout::CenterColumns::Single);
         ws.set_scroll_offset(137.0);
         ws.reconcile_scroll_bounds(1920);
         let (_, model) = state.build_overview_model().expect("model");
@@ -2519,5 +2910,289 @@ mod tests {
         };
         assert!(!card(101).live, "ghost-handled window stays placeholder");
         assert!(card(102).live, "other windows stay live");
+    }
+
+    fn assert_float_before_tiles(row: &OverviewRow, float_id: u64) {
+        let float = row.cards.iter().find(|c| c.window_id == float_id).unwrap();
+        for tile in row.cards.iter().filter(|c| c.window_id != float_id) {
+            assert!(
+                float.rect.x + float.rect.width < tile.rect.x,
+                "float {:?}, tile {:?}",
+                float.rect,
+                tile.rect
+            );
+        }
+        assert!(float.rect.x >= row.panel.x + ROW_INNER_PAD);
+        assert!(float.rect.x + float.rect.width <= row.panel.x + row.panel.width - ROW_INNER_PAD);
+        assert!(float.rect.y >= row.label_strip.y + row.label_strip.height + ROW_INNER_PAD);
+        assert!(float.rect.y + float.rect.height <= row.panel.y + row.panel.height - ROW_INNER_PAD);
+    }
+
+    #[test]
+    fn float_group_packs_inactive_and_active_rows_and_preserves_real_origin() {
+        let mut state = test_state();
+        state.monitors.get_mut(&1).unwrap().work_area = Rect::new(300, 200, 1920, 1040);
+        add_windows(&mut state, 0, &[101]);
+        add_windows(&mut state, 1, &[201]);
+        for idx in [0, 1] {
+            let ws = &mut state.workspaces.get_mut(&1).unwrap()[idx];
+            ws.set_scroll_offset(150.0);
+            ws.add_floating(301 + idx as u64, Rect::new(400, 300, 500, 400))
+                .unwrap();
+        }
+        let (_, model) = state.build_overview_model().unwrap();
+        for (idx, row) in model.rows.iter().enumerate() {
+            let wid = 301 + idx as u64;
+            assert_float_before_tiles(row, wid);
+            let float = row.cards.iter().find(|c| c.window_id == wid).unwrap();
+            assert_eq!(float.from_rect, Some(Rect::new(100, 100, 500, 400)));
+            let tile = &row.cards[0];
+            let tile_width = tile.from_rect.unwrap().width;
+            let float_scale = f64::from(float.rect.width + 2 * CARD_INSET) / 500.0;
+            let tile_scale = f64::from(tile.rect.width + 2 * CARD_INSET) / f64::from(tile_width);
+            assert!((float_scale - tile_scale).abs() < 0.005);
+            assert_eq!(row.cards.last().unwrap().window_id, wid);
+            assert_eq!(row.viewport.width, 0);
+        }
+    }
+
+    #[test]
+    fn focused_float_is_initial_selection_and_does_not_create_a_ring() {
+        let mut state = test_state();
+        add_windows(&mut state, 0, &[101]);
+        state.workspaces.get_mut(&1).unwrap()[0]
+            .add_floating(301, Rect::new(-2000, 100, 500, 400))
+            .unwrap();
+        state.previous_focused_hwnd = Some(301);
+        let (_, model) = state.build_overview_model().unwrap();
+        let row = &model.rows[0];
+        assert_eq!(
+            row.cards
+                .iter()
+                .filter(|c| c.selected)
+                .map(|c| c.window_id)
+                .collect::<Vec<_>>(),
+            vec![301]
+        );
+        assert_eq!(row.viewport.width, 0);
+        assert_float_before_tiles(row, 301);
+    }
+
+    #[test]
+    fn float_group_keeps_separation_and_ring_clearance_for_overflow() {
+        for scroll in [0.0, 2100.0] {
+            let mut state = test_state();
+            add_windows(&mut state, 0, &[101, 102, 103, 104]);
+            let ws = &mut state.workspaces.get_mut(&1).unwrap()[0];
+            ws.set_all_column_widths(1000);
+            ws.set_scroll_offset(scroll);
+            ws.add_floating(301, Rect::new(100, 100, 500, 400)).unwrap();
+            let (_, model) = state.build_overview_model().unwrap();
+            let row = &model.rows[0];
+            assert_float_before_tiles(row, 301);
+            assert!(row.viewport.width > 0);
+            let float = row.cards.iter().find(|c| c.window_id == 301).unwrap();
+            assert!(
+                float.rect.x + float.rect.width <= row.viewport.x - model.accent_width as i32 - 4
+            );
+            let left_tiles = row
+                .cards
+                .iter()
+                .filter(|c| c.window_id != 301 && c.rect.x + c.rect.width < row.viewport.x)
+                .count();
+            assert_eq!(left_tiles > 0, scroll > 0.0);
+            if scroll == 0.0 {
+                assert!(row
+                    .cards
+                    .iter()
+                    .any(|c| c.window_id != 301 && c.rect.x > row.viewport.x + row.viewport.width));
+            }
+            for card in &row.cards {
+                assert!(
+                    card.rect.x >= row.panel.x
+                        && card.rect.x + card.rect.width <= row.panel.x + row.panel.width
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn float_only_workspace_preserves_vertical_offset() {
+        let mut state = test_state();
+        state.workspaces.get_mut(&1).unwrap()[0]
+            .add_floating(301, Rect::new(100, 50, 500, 300))
+            .unwrap();
+        let (_, top) = state.build_overview_model().unwrap();
+        let ws = &mut state.workspaces.get_mut(&1).unwrap()[0];
+        assert!(ws.update_floating(301, Rect::new(100, 600, 500, 300)));
+        let (_, bottom) = state.build_overview_model().unwrap();
+        assert!(top.rows[0].cards[0].rect.y < bottom.rows[0].cards[0].rect.y);
+        assert_eq!(top.rows[0].viewport.width, 0);
+        assert_eq!(bottom.rows[0].viewport.width, 0);
+    }
+
+    #[test]
+    fn floats_are_sorted_packed_and_clamped_to_the_body() {
+        let mut state = test_state();
+        add_windows(&mut state, 0, &[101]);
+        let ws = &mut state.workspaces.get_mut(&1).unwrap()[0];
+        for (id, rect) in [
+            (305, Rect::new(100, 100, 500, 400)),
+            (303, Rect::new(100, 100, 500, 400)),
+            (302, Rect::new(100, -100, 500, 400)),
+            (301, Rect::new(-100, 1200, 3000, 2000)),
+        ] {
+            ws.add_floating(id, rect).unwrap();
+        }
+        let (_, model) = state.build_overview_model().unwrap();
+        let row = &model.rows[0];
+        assert_eq!(
+            row.cards.iter().map(|c| c.window_id).collect::<Vec<_>>(),
+            vec![101, 301, 302, 303, 305]
+        );
+        for pair in row.cards[1..].windows(2) {
+            assert!(pair[0].rect.x + pair[0].rect.width < pair[1].rect.x);
+        }
+        let last = row.cards.last().unwrap();
+        let float_gap = row.cards[3].rect.x - (row.cards[2].rect.x + row.cards[2].rect.width);
+        let group_gap = row.cards[0].rect.x - (last.rect.x + last.rect.width);
+        assert!(
+            group_gap >= 2 * float_gap,
+            "group {group_gap}, float {float_gap}"
+        );
+        let oversized = row.cards[1].rect;
+        let width = oversized.width + 2 * CARD_INSET;
+        let height = oversized.height + 2 * CARD_INSET;
+        assert!((2 * width - 3 * height).abs() <= 5);
+        for card in &row.cards[1..] {
+            assert!(card.rect.x >= row.panel.x + ROW_INNER_PAD);
+            assert!(card.rect.x + card.rect.width <= row.panel.x + row.panel.width - ROW_INNER_PAD);
+            assert!(card.rect.y >= row.label_strip.y + row.label_strip.height + ROW_INNER_PAD);
+            assert!(
+                card.rect.y + card.rect.height <= row.panel.y + row.panel.height - ROW_INNER_PAD
+            );
+        }
+        assert_eq!(
+            row.cards[1].from_rect,
+            Some(Rect::new(-100, 1200, 3000, 2000))
+        );
+        assert!(row.cards[2].rect.y < row.cards[3].rect.y);
+    }
+
+    #[test]
+    fn many_floats_stay_inside_panel_and_backdrop() {
+        for with_tile in [false, true] {
+            let mut state = test_state();
+            state.monitors.get_mut(&1).unwrap().work_area = Rect::new(0, 0, 800, 600);
+            if with_tile {
+                add_windows(&mut state, 0, &[101]);
+            }
+            let ws = &mut state.workspaces.get_mut(&1).unwrap()[0];
+            for id in 1000..1100 {
+                ws.add_floating(id, Rect::new(0, 0, 100, 100)).unwrap();
+            }
+            let (_, model) = state.build_overview_model().unwrap();
+            let row = &model.rows[0];
+            assert_eq!(row.cards.len(), 100 + usize::from(with_tile));
+            for card in &row.cards {
+                for bounds in [row.panel, model.backdrop] {
+                    assert!(
+                        card.rect.x >= bounds.x
+                            && card.rect.y >= bounds.y
+                            && card.rect.x + card.rect.width <= bounds.x + bounds.width
+                            && card.rect.y + card.rect.height <= bounds.y + bounds.height,
+                        "card {:?} outside {:?} (with_tile={with_tile})",
+                        card.rect,
+                        bounds
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fullscreen_float_appears_once_with_viewport_origin() {
+        let mut state = test_state();
+        let ws = &mut state.workspaces.get_mut(&1).unwrap()[0];
+        ws.add_floating(301, Rect::new(100, 150, 500, 400)).unwrap();
+        ws.add_floating(302, Rect::new(300, 250, 600, 500)).unwrap();
+        assert!(ws.toggle_fullscreen_window(301));
+        let (_, model) = state
+            .build_overview_model_with_selection(Some(301))
+            .unwrap();
+        let row = &model.rows[0];
+        assert_eq!(
+            row.cards.iter().map(|c| c.window_id).collect::<Vec<_>>(),
+            vec![301, 302]
+        );
+        assert_eq!(row.cards[0].from_rect, Some(Rect::new(0, 0, 1920, 1040)));
+        assert_float_before_tiles(row, 302);
+    }
+
+    #[test]
+    fn fullscreen_and_multi_row_keep_floats_separate() {
+        let mut state = test_state();
+        add_windows(&mut state, 0, &[101, 102]);
+        let ws = &mut state.workspaces.get_mut(&1).unwrap()[0];
+        assert!(ws.toggle_fullscreen());
+        let fullscreen = ws.fullscreen_window_id().unwrap();
+        ws.add_floating(301, Rect::new(100, 100, 500, 400)).unwrap();
+        for selection in [None, Some(301)] {
+            let (_, model) = state
+                .build_overview_model_with_selection(selection)
+                .unwrap();
+            let row = &model.rows[0];
+            assert_eq!(
+                row.cards.iter().map(|c| c.window_id).collect::<Vec<_>>(),
+                vec![fullscreen, 301]
+            );
+            assert_float_before_tiles(row, 301);
+        }
+        let other = if fullscreen == 101 { 102 } else { 101 };
+        let (_, expanded) = state
+            .build_overview_model_with_selection(Some(other))
+            .unwrap();
+        assert_eq!(expanded.rows[0].cards.len(), 3);
+        assert_float_before_tiles(&expanded.rows[0], 301);
+        let mut state = test_state();
+        let ws = &mut state.workspaces.get_mut(&1).unwrap()[0];
+        ws.set_row_layout(&[0.5, 0.5]);
+        ws.insert_window_in_row(101, 0, Some(800)).unwrap();
+        ws.insert_window_in_row(201, 1, Some(800)).unwrap();
+        ws.add_floating(301, Rect::new(100, 100, 500, 400)).unwrap();
+        let (_, model) = state.build_overview_model().unwrap();
+        assert_float_before_tiles(&model.rows[0], 301);
+    }
+
+    #[test]
+    fn test_multi_row_overview_uses_per_row_scroll_offset() {
+        let mut state = test_state();
+        {
+            let ws = &mut state.workspaces.get_mut(&1).unwrap()[0];
+            ws.set_row_layout(&[0.5, 0.5]);
+            ws.insert_window_in_row(101, 0, Some(800)).unwrap();
+            ws.insert_window_in_row(201, 1, Some(800)).unwrap();
+            ws.insert_window_in_row(202, 1, Some(800)).unwrap();
+            ws.set_scroll_offset_for_row(0, 0.0);
+            ws.set_scroll_offset_for_row(1, 500.0);
+        }
+
+        let (_, model) = state.build_overview_model().expect("model");
+        let card_101 = model.rows[0]
+            .cards
+            .iter()
+            .find(|c| c.window_id == 101)
+            .unwrap();
+        let card_201 = model.rows[0]
+            .cards
+            .iter()
+            .find(|c| c.window_id == 201)
+            .unwrap();
+        // Both windows are at column 0 in their respective rows, but row 1 is
+        // scrolled by 500px, so card 201's on-screen from_rect.x is 500px left of card 101's.
+        assert_eq!(
+            card_201.from_rect.unwrap().x,
+            card_101.from_rect.unwrap().x - 500
+        );
     }
 }

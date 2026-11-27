@@ -2,22 +2,45 @@ use crate::helpers::ScaledLayoutParams;
 use crate::state::*;
 use anyhow::Result;
 use leopardwm_core_layout::Workspace;
+use leopardwm_ipc::log_text;
 use leopardwm_platform_win32::MonitorId;
 use std::collections::{HashMap, HashSet};
 use tracing::{debug, info, warn};
+
+const MAX_SAVED_WORKSPACES: usize = 9;
 
 fn saved_workspace_slot(index: usize) -> usize {
     // Clamp to the 1-9 workspace range (0-based 0..=8). The snapshot is
     // user-writable JSON, so a garbage index must not drive the vec to
     // pathological length on startup.
-    index.min(8)
+    index.min(MAX_SAVED_WORKSPACES - 1)
 }
 
 impl AppState {
+    fn apply_saved_workspace_params(
+        &self,
+        ws: &mut Workspace,
+        ws_idx: usize,
+        params: &ScaledLayoutParams,
+        device_name: &str,
+    ) {
+        params.apply_to(ws, ws_idx);
+        self.config.apply_monitor_rules(device_name, ws);
+        ws.set_center_columns(self.config.center_columns_for(device_name).into());
+        ws.set_reduce_motion(self.reduce_motion);
+        ws.set_scroll_animation(
+            self.config.animation.scroll_duration_ms,
+            self.config.animation.easing,
+        );
+    }
+
     pub(crate) fn save_state(&self) -> Result<()> {
         let json = self.build_state_json()?;
         Self::write_state_file(&json)?;
-        info!("Workspace state saved to {:?}", Self::state_file_path());
+        info!(
+            "Workspace state saved to {}",
+            log_text::path(Self::state_file_path().display())
+        );
         Ok(())
     }
 
@@ -88,6 +111,7 @@ impl AppState {
             focused_monitor_name: focused_name,
             active_workspace: active_ws_map,
             tab_title_overrides: self.tab_title_overrides.clone(),
+            stashed_monitor_layouts: self.stashed_monitor_layouts.clone(),
         };
 
         let json = serde_json::to_string_pretty(&snapshot)?;
@@ -97,7 +121,7 @@ impl AppState {
     /// Cheap deterministic hash for save-request deduplication: focused
     /// monitor, per-monitor active workspace index, every workspace's
     /// requested column widths + membership + floating windows + rounded
-    /// scroll offset, and tab title override
+    /// scroll offset, stashed monitor layouts, and tab title override
     /// keys/value lengths. Used to dedup save requests so unchanged
     /// state (e.g. mid-animation frames with no structural delta) does
     /// not enqueue a write.
@@ -117,12 +141,18 @@ impl AppState {
             self.active_workspace_idx(monitor_id).hash(&mut hasher);
             if let Some(ws_vec) = self.workspaces.get(&monitor_id) {
                 for workspace in ws_vec {
-                    for column in workspace.columns() {
-                        column.width().hash(&mut hasher);
-                        column.windows().len().hash(&mut hasher);
-                        for &wid in column.windows() {
-                            wid.hash(&mut hasher);
+                    workspace.rows().len().hash(&mut hasher);
+                    workspace.focused_row().hash(&mut hasher);
+                    for row in workspace.rows() {
+                        row.columns().len().hash(&mut hasher);
+                        for column in row.columns() {
+                            column.width().hash(&mut hasher);
+                            column.windows().len().hash(&mut hasher);
+                            for &wid in column.windows() {
+                                wid.hash(&mut hasher);
+                            }
                         }
+                        (row.scroll_offset().round() as i64).hash(&mut hasher);
                     }
                     for f in workspace.floating_windows() {
                         f.id.hash(&mut hasher);
@@ -131,9 +161,17 @@ impl AppState {
                         f.rect.width.hash(&mut hasher);
                         f.rect.height.hash(&mut hasher);
                     }
-                    (workspace.scroll_offset().round() as i64).hash(&mut hasher);
                 }
             }
+        }
+
+        let mut stashes: Vec<_> = self.stashed_monitor_layouts.iter().collect();
+        stashes.sort_unstable_by_key(|(name, _)| *name);
+        for (name, stash) in stashes {
+            name.hash(&mut hasher);
+            serde_json::to_vec(stash)
+                .expect("stash serialization")
+                .hash(&mut hasher);
         }
 
         let mut overrides: Vec<(u64, usize)> = self
@@ -167,7 +205,7 @@ impl AppState {
             Ok(json) => match serde_json::from_str(&json) {
                 Ok(snapshot) => Some(snapshot),
                 Err(e) => {
-                    warn!("Failed to parse saved state: {}", e);
+                    warn!("Failed to parse saved state: {}", log_text::text(e));
                     None
                 }
             },
@@ -199,15 +237,19 @@ impl AppState {
         &mut self,
         snapshot: &StateSnapshot,
     ) -> HashSet<(MonitorId, usize)> {
-        let restored_slots = self.restore_workspace_structure_with(snapshot, |hwnd| {
-            // Keep a saved window only if it's still alive AND manageable. An
-            // elevated window a non-elevated daemon can't reposition would
-            // otherwise restore as a column we can never fill (a ghost column);
-            // dropping it here lets enumerate re-see it, record it, and notify.
-            leopardwm_platform_win32::is_valid_window(hwnd)
-                && !leopardwm_platform_win32::is_excluded_window_class_hwnd(hwnd)
-                && !leopardwm_platform_win32::window_manage_block(hwnd).is_blocked()
-        });
+        let restored_slots = self.restore_workspace_structure_with(
+            snapshot,
+            leopardwm_platform_win32::current_session_logon_epoch_seconds(),
+            |hwnd| {
+                // Keep a saved window only if it's still alive AND manageable. An
+                // elevated window a non-elevated daemon can't reposition would
+                // otherwise restore as a column we can never fill (a ghost column);
+                // dropping it here lets enumerate re-see it, record it, and notify.
+                leopardwm_platform_win32::is_valid_window(hwnd)
+                    && !leopardwm_platform_win32::is_excluded_window_class_hwnd(hwnd)
+                    && !leopardwm_platform_win32::window_manage_block(hwnd).is_blocked()
+            },
+        );
         self.disable_snap_for_all_tiled_windows();
         restored_slots
     }
@@ -215,6 +257,7 @@ impl AppState {
     pub(crate) fn restore_workspace_structure_with(
         &mut self,
         snapshot: &StateSnapshot,
+        session_start: Option<u64>,
         keep: impl Fn(u64) -> bool,
     ) -> HashSet<(MonitorId, usize)> {
         let mut restored_slots = HashSet::new();
@@ -228,7 +271,7 @@ impl AppState {
             else {
                 debug!(
                     "Skipping saved workspace for unknown monitor '{}'",
-                    ws_snapshot.monitor_device_name
+                    log_text::text(&ws_snapshot.monitor_device_name)
                 );
                 continue;
             };
@@ -271,18 +314,15 @@ impl AppState {
                 vw,
                 device_name,
             );
-            params.apply_to(&mut ws);
-            self.config.apply_monitor_rules(device_name, &mut ws);
-            ws.set_reduce_motion(self.reduce_motion);
-            ws.set_scroll_animation(
-                self.config.animation.scroll_duration_ms,
-                self.config.animation.easing,
-            );
-            ws.set_scroll_offset(ws_snapshot.workspace.scroll_offset());
+            self.apply_saved_workspace_params(&mut ws, ws_idx, &params, device_name);
+            for (r_idx, saved_row) in ws_snapshot.workspace.rows().iter().enumerate() {
+                ws.set_scroll_offset_for_row(r_idx, saved_row.scroll_offset());
+            }
             ws.reconcile_scroll_bounds(vw);
 
             let entry = self.workspaces.entry(monitor_id).or_default();
             while entry.len() <= ws_idx {
+                let cur_idx = entry.len();
                 let mut empty = Workspace::with_directional_gaps(
                     params.gap,
                     params.outer_gap_left,
@@ -290,9 +330,9 @@ impl AppState {
                     params.outer_gap_top,
                     params.outer_gap_bottom,
                 );
-                empty.set_default_column_width(params.default_column_width);
-                empty.set_tab_strip_reserve_px(params.tab_strip_reserve_px);
+                params.apply_to(&mut empty, cur_idx);
                 self.config.apply_monitor_rules(device_name, &mut empty);
+                empty.set_center_columns(self.config.center_columns_for(device_name).into());
                 empty.set_reduce_motion(self.reduce_motion);
                 empty.set_scroll_animation(
                     self.config.animation.scroll_duration_ms,
@@ -304,8 +344,92 @@ impl AppState {
             restored_slots.insert((monitor_id, ws_idx));
             info!(
                 "Restored workspace structure for monitor '{}' workspace {}",
-                ws_snapshot.monitor_device_name, ws_idx
+                log_text::text(&ws_snapshot.monitor_device_name),
+                ws_idx
             );
+        }
+
+        if !snapshot.stashed_monitor_layouts.is_empty()
+            && !session_start
+                .zip(snapshot.saved_at.parse::<u64>().ok())
+                .is_some_and(|(session, saved)| saved >= session)
+        {
+            info!(
+                "Discarded stashed monitor layouts not known to be saved during the current logon session"
+            );
+            return restored_slots;
+        }
+
+        for (name, saved) in &snapshot.stashed_monitor_layouts {
+            let mut stash = saved.clone();
+            stash.workspaces.truncate(MAX_SAVED_WORKSPACES);
+            let connected = self
+                .monitors
+                .values()
+                .find(|m| &m.device_name == name)
+                .cloned();
+            let scale = connected.as_ref().map_or(1.0, |m| m.scale_factor);
+            let params = ScaledLayoutParams::from_config(
+                &self.config,
+                scale,
+                stash.source_viewport_width,
+                name,
+            );
+            let mut dropped = 0;
+            for (idx, ws) in stash.workspaces.iter_mut().enumerate() {
+                for wid in ws.all_window_ids() {
+                    if !keep(wid) {
+                        if ws.is_floating(wid) {
+                            ws.remove_floating(wid);
+                        } else {
+                            let _ = ws.remove_window(wid);
+                        }
+                        dropped += 1;
+                    }
+                }
+                let gap = ws.gap();
+                let (left, right, top, bottom) = ws.outer_gaps();
+                self.apply_saved_workspace_params(ws, idx, &params, name);
+                ws.set_gap(gap);
+                ws.set_outer_gaps(left, right, top, bottom);
+            }
+            if dropped > 0 {
+                info!(
+                    "Dropped {} invalid window(s) from stashed monitor {}",
+                    dropped,
+                    log_text::name(name)
+                );
+            }
+            if !stash
+                .workspaces
+                .iter()
+                .any(|ws| !ws.all_window_ids().is_empty())
+            {
+                continue;
+            }
+            self.stashed_monitor_layouts.insert(name.clone(), stash);
+        }
+
+        let monitors: Vec<_> = self.monitors.values().cloned().collect();
+        for monitor in monitors {
+            if let Some(stash) = self.stashed_monitor_layouts.remove(&monitor.device_name) {
+                let source_width = self.restore_stashed_monitor_layout(&monitor, stash);
+                let viewport_width = crate::monitors::monitor_viewport_width(&monitor);
+                let params = ScaledLayoutParams::from_config(
+                    &self.config,
+                    monitor.scale_factor,
+                    viewport_width,
+                    &monitor.device_name,
+                );
+                let workspaces = self.workspaces.get_mut(&monitor.id).unwrap();
+                crate::monitors::apply_reconciled_geometry(
+                    workspaces,
+                    &params,
+                    source_width,
+                    viewport_width,
+                );
+                restored_slots.extend((0..workspaces.len()).map(|idx| (monitor.id, idx)));
+            }
         }
 
         restored_slots
@@ -352,6 +476,7 @@ impl AppState {
                         device_name,
                     );
                     while ws_vec.len() <= ws_idx {
+                        let cur_idx = ws_vec.len();
                         let mut ws = Workspace::with_directional_gaps(
                             params.gap,
                             params.outer_gap_left,
@@ -359,9 +484,9 @@ impl AppState {
                             params.outer_gap_top,
                             params.outer_gap_bottom,
                         );
-                        ws.set_default_column_width(params.default_column_width);
-                        ws.set_tab_strip_reserve_px(params.tab_strip_reserve_px);
+                        params.apply_to(&mut ws, cur_idx);
                         self.config.apply_monitor_rules(device_name, &mut ws);
+                        ws.set_center_columns(self.config.center_columns_for(device_name).into());
                         ws.set_reduce_motion(self.reduce_motion);
                         ws.set_scroll_animation(
                             self.config.animation.scroll_duration_ms,
@@ -369,21 +494,25 @@ impl AppState {
                         );
                         ws_vec.push(ws);
                     }
-                    let saved_offset = ws_snapshot.workspace.scroll_offset();
                     self.config
                         .apply_monitor_rules(device_name, &mut ws_vec[ws_idx]);
-                    ws_vec[ws_idx].set_scroll_offset(saved_offset);
+                    ws_vec[ws_idx]
+                        .set_center_columns(self.config.center_columns_for(device_name).into());
+                    for (r_idx, saved_row) in ws_snapshot.workspace.rows().iter().enumerate() {
+                        ws_vec[ws_idx].set_scroll_offset_for_row(r_idx, saved_row.scroll_offset());
+                    }
                     ws_vec[ws_idx].reconcile_scroll_bounds(vw);
                     restored_monitors.insert(id);
                     info!(
                         "Restored workspace state for monitor '{}' workspace {}",
-                        ws_snapshot.monitor_device_name, ws_idx
+                        log_text::text(&ws_snapshot.monitor_device_name),
+                        ws_idx
                     );
                 }
             } else {
                 debug!(
                     "Skipping saved workspace for unknown monitor '{}'",
-                    ws_snapshot.monitor_device_name
+                    log_text::text(&ws_snapshot.monitor_device_name)
                 );
             }
         }
@@ -423,8 +552,9 @@ impl AppState {
                 self.tab_title_overrides.insert(hwnd, title.clone());
             } else {
                 debug!(
-                    "Pruning stale tab title override for dead HWND {}: {:?}",
-                    hwnd, title
+                    "Pruning stale tab title override for dead HWND {}: {}",
+                    hwnd,
+                    log_text::title(title)
                 );
             }
         }

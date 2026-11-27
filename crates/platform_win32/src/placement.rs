@@ -5,6 +5,7 @@ mod mover;
 use crate::types::{PlatformConfig, Win32Error};
 use crate::window_id_to_hwnd;
 use leopardwm_core_layout::{Rect, Visibility, WindowId, WindowPlacement};
+use leopardwm_ipc::log_text;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Mutex;
@@ -555,9 +556,22 @@ struct DeferEntry {
     flags: windows::Win32::UI::WindowsAndMessaging::SET_WINDOW_POS_FLAGS,
     column_index: usize,
     offscreen_rect: Option<Rect>,
+    frame_refresh: Option<u64>,
 }
 
 impl DeferEntry {
+    fn clear_frame_refresh(&self) {
+        if let Some(generation) = self.frame_refresh {
+            clear_frame_refresh_at_target(
+                self.window_id,
+                self.hwnd,
+                generation,
+                Rect::new(self.x, self.y, self.w, self.h),
+                self.flags,
+            );
+        }
+    }
+
     fn position_only(
         hwnd: HWND,
         window_id: WindowId,
@@ -581,7 +595,38 @@ impl DeferEntry {
             flags: flags | SWP_NOSIZE,
             column_index: usize::MAX,
             offscreen_rect: None,
+            frame_refresh: None,
         }
+    }
+}
+
+pub(crate) fn clear_frame_refresh_at_target(
+    window_id: WindowId,
+    hwnd: HWND,
+    generation: u64,
+    mut target: Rect,
+    flags: SET_WINDOW_POS_FLAGS,
+) {
+    use windows::Win32::Graphics::Gdi::{MonitorFromRect, MONITOR_DEFAULTTONULL};
+    if !flags.contains(SWP_FRAMECHANGED) || flags.contains(SWP_ASYNCWINDOWPOS) {
+        return;
+    }
+    if flags.contains(SWP_NOSIZE) {
+        let mut current = RECT::default();
+        if unsafe { GetWindowRect(hwnd, &mut current) }.is_err() {
+            return;
+        }
+        target.width = current.right - current.left;
+        target.height = current.bottom - current.top;
+    }
+    let rect = RECT {
+        left: target.x,
+        top: target.y,
+        right: target.x.saturating_add(target.width),
+        bottom: target.y.saturating_add(target.height),
+    };
+    if !unsafe { MonitorFromRect(&rect, MONITOR_DEFAULTTONULL).0.is_null() } {
+        crate::window_style::clear_frame_refresh(window_id, generation);
     }
 }
 
@@ -1045,14 +1090,21 @@ fn skip_visible_tiled_maximized(
                 let Ok(hwnd) = window_id_to_hwnd(placement.window_id) else {
                     return false;
                 };
+                let frame_refresh = crate::window_style::frame_refresh(placement.window_id, hwnd);
+                let flags = if frame_refresh.is_some() {
+                    flags | SWP_FRAMECHANGED
+                } else {
+                    flags
+                };
                 if mover::is_marked(placement.window_id) {
-                    let entry = DeferEntry::position_only(
+                    let mut entry = DeferEntry::position_only(
                         hwnd,
                         placement.window_id,
                         placement.rect.x,
                         placement.rect.y,
                         flags,
                     );
+                    entry.frame_refresh = frame_refresh;
                     if async_flag.contains(SWP_ASYNCWINDOWPOS) {
                         mover::submit(&entry, generation);
                         return true;
@@ -1060,10 +1112,22 @@ fn skip_visible_tiled_maximized(
                     return mover::seal(&entry);
                 }
                 origin = observed_async_position(hwnd);
-                unsafe {
+                let success = unsafe {
                     SetWindowPos(hwnd, None, placement.rect.x, placement.rect.y, 0, 0, flags)
                         .is_ok()
+                };
+                if success {
+                    if let Some(mark) = frame_refresh {
+                        clear_frame_refresh_at_target(
+                            placement.window_id,
+                            hwnd,
+                            mark,
+                            Rect::new(placement.rect.x, placement.rect.y, 0, 0),
+                            flags,
+                        );
+                    }
                 }
+                success
             });
         *async_recovery = recovery == ParkedRecoveryOutcome::Succeeded && pending;
         *failed_recovery = recovery == ParkedRecoveryOutcome::Failed;
@@ -1195,7 +1259,11 @@ fn build_defer_entries(
             }
             continue;
         }
+        let frame_refresh = (placement.visibility == Visibility::Visible)
+            .then(|| crate::window_style::frame_refresh(placement.window_id, hwnd))
+            .flatten();
         if !force_positioning
+            && frame_refresh.is_none()
             && cache.as_deref().is_some_and(|cache| {
                 cache.positions.get(&placement.window_id)
                     == Some(&(placement.rect, placement.visibility))
@@ -1228,7 +1296,7 @@ fn build_defer_entries(
             let needs_frame_changed = cache
                 .as_ref()
                 .is_none_or(|cache| !cache.positions.contains_key(&placement.window_id));
-            if needs_frame_changed {
+            if needs_frame_changed || frame_refresh.is_some() {
                 flags |= SWP_FRAMECHANGED;
             }
             entries.push(DeferEntry {
@@ -1247,6 +1315,7 @@ fn build_defer_entries(
                 flags,
                 column_index: placement.column_index,
                 offscreen_rect: None,
+                frame_refresh,
             });
         } else {
             // SWP_NOSIZE avoids resize side-effects; SetWindowPos ignores w/h.
@@ -1280,6 +1349,7 @@ fn build_defer_entries(
                 flags: SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | async_flag,
                 column_index: placement.column_index,
                 offscreen_rect: actual_rect.map(|rect| Rect::new(x, y, rect.width, rect.height)),
+                frame_refresh: None,
             });
         }
     }
@@ -1575,7 +1645,11 @@ fn position_entries_for_pending(
                 entry.y,
                 entry.w,
                 entry.h,
-                (entry.flags & !SWP_FRAMECHANGED) | SWP_ASYNCWINDOWPOS,
+                (if entry.frame_refresh.is_some() {
+                    entry.flags
+                } else {
+                    entry.flags & !SWP_FRAMECHANGED
+                }) | SWP_ASYNCWINDOWPOS,
             )
         },
         position_entries_batch,
@@ -1630,7 +1704,8 @@ where
         if !(post_animation_landing
             || deferrals.pending.contains(&entry.window_id)
             || deferrals.probe_expired.contains(&entry.window_id))
-            || queued_endpoints.get(&entry.window_id) == Some(&endpoint_target)
+            || (entry.frame_refresh.is_none()
+                && queued_endpoints.get(&entry.window_id) == Some(&endpoint_target))
         {
             continue;
         }
@@ -1674,6 +1749,7 @@ where
         if batch_failures.contains(&entry.window_id) {
             continue;
         }
+        entry.clear_frame_refresh();
         if entry.flags.contains(SWP_ASYNCWINDOWPOS) {
             record_async_position(entry, origin);
         } else if !post_animation_landing && !deferrals.probe_expired.contains(&entry.window_id) {
@@ -2041,7 +2117,8 @@ fn position_entries_batch(entries: &[DeferEntry]) -> HashSet<u64> {
                 Ok(initial_hdwp) => {
                     let mut hdwp = initial_hdwp;
                     let mut batch_ok = true;
-                    for entry in entries {
+                    let mut failed_index = 0;
+                    for (index, entry) in entries.iter().enumerate() {
                         match DeferWindowPos(
                             hdwp,
                             entry.hwnd,
@@ -2055,6 +2132,7 @@ fn position_entries_batch(entries: &[DeferEntry]) -> HashSet<u64> {
                             Ok(new_hdwp) => hdwp = new_hdwp,
                             Err(_) => {
                                 batch_ok = false;
+                                failed_index = index;
                                 break;
                             }
                         }
@@ -2078,9 +2156,16 @@ fn position_entries_batch(entries: &[DeferEntry]) -> HashSet<u64> {
                             }
                         }
                     } else {
-                        // DeferWindowPos failed — HDWP is already freed by Win32.
-                        // Fall back to individual SetWindowPos calls.
-                        for entry in entries {
+                        // Win32 says to abandon a failed batch, but a rejected window left its HDWP
+                        // allocated: 100 abandoned batches leaked 100 USER objects; ending them leaked
+                        // none. A live daemon held 1628 of 1718 USER objects as HDWPs (#180).
+                        // Ending applies prior entries; if End fails, every entry falls back.
+                        let fallback = if EndDeferWindowPos(hdwp).is_ok() {
+                            &entries[failed_index..]
+                        } else {
+                            entries
+                        };
+                        for entry in fallback {
                             if SetWindowPos(
                                 entry.hwnd,
                                 None,
@@ -2667,14 +2752,14 @@ fn nudge_sticky_compositor_windows(targets: &[NudgeTarget]) {
                 // is diagnosable; the next apply will correct geometry.
                 tracing::warn!(
                     "Nudge restore SetWindowPos failed for hwnd={:?} class={} — window left at w-1 until next apply: {:?}",
-                    t.hwnd, class, e
+                    t.hwnd, log_text::name(class), e
                 );
                 continue;
             }
         }
         tracing::debug!(
             "Nudged sticky-compositor window (class={}, hwnd={:?})",
-            class,
+            log_text::name(class),
             t.hwnd
         );
     }
@@ -3130,6 +3215,7 @@ pub(crate) mod tests {
             rect: Rect::new(destination.0, destination.1, 800, 600),
             visibility: Visibility::Visible,
             column_index: 0,
+            row_index: 0,
         };
         let placements = [placement];
         let measured = Rect::new(100, 100, 800, 600);
@@ -3232,6 +3318,7 @@ pub(crate) mod tests {
             rect: Rect::new(400, 100, 800, 600),
             visibility: Visibility::Visible,
             column_index: 0,
+            row_index: 0,
         }];
         let landings = collect_placement_landings_with_recoveries(
             &placements,
@@ -3502,6 +3589,7 @@ pub(crate) mod tests {
                     flags,
                     column_index: 0,
                     offscreen_rect: None,
+                    frame_refresh: None,
                 };
                 position_entries(&[entry], landing)
             };
@@ -3632,6 +3720,7 @@ pub(crate) mod tests {
                     flags,
                     column_index: 0,
                     offscreen_rect: None,
+                    frame_refresh: None,
                 };
                 position_entries(&[entry], landing)
             })
@@ -4256,6 +4345,7 @@ pub(crate) mod tests {
             flags: SET_WINDOW_POS_FLAGS(0),
             column_index: 0,
             offscreen_rect: None,
+            frame_refresh: None,
         }
     }
 
@@ -4888,6 +4978,82 @@ pub(crate) mod tests {
         }
     }
 
+    fn run_in_placement_test_process(test_name: &str) -> bool {
+        const CHILD_ENV: &str = "LEOPARDWM_TEST_PLACEMENT_CHILD";
+        if std::env::var(CHILD_ENV).as_deref() == Ok(test_name) {
+            return false;
+        }
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test_name, "--nocapture"])
+            .env(CHILD_ENV, test_name)
+            .spawn()
+            .unwrap();
+        let started = std::time::Instant::now();
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if started.elapsed() >= std::time::Duration::from_secs(30) {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("placement test child exceeded its deadline: {test_name}");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert!(
+            status.success(),
+            "placement test child failed: {test_name}: {status}"
+        );
+        true
+    }
+
+    #[test]
+    fn failed_deferred_batch_does_not_leak_user_objects() {
+        use windows::Win32::System::Threading::{
+            GetCurrentProcess, GetGuiResources, GR_USEROBJECTS,
+        };
+
+        if run_in_placement_test_process(
+            "placement::tests::failed_deferred_batch_does_not_leak_user_objects",
+        ) {
+            return;
+        }
+        let window = HiddenPopup::new(48, 48, 160, 120);
+        let suffix_window = HiddenPopup::new(60, 60, 160, 120);
+        let entries = [
+            DeferEntry {
+                hwnd: window.hwnd,
+                x: 300,
+                y: 100,
+                flags: SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER,
+                ..fresh_inset_entry(window.id, 0)
+            },
+            fresh_inset_entry(0, 0),
+            DeferEntry {
+                hwnd: suffix_window.hwnd,
+                x: 500,
+                y: 200,
+                flags: SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER,
+                ..fresh_inset_entry(suffix_window.id, 0)
+            },
+        ];
+        let user_objects = || unsafe { GetGuiResources(GetCurrentProcess(), GR_USEROBJECTS) };
+        let before = user_objects();
+        for _ in 0..256 {
+            let failures = position_entries_batch(&entries);
+            assert_eq!(failures, HashSet::from([0]));
+        }
+        let after = user_objects();
+        let growth = i64::from(after) - i64::from(before);
+        println!("USER objects: before={before}, after={after}, growth={growth}");
+        assert_eq!(growth, 0, "failed batches leaked USER objects");
+        assert_eq!(observed_async_position(window.hwnd), Some((300, 100)));
+        assert_eq!(
+            observed_async_position(suffix_window.hwnd),
+            Some((500, 200))
+        );
+    }
+
     #[test]
     fn queued_move_synchronous_landing_does_not_credit_never_applying_owner() {
         let _owner_sweep = OWNER_SWEEP
@@ -5426,6 +5592,7 @@ pub(crate) mod tests {
             rect: Rect::new(0, 0, 800, 600),
             visibility: Visibility::OffScreenLeft,
             column_index: 0,
+            row_index: 0,
         }];
 
         let result = apply_placements(&placements, &config, None, false).unwrap();
@@ -5496,6 +5663,7 @@ pub(crate) mod tests {
             rect: Rect::new(0, 0, 800, 600),
             visibility: Visibility::Visible,
             column_index: 0,
+            row_index: 0,
         };
         let mut cache = PlacementCache::new();
         cache
@@ -5550,6 +5718,7 @@ pub(crate) mod tests {
             rect: Rect::new(0, 0, 800, 600),
             visibility: Visibility::Visible,
             column_index: 0,
+            row_index: 0,
         };
         let landing_flags = SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE;
 
@@ -5734,6 +5903,7 @@ pub(crate) mod tests {
             rect,
             visibility,
             column_index: 0,
+            row_index: 0,
         }
     }
 

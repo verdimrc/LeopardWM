@@ -99,6 +99,7 @@ impl AppState {
         let Some((mon, ws_idx)) = self.find_window_workspace(wid) else {
             return false;
         };
+        let viewport_width = self.viewport_width_for(mon);
         if let Some(ws) = self
             .workspaces
             .get_mut(&mon)
@@ -106,8 +107,8 @@ impl AppState {
         {
             if ws.is_floating(wid) {
                 ws.remove_floating(wid);
-            } else {
-                let _ = ws.remove_window(wid);
+            } else if ws.remove_window(wid).is_ok() {
+                ws.reconcile_scroll_bounds(viewport_width);
             }
             return true;
         }
@@ -254,7 +255,13 @@ impl AppState {
         if let Some(sp) = self.scratchpad {
             if sp.window_id == wid {
                 self.scratchpad = None;
-                self.release_to_tiling(wid, sp.origin_column, sp.origin_sibling, sp.frame_insets);
+                self.release_to_tiling(
+                    wid,
+                    sp.origin_row,
+                    sp.origin_column,
+                    sp.origin_sibling,
+                    sp.frame_insets,
+                );
                 // Keep focus on the returned window — it was focused while
                 // summoned, so re-tiling it (especially back into a stack)
                 // shouldn't hand focus to a sibling.
@@ -284,6 +291,7 @@ impl AppState {
         if let Some(prev) = self.scratchpad.take() {
             self.release_to_tiling(
                 prev.window_id,
+                prev.origin_row,
                 prev.origin_column,
                 prev.origin_sibling,
                 prev.frame_insets,
@@ -291,25 +299,25 @@ impl AppState {
         }
 
         // Remember where it sat so releasing later restores it to the same
-        // spot: the column index (fallback) and a window that shared the
+        // spot: the row and column indices (fallback) and a window that shared the
         // column (so it can rejoin that exact column even if indices shift).
-        let (origin_column, origin_sibling) = self
+        let (origin_row, origin_column, origin_sibling) = self
             .focused_workspace()
             .and_then(|ws| {
-                ws.find_window_location(wid).map(|(col, _)| {
+                ws.find_window_location_rc(wid).map(|(r, col, _)| {
                     let sibling = ws
-                        .columns()
-                        .get(col)
+                        .rows()
+                        .get(r)
+                        .and_then(|row| row.column(col))
                         .and_then(|c| c.windows().iter().copied().find(|&w| w != wid));
-                    (col, sibling)
+                    (r, col, sibling)
                 })
             })
             .unwrap_or_else(|| {
-                let col = self
-                    .focused_workspace()
-                    .map(|ws| ws.focused_column_index())
-                    .unwrap_or(0);
-                (col, None)
+                let ws = self.focused_workspace();
+                let r = ws.map(|w| w.focused_row()).unwrap_or(0);
+                let col = ws.map(|w| w.focused_column_index()).unwrap_or(0);
+                (r, col, None)
             });
 
         let frame_insets = self.scratchpad_frame_insets(wid, None);
@@ -323,10 +331,15 @@ impl AppState {
             shown: false,
             saved_rect: None,
             frame_insets,
+            origin_row,
             origin_column,
             origin_sibling,
         });
+        let was_managed = self.find_window_workspace(wid).is_some();
         self.hide_window_to_holding(wid);
+        if was_managed && self.find_window_workspace(wid).is_none() {
+            self.forget_stashed_windows(&[wid]);
+        }
         let _ = self.apply_layout();
         self.sync_foreground_window();
         info!("Scratchpad: stashed window {}", wid);
@@ -341,6 +354,7 @@ impl AppState {
     fn release_to_tiling(
         &mut self,
         wid: u64,
+        origin_row: usize,
         origin_column: usize,
         origin_sibling: Option<u64>,
         frame_insets: Option<FrameInsets>,
@@ -351,12 +365,14 @@ impl AppState {
         let reinserted = self
             .focused_workspace_mut()
             .map(|ws| {
-                let rejoin_column = origin_sibling
-                    .and_then(|s| ws.find_window_location(s))
-                    .map(|(col, _)| col);
-                match rejoin_column {
-                    Some(col) => ws.insert_window_in_column(wid, col).is_ok(),
-                    None => ws.insert_window_at_column(wid, None, origin_column).is_ok(),
+                let rejoin_loc = origin_sibling
+                    .and_then(|s| ws.find_window_location_rc(s))
+                    .map(|(r, col, _)| (r, col));
+                match rejoin_loc {
+                    Some((r, col)) => ws.insert_window_in_row_column(wid, r, col).is_ok(),
+                    None => ws
+                        .insert_window_at_row_column(wid, origin_row, None, origin_column)
+                        .is_ok(),
                 }
             })
             .unwrap_or(false);

@@ -3,8 +3,9 @@ use super::*;
 #[cfg(test)]
 impl Workspace {
     pub fn test_set_focus_unchecked(&mut self, column: usize, win: usize) {
-        self.focused_column = column;
-        self.focused_window_in_column = win;
+        let fr = self.focused_row;
+        self.rows[fr].focused_column = column;
+        self.rows[fr].focused_window_in_column = win;
     }
 }
 
@@ -24,7 +25,7 @@ mod tests {
     }
 
     #[test]
-    fn test_center_columns_when_narrower_centers_all_columns_until_they_overflow() {
+    fn test_fit_centers_all_columns_until_they_overflow() {
         let viewport = Rect::new(100, 50, 1000, 600);
         // Visible width 960; two 300px columns + 10px gap = 610, so 175px of
         // space on each side: A starts at 100 + 20 + 175, B 310px later.
@@ -42,7 +43,8 @@ mod tests {
                         "rtl={rtl}, past_edges={past_edges}, reduce_motion={reduce_motion}"
                     );
                     let mut ws = Workspace::with_gaps(10, 20);
-                    ws.set_centering_mode(CenteringMode::CenterColumnsWhenNarrower);
+                    ws.set_center_columns(CenterColumns::Fit);
+                    ws.set_centering_mode(CenteringMode::JustInView);
                     ws.set_rtl(rtl);
                     ws.set_center_past_edges(past_edges);
                     ws.set_reduce_motion(reduce_motion);
@@ -108,7 +110,7 @@ mod tests {
     }
 
     #[test]
-    fn test_center_columns_when_narrower_treats_near_full_screen_as_full() {
+    fn test_fit_treats_near_full_screen_as_full() {
         // Columns that leave at most `full_screen_tolerance_px` free count as
         // a full screen, so Ctrl+Alt+C centers the focused (last) window; more
         // free space keeps the group centered and Ctrl+Alt+C does nothing.
@@ -126,7 +128,8 @@ mod tests {
                     "widths={widths:?}, tolerance={tolerance}, reduce_motion={reduce_motion}"
                 );
                 let mut ws = gapless_workspace();
-                ws.set_centering_mode(CenteringMode::CenterColumnsWhenNarrower);
+                ws.set_center_columns(CenterColumns::Fit);
+                ws.set_centering_mode(CenteringMode::JustInView);
                 ws.set_center_past_edges(true);
                 ws.set_full_screen_tolerance_px(tolerance);
                 ws.set_reduce_motion(reduce_motion);
@@ -212,7 +215,11 @@ mod tests {
                 ws.set_centering_mode(CenteringMode::JustInView);
                 ws.set_rtl(rtl);
                 ws.set_right_aligned(right_aligned);
-                ws.set_center_single_column(center_single_column);
+                ws.set_center_columns(if center_single_column {
+                    CenterColumns::Single
+                } else {
+                    CenterColumns::Off
+                });
                 ws.set_reduce_motion(!animate);
                 for id in 1..=3 {
                     ws.insert_window(id, Some(300)).unwrap();
@@ -255,18 +262,167 @@ mod tests {
     }
 
     #[test]
+    fn test_right_aligned_pins_every_row_right() {
+        // Row 0 holds 300 + 300 on a 1000px screen, row 1 a single 400: each
+        // row's strip ends at the right edge, also after Ctrl+Alt+C.
+        for reduce_motion in [true, false] {
+            let mut ws = gapless_workspace();
+            ws.set_centering_mode(CenteringMode::JustInView);
+            ws.set_right_aligned(true);
+            ws.set_reduce_motion(reduce_motion);
+            ws.set_row_layout(&[0.5, 0.5]);
+            ws.focus_row(0);
+            ws.insert_window(1, Some(300)).unwrap();
+            ws.insert_window(2, Some(300)).unwrap();
+            ws.focus_row(1);
+            ws.insert_window(3, Some(400)).unwrap();
+            ws.reconcile_scroll_bounds(1000);
+            assert_eq!(ws.scroll_offset_for_row(0), -400.0, "{reduce_motion}");
+            assert_eq!(ws.scroll_offset_for_row(1), -600.0, "{reduce_motion}");
+
+            ws.focus_row(0);
+            ws.center_focused_column_animated(1000);
+            ws.stop_animation();
+            assert_eq!(ws.scroll_offset_for_row(0), -400.0, "{reduce_motion}");
+        }
+    }
+
+    #[test]
+    fn test_rtl_opens_new_columns_left_of_focus_in_every_row_path() {
+        let ids = |ws: &Workspace, row: usize| -> Vec<WindowId> {
+            ws.rows()[row]
+                .columns()
+                .iter()
+                .map(|c| c.windows()[0])
+                .collect()
+        };
+        let mut ws = gapless_workspace();
+        ws.set_rtl(true);
+        ws.set_row_layout(&[0.5, 0.5]);
+        ws.focus_row(0);
+        ws.insert_window(1, Some(300)).unwrap();
+        ws.insert_window(2, Some(300)).unwrap();
+        assert_eq!(ids(&ws, 0), vec![2, 1]);
+
+        // Without focus: opens left of 2, and 2 keeps focus.
+        ws.insert_window_in_row_no_focus(3, 0, Some(300)).unwrap();
+        assert_eq!(ids(&ws, 0), vec![3, 2, 1]);
+        assert_eq!(ws.focused_window(), Some(2));
+        ws.insert_window_no_focus(4, Some(300)).unwrap();
+        assert_eq!(ids(&ws, 0), vec![3, 4, 2, 1]);
+        assert_eq!(ws.focused_window(), Some(2));
+
+        // Moving to another row opens left of that row's focused column.
+        ws.focus_row(1);
+        ws.insert_window(5, Some(300)).unwrap();
+        ws.focus_row(0);
+        ws.move_window_to_row(2, 1).unwrap();
+        assert_eq!(ids(&ws, 1), vec![2, 5]);
+        assert_eq!(ws.focused_window(), Some(2));
+    }
+
+    #[test]
+    fn visible_column_query_skips_minimized_and_detects_edges() {
+        let mut ws = Workspace::new();
+        assert!(!ws.has_visible_column(true));
+        assert!(!ws.has_visible_column(false));
+        for id in [1, 2, 3, 4, 5] {
+            ws.insert_window(id, None).unwrap();
+        }
+        ws.focus_window(3).unwrap();
+        assert!(ws.mark_minimized(2));
+        assert!(ws.mark_minimized(4));
+        assert!(ws.has_visible_column(true));
+        assert!(ws.has_visible_column(false));
+        assert!(ws.mark_minimized(1));
+        assert!(ws.mark_minimized(5));
+        assert!(!ws.has_visible_column(true));
+        assert!(!ws.has_visible_column(false));
+        assert!(ws.mark_restored(1));
+        assert!(ws.has_visible_column(true));
+        ws.focus_window(1).unwrap();
+        assert!(!ws.has_visible_column(true));
+        assert!(ws.has_visible_column(false));
+    }
+
+    #[test]
+    fn explicit_column_alignment_obeys_edges_and_scroll_bounds() {
+        for reduce_motion in [false, true] {
+            for mode in [
+                CenteringMode::Center,
+                CenteringMode::JustInView,
+                CenteringMode::OnOverflow,
+            ] {
+                for (middle_width, focused, alignment, past_edges, expected) in [
+                    (800, 2, ColumnAlignment::Left, false, 810.0),
+                    (800, 2, ColumnAlignment::Right, false, 650.0),
+                    (800, 1, ColumnAlignment::Left, false, 0.0),
+                    (800, 1, ColumnAlignment::Right, false, 0.0),
+                    (800, 3, ColumnAlignment::Left, false, 1460.0),
+                    (800, 3, ColumnAlignment::Right, false, 1460.0),
+                    (800, 1, ColumnAlignment::Right, true, -80.0),
+                    (800, 3, ColumnAlignment::Left, true, 1540.0),
+                    (1200, 2, ColumnAlignment::Left, false, 810.0),
+                    (1200, 2, ColumnAlignment::Right, false, 1050.0),
+                ] {
+                    let mut ws = Workspace::with_gaps(10, 20);
+                    ws.set_centering_mode(mode);
+                    ws.set_center_past_edges(past_edges);
+                    ws.set_center_columns(CenterColumns::Single);
+                    ws.set_reduce_motion(reduce_motion);
+                    ws.insert_window(1, Some(800)).unwrap();
+                    ws.insert_window(2, Some(middle_width)).unwrap();
+                    ws.insert_window(3, Some(800)).unwrap();
+                    ws.focus_window(focused).unwrap();
+                    ws.align_focused_column_animated(alignment, 1000);
+                    if past_edges {
+                        let row = &ws.rows[ws.focused_row];
+                        let target = row
+                            .active_animation
+                            .as_ref()
+                            .map_or(row.scroll_offset, |anim| anim.target());
+                        ws.reconcile_scroll_bounds(1000);
+                        let row = &ws.rows[ws.focused_row];
+                        if !reduce_motion {
+                            assert!(
+                                row.active_animation.is_some(),
+                                "reconciliation canceled {alignment:?} animation"
+                            );
+                        }
+                        assert_eq!(
+                            row.active_animation
+                                .as_ref()
+                                .map_or(row.scroll_offset, |anim| anim.target()),
+                            target
+                        );
+                    }
+                    ws.tick_animation(1000);
+                    assert_eq!(
+                        ws.scroll_offset(),
+                        expected,
+                        "{mode:?} {alignment:?} {focused} {past_edges} {reduce_motion}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn test_focus_after_center_command_keeps_past_edge_scroll_when_visible() {
         // Four 300px columns on a 1000px screen, no gaps: A 0-300, B 300-600,
         // C 600-900, D 900-1200 (200px over).
-        for mode in [
-            CenteringMode::JustInView,
-            CenteringMode::OnOverflow,
-            CenteringMode::CenterColumnsWhenNarrower,
+        for (mode, center_columns) in [
+            (CenteringMode::JustInView, CenterColumns::Off),
+            (CenteringMode::OnOverflow, CenterColumns::Off),
+            (CenteringMode::JustInView, CenterColumns::Fit),
         ] {
             for reduce_motion in [false, true] {
-                let case = format!("mode={mode:?}, reduce_motion={reduce_motion}");
+                let case = format!(
+                    "mode={mode:?}, center_columns={center_columns:?}, reduce_motion={reduce_motion}"
+                );
                 let mut ws = gapless_workspace();
                 ws.set_centering_mode(mode);
+                ws.set_center_columns(center_columns);
                 ws.set_center_past_edges(true);
                 ws.set_reduce_motion(reduce_motion);
                 for id in 1..=4 {
@@ -302,6 +458,368 @@ mod tests {
     }
 
     #[test]
+    fn floating_alignment_preserves_vertical_position_and_named_edge() {
+        let mut ws = Workspace::with_gaps(10, 20);
+        let area = Rect::new(100, 50, 1000, 600);
+        ws.add_floating(1, Rect::new(300, -20, 1200, 400)).unwrap();
+        for (alignment, x) in [(ColumnAlignment::Left, 100), (ColumnAlignment::Right, -100)] {
+            ws.align_floating(1, area, alignment);
+            assert_eq!(ws.floating_windows()[0].rect, Rect::new(x, -20, 1200, 400));
+        }
+    }
+
+    #[test]
+    fn fit_centers_active_group_in_every_focus_mode() {
+        for mode in [
+            CenteringMode::Center,
+            CenteringMode::JustInView,
+            CenteringMode::OnOverflow,
+        ] {
+            for past_edges in [false, true] {
+                for count in 1..=3 {
+                    let mut ws = Workspace::with_gaps(10, 20);
+                    ws.set_center_columns(CenterColumns::Fit);
+                    ws.set_centering_mode(mode);
+                    ws.set_center_past_edges(past_edges);
+                    ws.insert_window(99, Some(200)).unwrap();
+                    ws.mark_minimized(99);
+                    for id in 1..=count {
+                        ws.insert_window(id, Some(200)).unwrap();
+                    }
+                    ws.ensure_focused_visible_animated(1000);
+                    ws.stop_animation();
+                    let total = count as i32 * 200 + (count as i32 - 1) * 10;
+                    assert_eq!(ws.scroll_offset(), -((960 - total) / 2) as f64);
+                    let placements = ws.compute_placements(Rect::new(0, 0, 1000, 600));
+                    let first = placements.iter().find(|p| p.window_id == 1).unwrap();
+                    assert_eq!(first.rect.x, (1000 - total) / 2);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fit_overflow_transition_animates_and_recenters_after_removal() {
+        let mut ws = Workspace::with_gaps(10, 20);
+        ws.set_center_columns(CenterColumns::Fit);
+        ws.insert_window(1, Some(400)).unwrap();
+        ws.insert_window(2, Some(400)).unwrap();
+        ws.ensure_focused_visible(1000);
+        assert_eq!(ws.scroll_offset(), -75.0);
+        ws.insert_window(3, Some(400)).unwrap();
+        ws.ensure_focused_visible_animated(1000);
+        ws.reconcile_scroll_bounds(1000);
+        assert!(ws.is_animating());
+        ws.stop_animation();
+        assert_eq!(ws.scroll_offset(), 260.0);
+        ws.remove_window(3).unwrap();
+        ws.ensure_focused_visible_animated(1000);
+        ws.reconcile_scroll_bounds(1000);
+        assert!(ws.is_animating());
+        ws.stop_animation();
+        assert_eq!(ws.scroll_offset(), -75.0);
+    }
+
+    #[test]
+    fn leaving_column_centering_slides_to_off_unless_motion_is_reduced() {
+        for (mode, widths, centered) in [
+            (CenterColumns::Single, &[400][..], -280.0),
+            (CenterColumns::Fit, &[200, 200][..], -275.0),
+        ] {
+            for past_edges in [false, true] {
+                for reduce_motion in [false, true] {
+                    let mut ws = Workspace::with_gaps(10, 20);
+                    ws.set_center_columns(mode);
+                    ws.set_centering_mode(CenteringMode::JustInView);
+                    ws.set_center_past_edges(past_edges);
+                    ws.set_reduce_motion(reduce_motion);
+                    for (index, &width) in widths.iter().enumerate() {
+                        ws.insert_window(index as u64 + 1, Some(width)).unwrap();
+                    }
+                    ws.ensure_focused_visible(1000);
+                    assert_eq!(ws.effective_scroll_offset(), centered);
+
+                    ws.reconcile_leaving_column_centering(1000);
+
+                    assert_eq!(ws.center_columns(), CenterColumns::Off);
+                    if reduce_motion {
+                        assert!(!ws.is_animating());
+                        assert_eq!(ws.effective_scroll_offset(), 0.0);
+                    } else {
+                        assert!(ws.is_animating(), "{mode:?}, past_edges={past_edges}");
+                        assert_eq!(ws.effective_scroll_offset(), centered);
+                        assert_eq!(ws.rows[0].active_animation.as_ref().unwrap().target(), 0.0);
+                    }
+                    ws.ensure_focused_visible_animated(1000);
+                    assert_eq!(ws.is_animating(), !reduce_motion);
+                    ws.tick_animation(1000);
+                    assert_eq!(ws.effective_scroll_offset(), 0.0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fit_centers_rows_independently_with_inactive_columns() {
+        let mut ws = Workspace::with_gaps(10, 20);
+        ws.set_row_layout(&[1.0, 1.0]);
+        ws.set_center_columns(CenterColumns::Fit);
+        ws.insert_column_at_row(Column::new(1, 200), 0, 0);
+        ws.insert_column_at_row(Column::new(2, 200), 0, 1);
+        ws.insert_column_at_row(Column::new(3, 200), 0, 2);
+        ws.mark_minimized(2);
+        ws.insert_column_at_row(Column::new(4, 400), 1, 0);
+        ws.reconcile_scroll_bounds(1000);
+        assert_eq!(ws.scroll_offset_for_row(0), -275.0);
+        assert_eq!(ws.scroll_offset_for_row(1), -280.0);
+        let placements = ws.compute_placements(Rect::new(0, 0, 1000, 600));
+        assert_eq!(
+            placements.iter().find(|p| p.window_id == 1).unwrap().rect.x,
+            295
+        );
+        assert_eq!(
+            placements.iter().find(|p| p.window_id == 3).unwrap().rect.x,
+            505
+        );
+        assert_eq!(
+            placements.iter().find(|p| p.window_id == 4).unwrap().rect.x,
+            300
+        );
+    }
+
+    #[test]
+    fn fit_alignment_sequences_preserve_edges_and_restore_center() {
+        let alignments = [
+            ColumnAlignment::Left,
+            ColumnAlignment::Right,
+            ColumnAlignment::Center,
+        ];
+        for reduce_motion in [false, true] {
+            for past_edges in [false, true] {
+                for mode in [
+                    CenteringMode::Center,
+                    CenteringMode::JustInView,
+                    CenteringMode::OnOverflow,
+                ] {
+                    let mut left = None;
+                    let mut right = None;
+                    for first in alignments {
+                        for second in [
+                            None,
+                            Some(ColumnAlignment::Left),
+                            Some(ColumnAlignment::Right),
+                            Some(ColumnAlignment::Center),
+                        ] {
+                            let mut ws = Workspace::with_gaps(10, 20);
+                            ws.set_center_columns(CenterColumns::Fit);
+                            ws.set_reduce_motion(reduce_motion);
+                            ws.set_center_past_edges(past_edges);
+                            ws.set_centering_mode(mode);
+                            ws.insert_window(1, Some(200)).unwrap();
+                            ws.insert_window(2, Some(200)).unwrap();
+                            ws.ensure_focused_visible(1000);
+                            assert_eq!(ws.scroll_offset(), -275.0);
+                            for alignment in [Some(first), second].into_iter().flatten() {
+                                let expected = match alignment {
+                                    ColumnAlignment::Left => 0.0,
+                                    ColumnAlignment::Right => -550.0,
+                                    ColumnAlignment::Center => -275.0,
+                                };
+                                ws.align_focused_column_animated(alignment, 1000);
+                                ws.stop_animation();
+                                assert_eq!(ws.scroll_offset(), expected, "{first:?} {second:?} {alignment:?} motion={reduce_motion} edges={past_edges} mode={mode:?}");
+                                ws.reconcile_scroll_bounds(1000);
+                                assert_eq!(ws.scroll_offset(), expected);
+                                ws.ensure_focused_visible_animated(1000);
+                                ws.stop_animation();
+                                assert_eq!(ws.scroll_offset(), expected, "reveal {first:?} {second:?} {alignment:?} motion={reduce_motion} edges={past_edges} mode={mode:?}");
+                            }
+                            if second.is_none() {
+                                match first {
+                                    ColumnAlignment::Left => left = Some(ws.scroll_offset()),
+                                    ColumnAlignment::Right => right = Some(ws.scroll_offset()),
+                                    ColumnAlignment::Center => (),
+                                }
+                            }
+                        }
+                    }
+                    assert_ne!(left.unwrap(), right.unwrap());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fit_right_alignment_survives_minimize_during_animation() {
+        let mut ws = Workspace::with_gaps(10, 20);
+        ws.set_center_columns(CenterColumns::Fit);
+        ws.insert_window(1, Some(200)).unwrap();
+        ws.insert_window(2, Some(200)).unwrap();
+        ws.insert_window_in_column(3, 1).unwrap();
+        ws.ensure_focused_visible(1000);
+        assert_eq!(ws.scroll_offset(), -275.0);
+        ws.align_focused_column_animated(ColumnAlignment::Right, 1000);
+        assert!(ws.is_animating());
+        assert!(ws.mark_minimized(3));
+        assert!(!ws.is_animating());
+        ws.reconcile_scroll_bounds(1000);
+        assert_eq!(ws.scroll_offset(), -550.0);
+        assert!(ws.mark_restored(3));
+        ws.reconcile_scroll_bounds(1000);
+        assert_eq!(ws.scroll_offset(), -550.0);
+    }
+
+    #[test]
+    fn fit_right_alignment_ignores_inactive_focused_column() {
+        let mut ws = Workspace::with_gaps(10, 20);
+        ws.set_center_columns(CenterColumns::Fit);
+        ws.insert_window(1, Some(200)).unwrap();
+        ws.insert_window(2, Some(200)).unwrap();
+        assert!(ws.mark_minimized(2));
+        assert_eq!(ws.focused_column_index(), 1);
+        ws.reconcile_scroll_bounds(1000);
+        ws.align_focused_column_animated(ColumnAlignment::Right, 1000);
+        ws.stop_animation();
+        assert_eq!(ws.scroll_offset(), -760.0);
+    }
+
+    #[test]
+    fn fit_alignment_release_survives_focus_and_stack_changes() {
+        for alignment in [ColumnAlignment::Left, ColumnAlignment::Right] {
+            let mut ws = Workspace::with_gaps(10, 20);
+            ws.set_center_columns(CenterColumns::Fit);
+            ws.insert_window(1, Some(200)).unwrap();
+            ws.insert_window(2, Some(200)).unwrap();
+            ws.ensure_focused_visible(1000);
+            assert_eq!(ws.scroll_offset(), -275.0);
+            ws.align_focused_column_animated(ColumnAlignment::Center, 1000);
+            ws.stop_animation();
+            assert_eq!(ws.scroll_offset(), -275.0);
+            ws.align_focused_column_animated(alignment, 1000);
+            ws.stop_animation();
+            let expected = if alignment == ColumnAlignment::Left {
+                0.0
+            } else {
+                -550.0
+            };
+            assert_eq!(ws.scroll_offset(), expected);
+            ws.insert_window_in_column(3, 1).unwrap();
+            ws.reconcile_scroll_bounds(1000);
+            assert_eq!(ws.scroll_offset(), expected);
+            ws.focus_window(1).unwrap();
+            ws.reconcile_scroll_bounds(1000);
+            ws.ensure_focused_visible_animated(1000);
+            ws.stop_animation();
+            assert_eq!(ws.scroll_offset(), expected);
+        }
+    }
+
+    #[test]
+    fn fit_release_expires_on_layout_changes_even_during_fullscreen() {
+        for fullscreen in [false, true] {
+            for change in ["gap", "width", "viewport", "columns"] {
+                let mut ws = Workspace::with_gaps(10, 20);
+                ws.set_center_columns(CenterColumns::Fit);
+                ws.insert_window(1, Some(200)).unwrap();
+                ws.insert_window(2, Some(200)).unwrap();
+                ws.ensure_focused_visible(1000);
+                ws.align_focused_column_animated(ColumnAlignment::Left, 1000);
+                ws.stop_animation();
+                assert_eq!(ws.scroll_offset(), 0.0);
+                ws.focus_window(1).unwrap();
+                if fullscreen {
+                    ws.toggle_fullscreen();
+                }
+                match change {
+                    "gap" => ws.set_gap(20),
+                    "width" => ws.set_column_width(0, 250).unwrap(),
+                    "viewport" => (),
+                    "columns" => {
+                        ws.remove_window(2).unwrap();
+                        ws.insert_window(3, Some(200)).unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+                assert_eq!(ws.is_fullscreen(), fullscreen, "{change}");
+                ws.reconcile_scroll_bounds(if change == "viewport" { 900 } else { 1000 });
+                match change {
+                    "gap" => ws.set_gap(10),
+                    "width" => ws.set_column_width(0, 200).unwrap(),
+                    "viewport" => (),
+                    "columns" => {
+                        ws.remove_window(3).unwrap();
+                        ws.insert_window(2, Some(200)).unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+                assert_eq!(ws.is_fullscreen(), fullscreen, "{change}");
+                ws.reconcile_scroll_bounds(1000);
+                if fullscreen {
+                    ws.toggle_fullscreen();
+                }
+                ws.reconcile_scroll_bounds(1000);
+                assert_eq!(
+                    ws.scroll_offset(),
+                    -275.0,
+                    "{change}, fullscreen={fullscreen}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fit_release_expires_when_other_fullscreen_row_changes_active_columns() {
+        for alignment in [ColumnAlignment::Left, ColumnAlignment::Right] {
+            for initially_minimized in [false, true] {
+                let mut ws = Workspace::with_gaps(10, 20);
+                ws.set_row_layout(&[1.0, 1.0]);
+                ws.set_center_columns(CenterColumns::Fit);
+                ws.insert_column_at_row(Column::new(1, 200), 0, 0);
+                ws.insert_column_at_row(Column::new(2, 200), 0, 1);
+                ws.insert_column_at_row(Column::new(3, 400), 1, 0);
+                if initially_minimized {
+                    assert!(ws.mark_minimized(2));
+                }
+                ws.focus_window(1).unwrap();
+                ws.reconcile_scroll_bounds(1000);
+                ws.align_focused_column_animated(alignment, 1000);
+                ws.stop_animation();
+                let right_offset = if initially_minimized { -760.0 } else { -550.0 };
+                assert_eq!(
+                    ws.scroll_offset_for_row(0),
+                    if alignment == ColumnAlignment::Left {
+                        0.0
+                    } else {
+                        right_offset
+                    }
+                );
+
+                ws.focus_window(3).unwrap();
+                assert!(ws.toggle_fullscreen());
+                if initially_minimized {
+                    assert!(ws.mark_restored(2));
+                    ws.ensure_focused_visible_animated(1000);
+                    assert!(ws.mark_minimized(2));
+                } else {
+                    assert!(ws.mark_minimized(2));
+                    ws.ensure_focused_visible_animated(1000);
+                    assert!(ws.mark_restored(2));
+                }
+                ws.ensure_focused_visible_animated(1000);
+                assert!(ws.is_fullscreen());
+                assert!(!ws.toggle_fullscreen());
+                ws.reconcile_scroll_bounds(1000);
+                let centered_offset = if initially_minimized { -380.0 } else { -275.0 };
+                assert_eq!(
+                    ws.scroll_offset_for_row(0),
+                    centered_offset,
+                    "{alignment:?}, initially_minimized={initially_minimized}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_center_single_column_modes_scroll_and_default() {
         let viewport = Rect::new(100, 50, 1000, 600);
         for mode in [
@@ -320,7 +838,7 @@ mod tests {
                         ws.compute_placements(viewport)[0].rect,
                         Rect::new(120, 70, width, 560)
                     );
-                    ws.set_center_single_column(true);
+                    ws.set_center_columns(CenterColumns::Single);
                     for offset in [-100.0, 0.0, 150.0] {
                         ws.set_scroll_offset(offset);
                         ws.reconcile_scroll_bounds(viewport.width);
@@ -345,8 +863,14 @@ mod tests {
                         ws.center_focused_column_animated(viewport.width);
                         ws.stop_animation();
                         assert_eq!(ws.compute_placements(viewport)[0].rect.x, center_x);
+                        for alignment in [ColumnAlignment::Left, ColumnAlignment::Right] {
+                            ws.set_scroll_offset(137.0);
+                            ws.align_focused_column_animated(alignment, viewport.width);
+                            ws.stop_animation();
+                            assert_eq!(ws.compute_placements(viewport)[0].rect.x, center_x);
+                        }
                     }
-                    ws.set_center_single_column(false);
+                    ws.set_center_columns(CenterColumns::Off);
                     ws.scroll_by(0.0, viewport.width);
                     assert_eq!(ws.compute_placements(viewport)[0].rect.x, 120);
                 }
@@ -368,13 +892,13 @@ mod tests {
                 ws.set_center_past_edges(past_edges);
                 ws.insert_window(1, Some(400)).unwrap();
                 ws.set_scroll_offset(137.0);
-                ws.set_center_single_column(true);
+                ws.set_center_columns(CenterColumns::Single);
                 ws.ensure_focused_visible(viewport.width);
                 assert_eq!(ws.compute_placements(viewport)[0].rect.x, 300);
                 assert_eq!(ws.scroll_offset(), -280.0);
                 ws.insert_window(2, Some(800)).unwrap();
                 let mut normal = ws.clone();
-                normal.set_center_single_column(false);
+                normal.set_center_columns(CenterColumns::Off);
                 assert_eq!(ws.compute_placements_animated(viewport)[0].rect.x, 300);
                 ws.ensure_focused_visible_animated(viewport.width);
                 ws.reconcile_scroll_bounds(viewport.width);
@@ -414,7 +938,7 @@ mod tests {
     fn test_center_single_column_reduce_motion_transition() {
         let viewport = Rect::new(0, 0, 1000, 600);
         let mut ws = Workspace::with_gaps(10, 20);
-        ws.set_center_single_column(true);
+        ws.set_center_columns(CenterColumns::Single);
         ws.set_reduce_motion(true);
         ws.insert_window(1, Some(400)).unwrap();
         ws.ensure_focused_visible(viewport.width);
@@ -431,52 +955,54 @@ mod tests {
 
     #[test]
     fn test_center_single_column_active_stacked_tabbed_and_floating() {
-        let viewport = Rect::new(0, 0, 1000, 600);
-        let mut ws = Workspace::with_gaps(10, 20);
-        ws.set_center_single_column(true);
-        ws.insert_window(9, Some(500)).unwrap();
-        ws.mark_minimized(9);
-        ws.insert_window(1, Some(400)).unwrap();
-        ws.insert_window(2, Some(400)).unwrap();
-        ws.consume_from_left();
-        ws.insert_window(10, Some(600)).unwrap();
-        ws.mark_minimized(10);
-        let float_rect = Rect::new(50, 100, 200, 150);
-        ws.add_floating(11, float_rect).unwrap();
-        ws.reconcile_scroll_bounds(viewport.width);
-        let placements = ws.compute_placements(viewport);
-        let stacked: Vec<_> = placements
-            .iter()
-            .filter(|p| p.column_index != usize::MAX)
-            .collect();
-        assert_eq!(stacked.len(), 2);
-        assert_eq!(stacked[0].rect, Rect::new(300, 20, 400, 275));
-        assert_eq!(stacked[1].rect, Rect::new(300, 305, 400, 275));
-        assert_eq!(
-            placements.iter().find(|p| p.window_id == 11).unwrap().rect,
-            float_rect
-        );
-        ws.focus_window(1).unwrap();
-        ws.toggle_focused_column_tabbed_mode();
-        ws.set_tab_strip_reserve_px(30);
-        let placements = ws.compute_placements(viewport);
-        let tab = placements.iter().find(|p| p.window_id == 1).unwrap();
-        assert_eq!(tab.rect, Rect::new(300, 50, 400, 530));
-        assert_eq!(tab.visibility, Visibility::Visible);
-        assert_eq!(
-            placements
+        for center_columns in [CenterColumns::Single, CenterColumns::Fit] {
+            let viewport = Rect::new(0, 0, 1000, 600);
+            let mut ws = Workspace::with_gaps(10, 20);
+            ws.set_center_columns(center_columns);
+            ws.insert_window(9, Some(500)).unwrap();
+            ws.mark_minimized(9);
+            ws.insert_window(1, Some(400)).unwrap();
+            ws.insert_window(2, Some(400)).unwrap();
+            ws.consume_from_left();
+            ws.insert_window(10, Some(600)).unwrap();
+            ws.mark_minimized(10);
+            let float_rect = Rect::new(50, 100, 200, 150);
+            ws.add_floating(11, float_rect).unwrap();
+            ws.reconcile_scroll_bounds(viewport.width);
+            let placements = ws.compute_placements(viewport);
+            let stacked: Vec<_> = placements
                 .iter()
-                .find(|p| p.window_id == 2)
-                .unwrap()
-                .visibility,
-            Visibility::OffScreenLeft
-        );
-        ws.mark_minimized(1);
-        let placements = ws.compute_placements(viewport);
-        assert_eq!(
-            placements.iter().find(|p| p.window_id == 2).unwrap().rect,
-            Rect::new(300, 50, 400, 530)
-        );
+                .filter(|p| p.column_index != usize::MAX)
+                .collect();
+            assert_eq!(stacked.len(), 2);
+            assert_eq!(stacked[0].rect, Rect::new(300, 20, 400, 275));
+            assert_eq!(stacked[1].rect, Rect::new(300, 305, 400, 275));
+            assert_eq!(
+                placements.iter().find(|p| p.window_id == 11).unwrap().rect,
+                float_rect
+            );
+            ws.focus_window(1).unwrap();
+            ws.toggle_focused_column_tabbed_mode();
+            ws.set_tab_strip_reserve_px(30);
+            let placements = ws.compute_placements(viewport);
+            let tab = placements.iter().find(|p| p.window_id == 1).unwrap();
+            assert_eq!(tab.rect, Rect::new(300, 50, 400, 530));
+            assert_eq!(tab.visibility, Visibility::Visible);
+            assert_eq!(
+                placements
+                    .iter()
+                    .find(|p| p.window_id == 2)
+                    .unwrap()
+                    .visibility,
+                Visibility::OffScreenLeft
+            );
+            ws.mark_minimized(1);
+            let placements = ws.compute_placements(viewport);
+            assert_eq!(
+                placements.iter().find(|p| p.window_id == 2).unwrap().rect,
+                Rect::new(300, 50, 400, 530)
+            );
+        }
     }
 
     #[test]
@@ -500,7 +1026,7 @@ mod tests {
                     }
                     normal.set_scroll_offset(123.0);
                     let mut centered = normal.clone();
-                    centered.set_center_single_column(true);
+                    centered.set_center_columns(CenterColumns::Single);
                     normal.ensure_focused_visible(viewport.width);
                     centered.ensure_focused_visible(viewport.width);
                     assert_eq!(
@@ -517,7 +1043,7 @@ mod tests {
         let mut constrained = Workspace::with_gaps(10, 20);
         constrained.insert_window(1, Some(400)).unwrap();
         constrained.set_window_min_width(1, 1000);
-        constrained.set_center_single_column(true);
+        constrained.set_center_columns(CenterColumns::Single);
         constrained.ensure_focused_visible(viewport.width);
         constrained.clear_window_min_width(1);
         constrained.reconcile_scroll_bounds(viewport.width);
@@ -527,12 +1053,18 @@ mod tests {
         ws.insert_window(1, Some(400)).unwrap();
         ws.toggle_fullscreen();
         let expected = ws.compute_placements(viewport);
-        ws.set_center_single_column(true);
+        ws.set_center_columns(CenterColumns::Single);
         assert_eq!(
             placement_geometry(ws.compute_placements(viewport)),
             placement_geometry(expected.clone())
         );
         assert_eq!(expected[0].rect, viewport);
+        ws.set_center_columns(CenterColumns::Fit);
+        ws.reconcile_scroll_bounds(viewport.width);
+        assert_eq!(
+            placement_geometry(ws.compute_placements(viewport)),
+            placement_geometry(expected)
+        );
         ws.toggle_fullscreen();
         ws.mark_minimized(1);
         assert!(ws.compute_placements(viewport).is_empty());
@@ -543,7 +1075,7 @@ mod tests {
         let viewport = Rect::new(0, 0, 1000, 600);
         for sticky in [false, true] {
             let mut ws = Workspace::with_gaps(10, 20);
-            ws.set_center_single_column(true);
+            ws.set_center_columns(CenterColumns::Single);
             ws.insert_window(1, Some(400)).unwrap();
             ws.ensure_focused_visible(viewport.width);
             assert_eq!(ws.compute_placements(viewport)[0].rect.x, 300);
@@ -566,7 +1098,7 @@ mod tests {
         let viewport = Rect::new(0, 0, 1000, 600);
         for animated in [false, true] {
             let mut ws = Workspace::with_gaps(10, 20);
-            ws.set_center_single_column(true);
+            ws.set_center_columns(CenterColumns::Single);
             ws.insert_window(1, Some(400)).unwrap();
             ws.insert_window(2, Some(400)).unwrap();
             ws.focus_window(1).unwrap();
@@ -590,7 +1122,7 @@ mod tests {
     fn test_center_single_column_migrated_clone_insert() {
         let viewport = Rect::new(0, 0, 1000, 600);
         let mut source = Workspace::with_gaps(10, 20);
-        source.set_center_single_column(true);
+        source.set_center_columns(CenterColumns::Single);
         source.insert_window(1, Some(400)).unwrap();
         source.ensure_focused_visible(viewport.width);
         assert_eq!(source.compute_placements(viewport)[0].rect.x, 300);
@@ -619,7 +1151,7 @@ mod tests {
     fn test_center_single_column_remove_column_clamps_during_fullscreen() {
         let viewport = Rect::new(0, 0, 1000, 600);
         let mut ws = Workspace::with_gaps(10, 20);
-        ws.set_center_single_column(true);
+        ws.set_center_columns(CenterColumns::Single);
         ws.insert_window(1, Some(400)).unwrap();
         ws.ensure_focused_visible(viewport.width);
         assert_eq!(ws.scroll_offset(), -280.0);
@@ -638,7 +1170,7 @@ mod tests {
         default.insert_window(1, Some(400)).unwrap();
         default.set_scroll_offset(137.0);
         let mut disabled = default.clone();
-        disabled.set_center_single_column(false);
+        disabled.set_center_columns(CenterColumns::Off);
         for ws in [&mut default, &mut disabled] {
             assert_eq!(ws.compute_placements(viewport)[0].rect.x, -117);
             assert_eq!(ws.compute_placements_animated(viewport)[0].rect.x, -117);
@@ -1850,11 +2382,11 @@ mod tests {
         ws.insert_window_in_column(3, 0).unwrap();
         ws.insert_window_in_column(4, 1).unwrap();
 
-        assert_eq!(ws.find_window_location(1), Some((0, 0)));
-        assert_eq!(ws.find_window_location(2), Some((1, 0)));
-        assert_eq!(ws.find_window_location(3), Some((0, 1)));
-        assert_eq!(ws.find_window_location(4), Some((1, 1)));
-        assert_eq!(ws.find_window_location(999), None);
+        assert_eq!(ws.find_window_location_rc(1), Some((0, 0, 0)));
+        assert_eq!(ws.find_window_location_rc(2), Some((0, 1, 0)));
+        assert_eq!(ws.find_window_location_rc(3), Some((0, 0, 1)));
+        assert_eq!(ws.find_window_location_rc(4), Some((0, 1, 1)));
+        assert_eq!(ws.find_window_location_rc(999), None);
     }
 
     #[test]
@@ -1938,11 +2470,11 @@ mod tests {
         ws.focus_left();
         ws.move_column_left();
 
-        assert!(ws.focused_column < ws.columns.len());
-        assert!(ws.focused_window_in_column < ws.columns[ws.focused_column].len());
+        assert!(ws.focused_column_index() < ws.columns().len());
+        assert!(ws.focused_window_in_column() < ws.columns()[ws.focused_column_index()].len());
 
         let mut all_windows: Vec<WindowId> = ws
-            .columns
+            .columns()
             .iter()
             .flat_map(|c| c.windows().iter().copied())
             .collect();
@@ -3088,6 +3620,32 @@ mod tests {
     }
 
     #[test]
+    fn floating_geometry_clamps_oversized_windows_and_preserves_size_floor() {
+        let mut ws = Workspace::new();
+        let area = Rect::new(-200, 100, 800, 600);
+        ws.add_floating(10, Rect::new(0, 200, 300, 200)).unwrap();
+        ws.move_floating(10, 1000, -1000, area);
+        assert_eq!(ws.floating_windows()[0].rect, Rect::new(300, 100, 300, 200));
+        ws.set_floating_size(10, 20, true, area);
+        ws.set_floating_size(10, 20, false, area);
+        assert_eq!(
+            ws.floating_windows()[0].rect,
+            Rect::new(300, 100, MIN_COLUMN_WIDTH, MIN_COLUMN_WIDTH)
+        );
+        ws.update_floating(10, Rect::new(0, 200, 1000, 700));
+        ws.center_floating(10, area);
+        assert_eq!(
+            ws.floating_windows()[0].rect,
+            Rect::new(-200, 100, 1000, 700)
+        );
+        ws.update_floating(10, Rect::new(0, 200, 80, 80));
+        ws.set_floating_size(10, 10, true, area);
+        ws.set_floating_size(10, 10, false, area);
+        assert_eq!(ws.floating_windows()[0].rect.width, 80);
+        assert_eq!(ws.floating_windows()[0].rect.height, 80);
+    }
+
+    #[test]
     fn test_resize_floating_ignores_tiled_and_missing_windows() {
         let mut ws = Workspace::new();
         ws.insert_window(1, Some(400)).unwrap();
@@ -3110,6 +3668,37 @@ mod tests {
         assert!(ws.is_floating(2));
         assert_eq!(ws.column_count(), 1);
         assert_eq!(ws.floating_count(), 1);
+    }
+
+    #[test]
+    fn float_window_at_preserves_rect_and_original_column_on_return() {
+        let mut ws = Workspace::new();
+        let viewport = Rect::new(0, 0, 1920, 1080);
+        let dropped = Rect::new(300, 200, 700, 500);
+        for id in 1..=3 {
+            ws.insert_window(id, Some(400)).unwrap();
+        }
+        assert!(ws.float_window_at(2, dropped, viewport));
+        assert_eq!(ws.floating_windows()[0].rect, dropped);
+        assert!(ws.unfloat_window(2));
+        assert_eq!(ws.find_window_location_rc(2).unwrap().1, 1);
+    }
+
+    #[test]
+    fn floating_last_column_repairs_scroll_bounds() {
+        let mut ws = Workspace::with_gaps(10, 10);
+        let viewport = Rect::new(0, 0, 800, 600);
+        for id in 1..=4 {
+            ws.insert_window(id, Some(400)).unwrap();
+        }
+        ws.focus_end();
+        ws.scroll_by(10_000.0, viewport.width);
+        let old_offset = ws.scroll_offset();
+
+        assert_eq!(ws.toggle_floating(viewport), Some(4));
+        let max_scroll = (ws.total_width() - ws.visible_width(viewport.width)).max(0) as f64;
+        assert!(old_offset > max_scroll);
+        assert!((0.0..=max_scroll).contains(&ws.scroll_offset()));
     }
 
     #[test]
@@ -3336,6 +3925,31 @@ mod tests {
             ws.effective_scroll_offset(),
             expected.effective_scroll_offset()
         );
+    }
+
+    #[test]
+    fn test_reconcile_multi_row_preserves_animation_to_valid_target_after_shrink() {
+        let mut ws = Workspace::with_gaps(10, 10);
+        ws.set_row_layout(&[0.5, 0.5]);
+        ws.set_center_past_edges(false);
+        for id in [1, 2, 3] {
+            ws.insert_window_in_row(id, 0, Some(800)).unwrap();
+        }
+        ws.set_window_min_width(3, 1500);
+        ws.set_scroll_offset(1220.0);
+        ws.start_scroll_animation(300.0, 1920, Some(1000), Some(Easing::Linear));
+        ws.tick_animation(10);
+        ws.clear_window_min_width(3);
+        let current = ws.effective_scroll_offset_for_row(0);
+        assert!(current > 520.0);
+
+        ws.reconcile_scroll_bounds(1920);
+
+        assert!(ws.is_animating_for_row(0));
+        assert_eq!(ws.effective_scroll_offset_for_row(0), current);
+        ws.tick_animation(1000);
+        assert!(!ws.is_animating_for_row(0));
+        assert_eq!(ws.scroll_offset_for_row(0), 300.0);
     }
 
     #[test]
@@ -4180,7 +4794,7 @@ mod tests {
         let _ = ws.focus_window(3);
         ws.ensure_focused_visible(vp_width);
         // max_scroll = 2420 - 1900 = 520
-        assert_eq!(ws.scroll_offset as i32, 520);
+        assert_eq!(ws.scroll_offset() as i32, 520);
 
         ws.mark_minimized(3);
         ws.focus_right();
@@ -4745,9 +5359,9 @@ mod tests {
         ws.consume_from_right();
 
         assert_eq!(ws.column_count(), 1);
-        assert!(ws.columns[0].is_tabbed());
-        assert_eq!(ws.columns[0].windows(), &[1, 2, 3]);
-        assert_eq!(ws.columns[0].active_tab_idx(), Some(2));
+        assert!(ws.columns()[0].is_tabbed());
+        assert_eq!(ws.columns()[0].windows(), &[1, 2, 3]);
+        assert_eq!(ws.columns()[0].active_tab_idx(), Some(2));
         assert_eq!(ws.focused_window(), Some(3));
     }
 
@@ -4949,7 +5563,7 @@ mod tests {
         ws.insert_window(1, Some(800)).unwrap();
         ws.insert_window_in_column(2, 0).unwrap();
 
-        ws.columns[0].set_height_weight(0, 0.667);
+        ws.columns_mut()[0].set_height_weight(0, 0.667);
 
         let viewport = Rect::new(0, 0, 800, 900);
         let placements = ws.compute_placements(viewport);
@@ -5014,7 +5628,7 @@ mod tests {
             ws.insert_window(1, Some(800)).unwrap();
             ws.insert_window_in_column(2, 0).unwrap();
             ws.set_focus(0, 0).unwrap();
-            ws.columns[0].set_height_weight(0, current);
+            ws.columns_mut()[0].set_height_weight(0, current);
             ws.cycle_height(&[0.75, 0.25, 0.5]);
             let weights = ws.columns()[0].height_weights();
             assert!((weights[0] - expected).abs() < 1e-9, "current={current}");
@@ -5125,11 +5739,23 @@ mod tests {
         assert_eq!(ws.columns()[0].height_weights(), &[1.0]);
         ws.insert_window_in_column(2, 0).unwrap();
         ws.set_focus(0, 0).unwrap();
-        ws.columns[0].set_height_weight(0, 0.75);
+        ws.columns_mut()[0].set_height_weight(0, 0.75);
         ws.toggle_focused_column_tabbed_mode();
         let before = ws.columns()[0].height_weights().to_vec();
         ws.cycle_height(&[0.25, 0.5, 0.75]);
         assert_eq!(ws.columns()[0].height_weights(), before);
+    }
+
+    #[test]
+    fn cycle_width_from_off_preset_selects_next_in_each_direction() {
+        let mut ws = Workspace::with_gaps(0, 0);
+        ws.insert_window(1, Some(420)).unwrap();
+        let presets = [0.25, 0.5, 0.75];
+        ws.cycle_width_up(&presets, 1000);
+        assert_eq!(ws.columns()[0].width(), 500);
+        ws.set_column_width(0, 420).unwrap();
+        ws.cycle_width_down(&presets, 1000);
+        assert_eq!(ws.columns()[0].width(), 250);
     }
 
     #[test]
@@ -5208,9 +5834,9 @@ mod tests {
         assert!(col.height_weights.is_empty());
         // Compute placements should fall back to equal distribution
         let mut ws = Workspace::with_gaps(0, 0);
-        ws.columns.push(col);
-        ws.focused_column = 0;
-        ws.focused_window_in_column = 0;
+        ws.rows[0].columns.push(col);
+        ws.rows[0].focused_column = 0;
+        ws.rows[0].focused_window_in_column = 0;
         let viewport = Rect::new(0, 0, 800, 1000);
         let placements = ws.compute_placements(viewport);
         assert_eq!(placements.len(), 2);
@@ -5226,12 +5852,12 @@ mod tests {
         ws.insert_window_in_column(3, 1).unwrap();
         ws.set_focus(1, 0).unwrap();
 
-        ws.columns[1].set_height_weight(0, 0.667);
+        ws.columns_mut()[1].set_height_weight(0, 0.667);
 
         ws.set_focus(1, 0).unwrap();
         ws.move_window_left();
 
-        let weights = ws.columns[0].height_weights();
+        let weights = ws.columns()[0].height_weights();
         assert_eq!(weights.len(), 2);
         assert!((weights[0] - 0.5).abs() < 1e-9);
         assert!((weights[1] - 0.5).abs() < 1e-9);
@@ -5275,9 +5901,9 @@ mod tests {
         let mut ws = ws_3_tabs();
         ws.set_focus(0, 1).unwrap();
         ws.toggle_focused_column_tabbed_mode();
-        assert_eq!(ws.columns[0].active_tab_idx(), Some(1));
+        assert_eq!(ws.columns()[0].active_tab_idx(), Some(1));
         ws.toggle_focused_column_tabbed_mode();
-        assert!(matches!(ws.columns[0].mode(), ColumnMode::Vertical));
+        assert!(matches!(ws.columns()[0].mode(), ColumnMode::Vertical));
     }
 
     #[test]
@@ -5285,7 +5911,7 @@ mod tests {
         let mut ws = Workspace::with_gaps(0, 0);
         ws.insert_window(1, Some(800)).unwrap();
         ws.toggle_focused_column_tabbed_mode();
-        assert!(matches!(ws.columns[0].mode(), ColumnMode::Vertical));
+        assert!(matches!(ws.columns()[0].mode(), ColumnMode::Vertical));
     }
 
     #[test]
@@ -5293,8 +5919,8 @@ mod tests {
         let mut ws = ws_3_tabs();
         ws.toggle_focused_column_tabbed_mode();
         ws.set_active_tab(0, 2).unwrap();
-        assert_eq!(ws.columns[0].active_tab_idx(), Some(2));
-        assert_eq!(ws.focused_window_in_column, 2);
+        assert_eq!(ws.columns()[0].active_tab_idx(), Some(2));
+        assert_eq!(ws.focused_window_in_column(), 2);
     }
 
     #[test]
@@ -5305,7 +5931,7 @@ mod tests {
         ws.toggle_focused_column_tabbed_mode();
         ws.set_focus(1, 0).unwrap();
         ws.set_active_tab(0, 2).unwrap();
-        assert_eq!(ws.columns[0].active_tab_idx(), Some(2));
+        assert_eq!(ws.columns()[0].active_tab_idx(), Some(2));
         assert_eq!(ws.focused_column_index(), 1);
     }
 
@@ -5328,10 +5954,10 @@ mod tests {
         let mut ws = ws_3_tabs();
         ws.toggle_focused_column_tabbed_mode();
         ws.focus_up();
-        assert_eq!(ws.focused_window_in_column, 2);
-        assert_eq!(ws.columns[0].active_tab_idx(), Some(2));
+        assert_eq!(ws.focused_window_in_column(), 2);
+        assert_eq!(ws.columns()[0].active_tab_idx(), Some(2));
         ws.focus_up();
-        assert_eq!(ws.focused_window_in_column, 1);
+        assert_eq!(ws.focused_window_in_column(), 1);
     }
 
     #[test]
@@ -5339,12 +5965,12 @@ mod tests {
         let mut ws = ws_3_tabs();
         ws.toggle_focused_column_tabbed_mode();
         ws.focus_down();
-        assert_eq!(ws.focused_window_in_column, 1);
+        assert_eq!(ws.focused_window_in_column(), 1);
         ws.focus_down();
-        assert_eq!(ws.focused_window_in_column, 2);
+        assert_eq!(ws.focused_window_in_column(), 2);
         ws.focus_down();
-        assert_eq!(ws.focused_window_in_column, 0);
-        assert_eq!(ws.columns[0].active_tab_idx(), Some(0));
+        assert_eq!(ws.focused_window_in_column(), 0);
+        assert_eq!(ws.columns()[0].active_tab_idx(), Some(0));
     }
 
     #[test]
@@ -5352,7 +5978,7 @@ mod tests {
         let mut ws = ws_3_tabs();
         ws.set_focus(0, 0).unwrap();
         ws.focus_up();
-        assert_eq!(ws.focused_window_in_column, 0);
+        assert_eq!(ws.focused_window_in_column(), 0);
     }
 
     #[test]
@@ -5368,7 +5994,7 @@ mod tests {
         ws.focus_left();
         assert_eq!(ws.focused_column_index(), 0);
         // Should land on the active tab (2), not whatever index was carried.
-        assert_eq!(ws.focused_window_in_column, 2);
+        assert_eq!(ws.focused_window_in_column(), 2);
     }
 
     #[test]
@@ -5407,61 +6033,92 @@ mod tests {
     }
 
     #[test]
-    fn test_column_removal_synchronizes_replacement_tab() {
-        for remove_whole_column in [false, true] {
-            for remove_left in [false, true] {
-                let mut ws = ws_3_tabs();
-                ws.toggle_focused_column_tabbed_mode();
-                ws.set_active_tab(0, 2).unwrap();
-                ws.insert_window(99, Some(400)).unwrap();
-                if remove_left {
-                    ws.reorder_column(1, 0);
-                }
-                assert_eq!(ws.focused_window(), Some(99));
-
-                if remove_whole_column {
-                    let removed = ws.remove_column(ws.focused_column_index()).unwrap();
-                    assert_eq!(removed.windows(), &[99]);
-                } else {
-                    ws.remove_window(99).unwrap();
-                }
-
-                // Replacement focus and the visible tab must identify the same window.
-                assert_eq!(ws.column_count(), 1);
-                assert_eq!(ws.columns()[0].windows(), &[1, 2, 3]);
-                assert_eq!(ws.focused_column_index(), 0);
-                assert_eq!(ws.focused_window_index_in_column(), 0);
-                assert_eq!(ws.focused_window(), Some(1));
-                assert_eq!(ws.columns()[0].active_tab_idx(), Some(0));
-                let visible: Vec<_> = ws
-                    .compute_placements(Rect::new(0, 0, 1920, 1080))
-                    .into_iter()
-                    .filter(|p| p.visibility == Visibility::Visible)
-                    .map(|p| p.window_id)
-                    .collect();
-                assert_eq!(visible, vec![1]);
+    fn test_removing_window_synchronizes_replacement_tab() {
+        for remove_left in [false, true] {
+            let mut ws = ws_3_tabs();
+            ws.toggle_focused_column_tabbed_mode();
+            ws.set_active_tab(0, 2).unwrap();
+            ws.insert_window(99, Some(400)).unwrap();
+            if remove_left {
+                ws.reorder_column(1, 0);
             }
+            ws.remove_window(99).unwrap();
+            assert_eq!(ws.focused_window(), Some(1));
+            assert_eq!(ws.columns()[0].active_tab_idx(), Some(0));
+            let visible: Vec<_> = ws
+                .compute_placements(Rect::new(0, 0, 1920, 1080))
+                .into_iter()
+                .filter(|p| p.visibility == Visibility::Visible)
+                .map(|p| p.window_id)
+                .collect();
+            assert_eq!(visible, vec![1]);
         }
     }
 
     #[test]
-    fn test_column_removal_clamps_replacement_tab_focus() {
-        let mut ws = ws_3_tabs();
-        ws.remove_window(3).unwrap();
-        ws.toggle_focused_column_tabbed_mode();
-        ws.set_active_tab(0, 0).unwrap();
-        ws.insert_window(99, Some(400)).unwrap();
-        ws.insert_window_in_column(100, 1).unwrap();
-        ws.insert_window_in_column(101, 1).unwrap();
-        ws.set_focus(1, 2).unwrap();
-
-        let removed = ws.remove_column(1).unwrap();
-        assert_eq!(removed.windows(), &[99, 100, 101]);
-        assert_eq!(ws.columns()[0].windows(), &[1, 2]);
-        assert_eq!(ws.focused_column_index(), 0);
-        assert_eq!(ws.focused_window_index_in_column(), 1);
-        assert_eq!(ws.focused_window(), Some(2));
-        assert_eq!(ws.columns()[0].active_tab_idx(), Some(1));
+    fn test_removing_focused_column_selects_replacement_tab() {
+        for (remove_left, inactive_row) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            for tabbed in [false, true] {
+                for minimized in [0, 1, 2] {
+                    for removed_index in 0..3 {
+                        let mut ws = ws_3_tabs();
+                        ws.set_focus(0, 1).unwrap();
+                        if tabbed {
+                            ws.toggle_focused_column_tabbed_mode();
+                        }
+                        ws.insert_window(99, Some(400)).unwrap();
+                        ws.insert_window_in_column(100, 1).unwrap();
+                        ws.insert_window_in_column(101, 1).unwrap();
+                        if remove_left {
+                            ws.reorder_column(1, 0);
+                        }
+                        let removed_column = usize::from(!remove_left);
+                        ws.set_focus(removed_column, removed_index).unwrap();
+                        if minimized >= 1 {
+                            ws.mark_minimized(2);
+                        }
+                        if minimized == 2 {
+                            ws.mark_minimized(1);
+                            ws.mark_minimized(3);
+                        }
+                        if inactive_row {
+                            ws.set_row_layout(&[1.0, 1.0]);
+                            ws.focus_row(1);
+                        }
+                        assert!(ws.remove_column_in_row(0, removed_column).is_some());
+                        let expected = if !tabbed {
+                            removed_index
+                        } else if minimized == 1 {
+                            0
+                        } else {
+                            1
+                        };
+                        let row = ws.row(0).unwrap();
+                        assert_eq!(row.focused_window_in_column(), expected, "left={remove_left} inactive_row={inactive_row} tabbed={tabbed} minimized={minimized} removed_index={removed_index}");
+                        assert_eq!(row.focused_window(), Some([1, 2, 3][expected]));
+                        if !inactive_row {
+                            assert_eq!(ws.focused_window(), row.focused_window());
+                        }
+                        let column = &row.columns()[0];
+                        assert_eq!(column.active_tab_idx(), tabbed.then_some(expected));
+                        let visible =
+                            column.effective_visible_tab(|window| ws.is_minimized(window));
+                        if tabbed && minimized != 2 {
+                            assert_eq!(visible, Some(expected));
+                            let placements = ws.compute_placements(Rect::new(0, 0, 1920, 1080));
+                            assert!(placements
+                                .iter()
+                                .any(|p| p.window_id == row.focused_window().unwrap()
+                                    && p.visibility == Visibility::Visible));
+                        } else {
+                            assert_eq!(visible, None);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -5503,8 +6160,8 @@ mod tests {
         ws.set_active_tab(0, 1).unwrap();
         ws.remove_window(2).unwrap();
         // Removing the active tab selects its successor in the same slot.
-        assert_eq!(ws.columns[0].active_tab_idx(), Some(1));
-        assert_eq!(ws.columns[0].windows()[1], 3);
+        assert_eq!(ws.columns()[0].active_tab_idx(), Some(1));
+        assert_eq!(ws.columns()[0].windows()[1], 3);
     }
 
     #[test]
@@ -5513,9 +6170,9 @@ mod tests {
         ws.toggle_focused_column_tabbed_mode();
         ws.set_active_tab(0, 2).unwrap();
         ws.remove_window(1).unwrap();
-        assert_eq!(ws.columns[0].active_tab_idx(), Some(1));
+        assert_eq!(ws.columns()[0].active_tab_idx(), Some(1));
         // The window at the new active idx is still window 3 (originally idx 2).
-        assert_eq!(ws.columns[0].windows()[1], 3);
+        assert_eq!(ws.columns()[0].windows()[1], 3);
     }
 
     #[test]
@@ -5524,8 +6181,8 @@ mod tests {
         ws.toggle_focused_column_tabbed_mode();
         ws.set_active_tab(0, 0).unwrap();
         ws.remove_window(3).unwrap();
-        assert_eq!(ws.columns[0].active_tab_idx(), Some(0));
-        assert_eq!(ws.columns[0].windows()[0], 1);
+        assert_eq!(ws.columns()[0].active_tab_idx(), Some(0));
+        assert_eq!(ws.columns()[0].windows()[0], 1);
     }
 
     #[test]
@@ -5535,7 +6192,7 @@ mod tests {
         ws.set_active_tab(0, 1).unwrap();
         ws.remove_window(1).unwrap();
         ws.remove_window(2).unwrap();
-        assert!(matches!(ws.columns[0].mode(), ColumnMode::Vertical));
+        assert!(matches!(ws.columns()[0].mode(), ColumnMode::Vertical));
     }
 
     #[test]
@@ -5545,8 +6202,8 @@ mod tests {
             ws.toggle_focused_column_tabbed_mode();
             ws.set_active_tab(0, 1).unwrap();
             ws.insert_window_in_column_at(99, 0, insert_index).unwrap();
-            assert_eq!(ws.columns[0].active_tab_idx(), Some(2));
-            assert_eq!(ws.columns[0].windows()[2], 2);
+            assert_eq!(ws.columns()[0].active_tab_idx(), Some(2));
+            assert_eq!(ws.columns()[0].windows()[2], 2);
         }
     }
 
@@ -5556,7 +6213,7 @@ mod tests {
         ws.toggle_focused_column_tabbed_mode();
         ws.set_active_tab(0, 0).unwrap();
         ws.insert_window_in_column_at(99, 0, 3).unwrap();
-        assert_eq!(ws.columns[0].active_tab_idx(), Some(0));
+        assert_eq!(ws.columns()[0].active_tab_idx(), Some(0));
     }
 
     #[test]
@@ -5564,10 +6221,10 @@ mod tests {
         let mut ws = ws_3_tabs();
         ws.toggle_focused_column_tabbed_mode();
         ws.set_active_tab(0, 1).unwrap();
-        ws.columns[0].swap_windows(0, 1);
-        assert_eq!(ws.columns[0].active_tab_idx(), Some(0));
+        ws.columns_mut()[0].swap_windows(0, 1);
+        assert_eq!(ws.columns()[0].active_tab_idx(), Some(0));
         // Window at the new active idx is the original "active" window (was at idx 1).
-        assert_eq!(ws.columns[0].windows()[0], 2);
+        assert_eq!(ws.columns()[0].windows()[0], 2);
     }
 
     #[test]
@@ -5576,8 +6233,8 @@ mod tests {
         ws.toggle_focused_column_tabbed_mode();
         ws.set_active_tab(0, 1).unwrap();
         ws.move_window_up_in_column();
-        assert_eq!(ws.focused_window_in_column, 0);
-        assert_eq!(ws.columns[0].active_tab_idx(), Some(0));
+        assert_eq!(ws.focused_window_in_column(), 0);
+        assert_eq!(ws.columns()[0].active_tab_idx(), Some(0));
     }
 
     #[test]
@@ -5591,7 +6248,7 @@ mod tests {
             ws.insert_window_in_column(3, receiver).unwrap();
             ws.set_focus(receiver, 0).unwrap();
             ws.toggle_focused_column_tabbed_mode();
-            let moved = ws.columns[source].windows()[0];
+            let moved = ws.columns()[source].windows()[0];
             ws.set_focus(source, 0).unwrap();
 
             if move_right {
@@ -5600,11 +6257,11 @@ mod tests {
                 ws.move_window_left();
             }
 
-            assert_eq!(ws.columns.len(), 1);
-            assert_eq!(ws.columns[0].active_tab_idx(), Some(2));
-            assert_eq!(ws.focused_window_in_column, 2);
+            assert_eq!(ws.columns().len(), 1);
+            assert_eq!(ws.columns()[0].active_tab_idx(), Some(2));
+            assert_eq!(ws.focused_window_in_column(), 2);
             assert_eq!(ws.focused_window(), Some(moved));
-            assert_eq!(ws.columns[0].windows()[2], moved);
+            assert_eq!(ws.columns()[0].windows()[2], moved);
         }
     }
 
@@ -5616,11 +6273,11 @@ mod tests {
         ws.set_focus(0, 1).unwrap();
         ws.expel_to_right();
         // The successor occupies the expelled tab's unchanged active index.
-        assert!(ws.columns[0].is_tabbed());
-        assert_eq!(ws.columns[0].active_tab_idx(), Some(1));
-        assert_eq!(ws.columns[0].windows(), &[1, 3]);
-        assert!(matches!(ws.columns[1].mode(), ColumnMode::Vertical));
-        assert_eq!(ws.columns[1].windows(), &[2]);
+        assert!(ws.columns()[0].is_tabbed());
+        assert_eq!(ws.columns()[0].active_tab_idx(), Some(1));
+        assert_eq!(ws.columns()[0].windows(), &[1, 3]);
+        assert!(matches!(ws.columns()[1].mode(), ColumnMode::Vertical));
+        assert_eq!(ws.columns()[1].windows(), &[2]);
     }
 
     #[test]
@@ -5630,10 +6287,10 @@ mod tests {
         ws.insert_window_in_column(2, 0).unwrap();
         ws.set_focus(0, 0).unwrap();
         ws.toggle_focused_column_tabbed_mode();
-        assert!(ws.columns[0].is_tabbed());
+        assert!(ws.columns()[0].is_tabbed());
         ws.set_focus(0, 1).unwrap();
         ws.expel_to_right();
-        assert!(matches!(ws.columns[0].mode(), ColumnMode::Vertical));
+        assert!(matches!(ws.columns()[0].mode(), ColumnMode::Vertical));
     }
 
     #[test]
@@ -5644,12 +6301,12 @@ mod tests {
         let json = serde_json::to_string(&ws).unwrap();
         let restored: Workspace = serde_json::from_str(&json).unwrap();
         assert_eq!(
-            restored.columns[0].active_tab_idx(),
+            restored.columns()[0].active_tab_idx(),
             Some(1),
             "active_idx should round-trip through JSON"
         );
-        assert!(restored.columns[0].is_tabbed());
-        assert_eq!(restored.focused_window_in_column, 1);
+        assert!(restored.columns()[0].is_tabbed());
+        assert_eq!(restored.focused_window_in_column(), 1);
     }
 
     #[test]
@@ -5668,7 +6325,7 @@ mod tests {
             "centering_mode": "Center"
         }"#;
         let ws: Workspace = serde_json::from_str(legacy).unwrap();
-        assert!(matches!(ws.columns[0].mode(), ColumnMode::Vertical));
+        assert!(matches!(ws.columns()[0].mode(), ColumnMode::Vertical));
         assert_eq!(ws.columns()[0].width(), 800);
         assert_eq!(ws.effective_column_width(&ws.columns()[0]), 800);
     }
@@ -5677,9 +6334,9 @@ mod tests {
     fn test_cycle_height_noop_on_tabbed_column() {
         let mut ws = ws_3_tabs();
         ws.toggle_focused_column_tabbed_mode();
-        let before = ws.columns[0].height_weights().to_vec();
+        let before = ws.columns()[0].height_weights().to_vec();
         ws.cycle_height_up(&[0.333, 0.5, 0.667]);
-        let after = ws.columns[0].height_weights().to_vec();
+        let after = ws.columns()[0].height_weights().to_vec();
         assert_eq!(before, after, "cycle_height should be no-op on Tabbed");
     }
 
@@ -5687,21 +6344,21 @@ mod tests {
     fn test_equalize_heights_noop_on_tabbed_column() {
         let mut ws = ws_3_tabs();
         // Set unequal weights first (in Vertical mode).
-        ws.columns[0].set_height_weight(0, 0.7);
-        let before = ws.columns[0].height_weights().to_vec();
+        ws.columns_mut()[0].set_height_weight(0, 0.7);
+        let before = ws.columns()[0].height_weights().to_vec();
         ws.toggle_focused_column_tabbed_mode();
         ws.equalize_focused_column_heights();
-        let after = ws.columns[0].height_weights().to_vec();
+        let after = ws.columns()[0].height_weights().to_vec();
         assert_eq!(before, after, "equalize should be no-op on Tabbed");
     }
 
     #[test]
     fn test_snap_height_noop_on_tabbed_column() {
         let mut ws = ws_3_tabs();
-        let before = ws.columns[0].height_weights().to_vec();
+        let before = ws.columns()[0].height_weights().to_vec();
         ws.toggle_focused_column_tabbed_mode();
         ws.snap_window_height_to_preset(0, 1, 600, &[0.333, 0.5, 0.667], 1000);
-        let after = ws.columns[0].height_weights().to_vec();
+        let after = ws.columns()[0].height_weights().to_vec();
         assert_eq!(before, after, "snap_height should be no-op on Tabbed");
     }
 
@@ -5712,13 +6369,13 @@ mod tests {
         ws.set_active_tab(0, 0).unwrap();
         ws.mark_minimized(2);
         ws.focus_down();
-        assert_eq!(ws.focused_window_in_column, 2);
-        assert_eq!(ws.columns[0].active_tab_idx(), Some(2));
+        assert_eq!(ws.focused_window_in_column(), 2);
+        assert_eq!(ws.columns()[0].active_tab_idx(), Some(2));
         assert_eq!(ws.focused_window(), Some(3));
 
         ws.focus_up();
-        assert_eq!(ws.focused_window_in_column, 0);
-        assert_eq!(ws.columns[0].active_tab_idx(), Some(0));
+        assert_eq!(ws.focused_window_in_column(), 0);
+        assert_eq!(ws.columns()[0].active_tab_idx(), Some(0));
         assert_eq!(ws.focused_window(), Some(1));
     }
 
@@ -5728,9 +6385,9 @@ mod tests {
         let mut ws = ws_3_tabs();
         ws.toggle_focused_column_tabbed_mode();
         ws.set_focus(0, 1).unwrap();
-        assert_eq!(ws.columns[0].active_tab_idx(), Some(1));
+        assert_eq!(ws.columns()[0].active_tab_idx(), Some(1));
         ws.set_focus(0, 2).unwrap();
-        assert_eq!(ws.columns[0].active_tab_idx(), Some(2));
+        assert_eq!(ws.columns()[0].active_tab_idx(), Some(2));
     }
 
     #[test]
@@ -5742,8 +6399,1292 @@ mod tests {
         ws.insert_window_in_column(3, 1).unwrap();
         ws.set_focus(1, 1).unwrap();
         ws.toggle_focused_column_tabbed_mode();
-        assert_eq!(ws.columns[1].active_tab_idx(), Some(1));
+        assert_eq!(ws.columns()[1].active_tab_idx(), Some(1));
         ws.insert_window_in_column_at(99, 1, 2).unwrap();
-        assert_eq!(ws.columns[1].active_tab_idx(), Some(1));
+        assert_eq!(ws.columns()[1].active_tab_idx(), Some(1));
+    }
+
+    // ========================================================================
+    // Multi-Row Scrolling Engine Tests (Phase 1)
+    // ========================================================================
+
+    #[test]
+    fn test_multi_row_rect_partitioning() {
+        let mut ws = Workspace::with_gaps(10, 10);
+        ws.set_row_gap(10);
+        let viewport = Rect::new(0, 0, 1920, 1080);
+
+        // 1 row: full content height = 1080 - 10 (top) - 10 (bottom) = 1060
+        let rects_1 = ws.row_rects(viewport);
+        assert_eq!(rects_1.len(), 1);
+        assert_eq!(rects_1[0], Rect::new(0, 10, 1920, 1060));
+
+        // 2 equal rows: content height = 1080 - 10 - 10 - 10 (row_gap) = 1050
+        // Each row gets 525 px.
+        ws.set_row_layout(&[1.0, 1.0]);
+        let rects_2 = ws.row_rects(viewport);
+        assert_eq!(rects_2.len(), 2);
+        assert_eq!(rects_2[0], Rect::new(0, 10, 1920, 525));
+        assert_eq!(rects_2[1], Rect::new(0, 10 + 525 + 10, 1920, 525));
+        // Verify total height coverage
+        assert_eq!(10 + rects_2[0].height + 10 + rects_2[1].height + 10, 1080);
+
+        // 3 rows with fractional shares [1.0, 2.0, 1.0]
+        // Content height = 1080 - 10 - 10 - 2 * 10 = 1040
+        // Total shares = 4.0. Row 0: 260, Row 1: 520, Row 2: 260.
+        ws.set_row_layout(&[1.0, 2.0, 1.0]);
+        let rects_3 = ws.row_rects(viewport);
+        assert_eq!(rects_3.len(), 3);
+        assert_eq!(rects_3[0].height, 260);
+        assert_eq!(rects_3[1].height, 520);
+        assert_eq!(rects_3[2].height, 260);
+    }
+
+    #[test]
+    #[ignore = "small tabbed rows reserve the entire row height for the tab strip"]
+    fn test_small_tabbed_row_keeps_active_window_visible() {
+        let mut ws = Workspace::with_gaps(0, 0);
+        ws.set_row_gap(10);
+        ws.set_row_layout(&[0.95, 0.05]);
+        ws.set_tab_strip_reserve_px(38);
+
+        ws.insert_window(1, Some(400)).unwrap();
+        ws.insert_window_in_column(2, 0).unwrap();
+        ws.toggle_focused_column_tabbed_mode();
+        ws.set_active_tab(0, 0).unwrap();
+
+        ws.focus_row(1);
+        ws.insert_window(3, Some(400)).unwrap();
+        ws.insert_window_in_column(4, 0).unwrap();
+        ws.toggle_focused_column_tabbed_mode();
+        ws.set_active_tab(0, 0).unwrap();
+
+        let placements = ws.compute_placements(Rect::new(0, 0, 1280, 720));
+        let normal = placements.iter().find(|p| p.window_id == 1).unwrap();
+        assert_eq!(normal.visibility, Visibility::Visible);
+        assert_eq!(normal.rect, Rect::new(0, 38, 400, 637));
+
+        let active = placements.iter().find(|p| p.window_id == 3).unwrap();
+        assert_eq!(active.visibility, Visibility::Visible);
+        assert!(active.rect.height > 0, "active tab has no usable height");
+    }
+
+    #[test]
+    fn test_multi_row_independent_scrolling() {
+        let mut ws = Workspace::with_gaps(10, 10);
+        ws.set_row_layout(&[1.0, 1.0]);
+
+        // Insert in row 0
+        ws.focus_row(0);
+        ws.insert_window(1, Some(1500)).unwrap();
+        ws.insert_window(2, Some(1500)).unwrap();
+
+        // Insert in row 1
+        ws.focus_row(1);
+        ws.insert_window(3, Some(1500)).unwrap();
+        ws.insert_window(4, Some(1500)).unwrap();
+
+        // Scroll row 0
+        ws.focus_row(0);
+        ws.scroll_by(300.0, 1920);
+        assert_eq!(ws.rows()[0].scroll_offset(), 300.0);
+        assert_eq!(ws.rows()[1].scroll_offset(), 0.0);
+
+        // Scroll row 1
+        ws.focus_row(1);
+        ws.scroll_by(450.0, 1920);
+        assert_eq!(ws.rows()[0].scroll_offset(), 300.0);
+        assert_eq!(ws.rows()[1].scroll_offset(), 450.0);
+
+        // Scroll row 0 targeting row index directly
+        ws.scroll_row_by(0, 50.0, 1920);
+        assert_eq!(ws.rows()[0].scroll_offset(), 350.0);
+        assert_eq!(ws.rows()[1].scroll_offset(), 450.0);
+    }
+
+    #[test]
+    fn test_multi_row_placements_tag_row_index() {
+        let mut ws = Workspace::with_gaps(10, 10);
+        ws.set_row_layout(&[1.0, 1.0]);
+        let viewport = Rect::new(0, 0, 1920, 1080);
+
+        ws.focus_row(0);
+        ws.insert_window(1, Some(800)).unwrap();
+
+        ws.focus_row(1);
+        ws.insert_window(2, Some(800)).unwrap();
+
+        let placements = ws.compute_placements(viewport);
+        assert_eq!(placements.len(), 2);
+
+        let p1 = placements.iter().find(|p| p.window_id == 1).unwrap();
+        let p2 = placements.iter().find(|p| p.window_id == 2).unwrap();
+
+        assert_eq!(p1.row_index, 0);
+        assert_eq!(p2.row_index, 1);
+
+        let row_rects = ws.row_rects(viewport);
+        assert!(p1.rect.y >= row_rects[0].y);
+        assert!(p1.rect.bottom() <= row_rects[0].bottom());
+        assert!(p2.rect.y >= row_rects[1].y);
+        assert!(p2.rect.bottom() <= row_rects[1].bottom());
+    }
+
+    #[test]
+    fn test_multi_row_focus_navigation_and_empty_row() {
+        let mut ws = Workspace::with_gaps(10, 10);
+        ws.set_row_layout(&[1.0, 1.0, 1.0]);
+
+        ws.focus_row(0);
+        ws.insert_window(1, Some(800)).unwrap();
+        ws.focus_row(2);
+        ws.insert_window(3, Some(800)).unwrap();
+
+        // Row 1 is empty. D6: empty rows can be focused.
+        assert_eq!(ws.window_count_for_row(1), 0);
+        ws.focus_row(1);
+        assert_eq!(ws.focused_row(), 1);
+
+        // Inserting into empty focused row puts the new window there
+        ws.insert_window(2, Some(800)).unwrap();
+        assert_eq!(ws.window_count_for_row(1), 1);
+        assert_eq!(ws.find_window_location_rc(2), Some((1, 0, 0)));
+
+        // Focus row navigation
+        ws.focus_row(0);
+        ws.focus_row_down();
+        assert_eq!(ws.focused_row(), 1);
+        assert_eq!(ws.focused_window(), Some(2));
+
+        ws.focus_row_down();
+        assert_eq!(ws.focused_row(), 2);
+        assert_eq!(ws.focused_window(), Some(3));
+
+        ws.focus_row_up();
+        assert_eq!(ws.focused_row(), 1);
+        assert_eq!(ws.focused_window(), Some(2));
+    }
+
+    #[test]
+    fn test_multi_row_directional_focus_crossing() {
+        let mut ws = Workspace::with_gaps(10, 10);
+        ws.set_row_layout(&[1.0, 1.0]);
+
+        ws.focus_row(0);
+        ws.insert_window(1, Some(800)).unwrap();
+
+        ws.focus_row(1);
+        ws.insert_window(2, Some(800)).unwrap();
+
+        ws.focus_row(0);
+        assert_eq!(ws.focused_window(), Some(1));
+
+        // Moving down at bottom of row 0 moves focus to row 1 (D2)
+        ws.focus_down();
+        assert_eq!(ws.focused_row(), 1);
+        assert_eq!(ws.focused_window(), Some(2));
+
+        // Moving up at top of row 1 moves focus to row 0 (D2)
+        ws.focus_up();
+        assert_eq!(ws.focused_row(), 0);
+        assert_eq!(ws.focused_window(), Some(1));
+    }
+
+    #[test]
+    fn test_multi_row_move_window_to_row() {
+        let mut ws = Workspace::with_gaps(10, 10);
+        ws.set_row_layout(&[1.0, 1.0]);
+
+        ws.focus_row(0);
+        ws.insert_window(1, Some(800)).unwrap();
+        ws.insert_window(2, Some(800)).unwrap();
+
+        assert_eq!(ws.window_count_for_row(0), 2);
+        assert_eq!(ws.window_count_for_row(1), 0);
+
+        // Move window 1 to row 1
+        ws.move_window_to_row(1, 1).unwrap();
+        assert_eq!(ws.window_count_for_row(0), 1);
+        assert_eq!(ws.window_count_for_row(1), 1);
+        assert_eq!(ws.focused_row(), 1);
+        assert_eq!(ws.focused_window(), Some(1));
+
+        // Move window 1 back to row 0
+        ws.move_window_to_row_up().unwrap();
+        assert_eq!(ws.window_count_for_row(0), 2);
+        assert_eq!(ws.window_count_for_row(1), 0);
+        assert_eq!(ws.focused_row(), 0);
+    }
+
+    #[test]
+    fn test_multi_row_reconciliation_add_and_remove() {
+        let mut ws = Workspace::with_gaps(10, 10);
+        ws.set_row_layout(&[1.0, 1.0, 1.0]);
+
+        ws.focus_row(0);
+        ws.insert_window(1, Some(800)).unwrap();
+        ws.focus_row(1);
+        ws.insert_window(2, Some(800)).unwrap();
+        ws.focus_row(2);
+        ws.insert_window(3, Some(800)).unwrap();
+
+        assert_eq!(ws.row_count(), 3);
+        assert_eq!(ws.window_count(), 3);
+
+        // Shrink to 1 row: rows 1 and 2 are drained into row 0
+        ws.set_row_layout(&[1.0]);
+        assert_eq!(ws.row_count(), 1);
+        assert_eq!(ws.window_count(), 3);
+        assert_eq!(ws.window_count_for_row(0), 3);
+        assert!(ws.contains_window(1));
+        assert!(ws.contains_window(2));
+        assert!(ws.contains_window(3));
+
+        // Expand back to 2 rows: new row is empty
+        ws.set_row_layout(&[1.0, 1.0]);
+        assert_eq!(ws.row_count(), 2);
+        assert_eq!(ws.window_count_for_row(0), 3);
+        assert_eq!(ws.window_count_for_row(1), 0);
+    }
+
+    #[test]
+    fn test_legacy_json_deserialization_single_row() {
+        let legacy_json = r#"{
+            "columns": [
+                {
+                    "windows": [101, 102],
+                    "width": 800,
+                    "height_weights": [0.5, 0.5],
+                    "mode": { "type": "vertical" }
+                }
+            ],
+            "focused_column": 0,
+            "focused_window_in_column": 1,
+            "scroll_offset": 25.0,
+            "gap": 12,
+            "default_column_width": 800
+        }"#;
+
+        let ws: Workspace = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(ws.row_count(), 1);
+        assert_eq!(ws.focused_row(), 0);
+        assert_eq!(ws.columns().len(), 1);
+        assert_eq!(ws.columns()[0].len(), 2);
+        assert_eq!(ws.focused_column_index(), 0);
+        assert_eq!(ws.focused_window_in_column(), 1);
+        assert_eq!(ws.scroll_offset(), 25.0);
+        assert_eq!(ws.gap(), 12);
+    }
+
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct LegacyWorkspace035 {
+        columns: Vec<Column>,
+        focused_column: usize,
+        focused_window_in_column: usize,
+        scroll_offset: f64,
+        gap: i32,
+        #[serde(default = "crate::types::default_outer_gap_value")]
+        outer_gap_left: i32,
+        #[serde(default = "crate::types::default_outer_gap_value")]
+        outer_gap_right: i32,
+        #[serde(default = "crate::types::default_outer_gap_value")]
+        outer_gap_top: i32,
+        #[serde(default = "crate::types::default_outer_gap_value")]
+        outer_gap_bottom: i32,
+        default_column_width: i32,
+        centering_mode: CenteringMode,
+        #[serde(default)]
+        floating_windows: Vec<FloatingWindow>,
+        #[serde(default)]
+        fullscreen_window: Option<WindowId>,
+        #[serde(default)]
+        minimized_windows: std::collections::HashSet<WindowId>,
+    }
+
+    #[test]
+    fn test_single_row_json_is_035_compatible() {
+        let mut ws = Workspace::with_gaps(10, 12);
+        ws.insert_window(10, Some(400)).unwrap();
+        ws.insert_window(20, Some(600)).unwrap();
+        ws.insert_window_in_column(30, 1).unwrap();
+        ws.focus_window(30).unwrap();
+        ws.set_scroll_offset(125.0);
+        let current = serde_json::to_value(&ws).unwrap();
+        let legacy: LegacyWorkspace035 = serde_json::from_value(current.clone()).unwrap();
+        assert_eq!(legacy.columns[0].width(), 400);
+        assert_eq!(legacy.columns[1].width(), 600);
+        assert_eq!(legacy.columns[1].windows(), &[20, 30]);
+        assert_eq!(
+            (legacy.focused_column, legacy.focused_window_in_column),
+            (1, 1)
+        );
+        assert_eq!(legacy.scroll_offset, 125.0);
+        let legacy_json = serde_json::to_value(&legacy).unwrap();
+        assert_eq!(current, legacy_json);
+        let restored: Workspace = serde_json::from_value(legacy_json).unwrap();
+        assert_eq!(restored.columns()[0].windows(), &[10]);
+        assert_eq!(restored.columns()[1].windows(), &[20, 30]);
+        assert_eq!(restored.columns()[1].width(), 600);
+        assert_eq!(restored.focused_window(), Some(30));
+        assert_eq!(restored.scroll_offset(), 125.0);
+    }
+
+    #[test]
+    fn test_multi_row_json_roundtrip() {
+        let mut ws = Workspace::with_gaps(10, 10);
+        ws.set_row_layout(&[0.4, 0.6]);
+        ws.set_row_gap(16);
+
+        ws.focus_row(0);
+        ws.insert_window(10, Some(750)).unwrap();
+
+        ws.focus_row(1);
+        ws.insert_window(20, Some(850)).unwrap();
+        ws.insert_window(30, Some(900)).unwrap();
+
+        let json = serde_json::to_string_pretty(&ws).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["rows"].as_array().unwrap().len(), 2);
+        assert!(value.get("columns").is_none());
+        let restored: Workspace = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(restored.row_count(), 2);
+        assert_eq!(restored.row_shares(), &[0.4, 0.6]);
+        assert_eq!(restored.row_gap(), 16);
+        assert_eq!(restored.focused_row(), 1);
+        assert_eq!(restored.window_count_for_row(0), 1);
+        assert_eq!(restored.window_count_for_row(1), 2);
+        assert_eq!(restored.find_window_location_rc(10), Some((0, 0, 0)));
+        assert_eq!(restored.find_window_location_rc(20), Some((1, 0, 0)));
+        assert_eq!(restored.find_window_location_rc(30), Some((1, 1, 0)));
+    }
+
+    #[test]
+    fn test_tabbed_column_no_wrap_multi_row() {
+        // Single row: tabbed column wraps
+        let mut ws_single = Workspace::new();
+        ws_single.insert_window(1, None).unwrap();
+        ws_single.insert_window_in_column(2, 0).unwrap();
+        ws_single.insert_window_in_column(3, 0).unwrap();
+        ws_single.toggle_focused_column_tabbed_mode();
+        assert_eq!(ws_single.focused_window(), Some(1));
+        ws_single.focus_up();
+        assert_eq!(
+            ws_single.focused_window(),
+            Some(3),
+            "Single row tabbed wraps up to last tab"
+        );
+        ws_single.focus_down();
+        assert_eq!(
+            ws_single.focused_window(),
+            Some(1),
+            "Single row tabbed wraps down to first tab"
+        );
+
+        // Multi row: tabbed column does NOT wrap, leaves for adjacent row
+        let mut ws = Workspace::new();
+        ws.set_row_layout(&[0.5, 0.5]);
+
+        // Row 0: tabbed column with windows 1, 2
+        ws.focus_row(0);
+        ws.insert_window(1, None).unwrap();
+        ws.insert_window_in_column(2, 0).unwrap();
+        ws.toggle_focused_column_tabbed_mode();
+
+        // Row 1: tabbed column with windows 3, 4
+        ws.focus_row(1);
+        ws.insert_window(3, None).unwrap();
+        ws.insert_window_in_column(4, 0).unwrap();
+        ws.toggle_focused_column_tabbed_mode();
+
+        // In Row 0 at tab 0 (win 1): focus_up must not wrap, stays at tab 0 (top of workspace)
+        ws.focus_row(0);
+        assert_eq!(ws.focused_window(), Some(1));
+        ws.focus_up();
+        assert_eq!(
+            ws.focused_window(),
+            Some(1),
+            "Row 0 tab 0 focus_up stays at top, does not wrap"
+        );
+
+        // Move to tab 1 (win 2): focus_down leaves Row 0 for Row 1 (lands on Row 1 last focused: win 3)
+        ws.focus_down();
+        assert_eq!(ws.focused_window(), Some(2));
+        ws.focus_down(); // Leaves Row 0 for Row 1
+        assert_eq!(ws.focused_row(), 1);
+        assert_eq!(ws.focused_window(), Some(3), "Leaves Row 0 for Row 1");
+
+        // In Row 1, focus tab 1 (win 4): focus_down stays at tab 4 (bottom of workspace)
+        ws.focus_down();
+        assert_eq!(ws.focused_window(), Some(4));
+        ws.focus_down();
+        assert_eq!(
+            ws.focused_window(),
+            Some(4),
+            "Row 1 last tab focus_down stays at bottom, does not wrap"
+        );
+
+        // From tab 0 in Row 1: focus_up leaves Row 1 for Row 0 (lands on win 2)
+        ws.focus_up();
+        assert_eq!(ws.focused_window(), Some(3));
+        ws.focus_up(); // Leaves Row 1 for Row 0
+        assert_eq!(ws.focused_row(), 0);
+        assert_eq!(
+            ws.focused_window(),
+            Some(2),
+            "Leaves Row 1 for Row 0 last focused"
+        );
+    }
+
+    #[test]
+    fn test_cross_row_focus_lands_on_last_focused() {
+        let mut ws = Workspace::new();
+        ws.set_row_layout(&[0.5, 0.5]);
+
+        // Row 0: columns with win 1 and win 2
+        ws.focus_row(0);
+        ws.insert_window(1, None).unwrap();
+        ws.insert_window(2, None).unwrap();
+        ws.focus_left();
+        assert_eq!(ws.focused_window(), Some(1)); // Focus win 1 in row 0
+
+        // Row 1: columns with win 3 and win 4
+        ws.focus_row(1);
+        ws.insert_window(3, None).unwrap();
+        ws.insert_window(4, None).unwrap();
+        assert_eq!(ws.focused_window(), Some(4)); // Focus win 4 in row 1
+
+        // Switch to row 0 -> lands on win 1 (last focused in row 0)
+        ws.focus_row_up();
+        assert_eq!(ws.focused_row(), 0);
+        assert_eq!(ws.focused_window(), Some(1));
+
+        // Focus win 2 in row 0
+        ws.focus_right();
+        assert_eq!(ws.focused_window(), Some(2));
+
+        // focus_down -> leaves row 0, lands on win 4 (last focused in row 1)
+        ws.focus_down();
+        assert_eq!(ws.focused_row(), 1);
+        assert_eq!(ws.focused_window(), Some(4));
+
+        // focus_up -> leaves row 1, lands on win 2 (last focused in row 0)
+        ws.focus_up();
+        assert_eq!(ws.focused_row(), 0);
+        assert_eq!(ws.focused_window(), Some(2));
+    }
+
+    #[test]
+    fn test_focus_empty_row_and_insert() {
+        let mut ws = Workspace::new();
+        ws.set_row_layout(&[0.33, 0.33, 0.34]);
+
+        ws.focus_row(0);
+        ws.insert_window(10, None).unwrap();
+
+        ws.focus_row(2);
+        ws.insert_window(30, None).unwrap();
+
+        // Row 1 is empty
+        assert!(ws.is_row_empty(1));
+
+        // Focus row 1 directly
+        ws.focus_row(1);
+        assert_eq!(ws.focused_row(), 1);
+        assert_eq!(ws.focused_window(), None);
+        assert_eq!(ws.focused_visible_window(), None);
+
+        // Directional focus_down from row 1 lands on row 2
+        ws.focus_down();
+        assert_eq!(ws.focused_row(), 2);
+        assert_eq!(ws.focused_window(), Some(30));
+
+        // Directional focus_up from row 2 lands on row 1 (empty row)
+        ws.focus_up();
+        assert_eq!(ws.focused_row(), 1);
+        assert_eq!(ws.focused_window(), None);
+
+        // Directional focus_up from row 1 lands on row 0
+        ws.focus_up();
+        assert_eq!(ws.focused_row(), 0);
+        assert_eq!(ws.focused_window(), Some(10));
+
+        // Move to empty row 1 and insert a window
+        ws.focus_row_down();
+        assert_eq!(ws.focused_row(), 1);
+        ws.insert_window(20, None).unwrap();
+        assert_eq!(ws.focused_row(), 1);
+        assert_eq!(ws.focused_window(), Some(20));
+        assert_eq!(ws.find_window_location_rc(20), Some((1, 0, 0)));
+    }
+
+    #[test]
+    fn test_move_window_edge_across_rows_setting() {
+        let mut ws = Workspace::new();
+        ws.set_row_layout(&[0.5, 0.5]);
+
+        // Row 0: column 0 with windows 1 and 2 vertically stacked
+        ws.focus_row(0);
+        ws.insert_window(1, None).unwrap();
+        ws.insert_window_in_column(2, 0).unwrap();
+
+        // Row 1: column 0 with window 3
+        ws.focus_row(1);
+        ws.insert_window(3, None).unwrap();
+
+        ws.focus_row(0);
+        ws.focus_up();
+        assert_eq!(ws.focused_window(), Some(1)); // win 1 is at top of column
+
+        // At top of column: move_window_up(false) is no-op
+        ws.move_window_up(false);
+        assert_eq!(ws.focused_window(), Some(1));
+        assert_eq!(ws.find_window_location_rc(1), Some((0, 0, 0)));
+
+        // At top of row 0: move_window_up(true) is also no-op (no row above)
+        ws.move_window_up(true);
+        assert_eq!(ws.find_window_location_rc(1), Some((0, 0, 0)));
+
+        // Move to window 2 (at bottom of column in row 0)
+        ws.focus_down();
+        assert_eq!(ws.focused_window(), Some(2));
+
+        // move_window_down(false) is a no-op (setting off)
+        ws.move_window_down(false);
+        assert_eq!(ws.find_window_location_rc(2), Some((0, 0, 1)));
+
+        // move_window_down(true) moves window 2 to row 1 (setting on)
+        ws.move_window_down(true);
+        assert_eq!(ws.focused_row(), 1);
+        assert_eq!(ws.focused_window(), Some(2));
+        assert_eq!(ws.find_window_location_rc(2), Some((1, 1, 0)));
+        assert_eq!(ws.window_count_for_row(0), 1);
+        assert_eq!(ws.window_count_for_row(1), 2);
+
+        // At top of column in row 1: move_window_up(true) moves window 2 back to row 0
+        ws.move_window_up(true);
+        assert_eq!(ws.focused_row(), 0);
+        assert_eq!(ws.focused_window(), Some(2));
+        assert_eq!(ws.find_window_location_rc(2), Some((0, 1, 0)));
+    }
+
+    #[test]
+    fn test_focus_next_prev_row_major_skipping_empty_rows() {
+        let mut ws = Workspace::new();
+        ws.set_row_layout(&[0.33, 0.33, 0.34]);
+
+        // Row 0: windows 1 and 2 in separate columns
+        ws.focus_row(0);
+        ws.insert_window(1, None).unwrap();
+        ws.insert_window(2, None).unwrap();
+
+        // Row 1: empty!
+        // Row 2: column 0 with windows 3 and 4 stacked
+        ws.focus_row(2);
+        ws.insert_window(3, None).unwrap();
+        ws.insert_window_in_column(4, 0).unwrap();
+
+        // Start at window 1 (Row 0, Col 0)
+        ws.focus_row(0);
+        ws.focus_left();
+        assert_eq!(ws.focused_window(), Some(1));
+
+        // Forward cycling via focus_next()
+        ws.focus_next();
+        assert_eq!(ws.focused_window(), Some(2), "Next from 1 -> 2 (Row 0)");
+        ws.focus_next();
+        assert_eq!(
+            ws.focused_window(),
+            Some(3),
+            "Next from 2 -> 3 (skips empty Row 1 into Row 2)"
+        );
+        assert_eq!(ws.focused_row(), 2);
+        ws.focus_next();
+        assert_eq!(
+            ws.focused_window(),
+            Some(4),
+            "Next from 3 -> 4 (stacked in Row 2)"
+        );
+        ws.focus_next();
+        assert_eq!(
+            ws.focused_window(),
+            Some(1),
+            "Next from 4 wraps to 1 (Row 0)"
+        );
+        assert_eq!(ws.focused_row(), 0);
+
+        // Reverse cycling via focus_prev()
+        ws.focus_prev();
+        assert_eq!(
+            ws.focused_window(),
+            Some(4),
+            "Prev from 1 wraps to 4 (Row 2, skipping empty Row 1)"
+        );
+        assert_eq!(ws.focused_row(), 2);
+        ws.focus_prev();
+        assert_eq!(ws.focused_window(), Some(3), "Prev from 4 -> 3");
+        ws.focus_prev();
+        assert_eq!(
+            ws.focused_window(),
+            Some(2),
+            "Prev from 3 -> 2 (Row 0, skipping empty Row 1)"
+        );
+        assert_eq!(ws.focused_row(), 0);
+        ws.focus_prev();
+        assert_eq!(ws.focused_window(), Some(1), "Prev from 2 -> 1");
+    }
+
+    #[test]
+    fn test_multi_row_animation_tick_and_query() {
+        let mut ws = Workspace::with_gaps(0, 0);
+        ws.set_row_layout(&[0.5, 0.5]);
+
+        ws.focus_row(0);
+        for id in 1..=5 {
+            ws.insert_window(id, Some(500)).unwrap();
+        }
+
+        ws.focus_row(1);
+        for id in 6..=10 {
+            ws.insert_window(id, Some(500)).unwrap();
+        }
+
+        assert!(!ws.is_animating());
+        assert!(!ws.is_animating_for_row(0));
+        assert!(!ws.is_animating_for_row(1));
+
+        // Start animation on row 0
+        ws.start_scroll_animation_for_row(0, 300.0, 1000, Some(200), Some(Easing::Linear));
+        assert!(ws.is_animating());
+        assert!(ws.is_animating_for_row(0));
+        assert!(!ws.is_animating_for_row(1));
+
+        // Start animation on row 1
+        ws.start_scroll_animation_for_row(1, 400.0, 1000, Some(400), Some(Easing::Linear));
+        assert!(ws.is_animating());
+        assert!(ws.is_animating_for_row(0));
+        assert!(ws.is_animating_for_row(1));
+
+        // Tick 250ms: row 0 finishes (duration 200), row 1 still active (duration 400)
+        let still_running = ws.tick_animation(250);
+        assert!(still_running);
+        assert!(!ws.is_animating_for_row(0));
+        assert!(ws.is_animating_for_row(1));
+        assert_eq!(ws.rows[0].scroll_offset, 300.0);
+
+        // Tick another 200ms: row 1 finishes
+        let still_running = ws.tick_animation(200);
+        assert!(!still_running);
+        assert!(!ws.is_animating());
+        assert_eq!(ws.rows[1].scroll_offset, 400.0);
+    }
+
+    #[test]
+    fn test_at_workspace_top_and_bottom() {
+        let mut ws = Workspace::new();
+        ws.set_row_layout(&[0.5, 0.5]);
+
+        ws.focus_row(0);
+        ws.insert_window(1, None).unwrap();
+        ws.insert_window_in_column(2, 0).unwrap();
+
+        ws.focus_row(1);
+        ws.insert_window(3, None).unwrap();
+        ws.insert_window_in_column(4, 0).unwrap();
+
+        // Row 0, win 1
+        ws.focus_row(0);
+        ws.focus_up();
+        assert_eq!(ws.focused_window(), Some(1));
+        assert!(ws.at_column_top());
+        assert!(ws.at_workspace_top());
+        assert!(!ws.at_column_bottom());
+        assert!(!ws.at_workspace_bottom());
+
+        // Row 0, win 2
+        ws.focus_down();
+        assert_eq!(ws.focused_window(), Some(2));
+        assert!(!ws.at_column_top());
+        assert!(!ws.at_workspace_top());
+        assert!(ws.at_column_bottom());
+        assert!(
+            !ws.at_workspace_bottom(),
+            "Row 0 column bottom is not workspace bottom"
+        );
+
+        // Row 1, win 3
+        ws.focus_row(1);
+        assert_eq!(ws.focused_window(), Some(3));
+        assert!(ws.at_column_top());
+        assert!(
+            !ws.at_workspace_top(),
+            "Row 1 column top is not workspace top"
+        );
+        assert!(!ws.at_column_bottom());
+        assert!(!ws.at_workspace_bottom());
+
+        // Row 1, win 4
+        ws.focus_down();
+        assert_eq!(ws.focused_window(), Some(4));
+        assert!(!ws.at_column_top());
+        assert!(!ws.at_workspace_top());
+        assert!(ws.at_column_bottom());
+        assert!(ws.at_workspace_bottom());
+    }
+
+    #[test]
+    fn test_set_row_layout_shrink_keeps_maximized_columns() {
+        let mut ws = Workspace::with_gaps(0, 0);
+        ws.set_row_layout(&[0.5, 0.5]);
+        ws.focus_row(0);
+        ws.insert_window(1, Some(400)).unwrap();
+        ws.focus_row(1);
+        ws.insert_window(2, Some(500)).unwrap();
+        assert!(ws.toggle_maximize_column(1920));
+        assert_eq!(ws.rows()[1].columns()[0].width(), 1920);
+
+        // Shrink to 1 row: row 1's maximized column moves to row 0 and can be un-maximized.
+        ws.set_row_layout(&[1.0]);
+        assert_eq!(ws.row_count(), 1);
+        assert_eq!(ws.rows()[0].columns()[1].width(), 1920);
+        assert!(!ws.toggle_maximize_column(1920));
+        assert_eq!(ws.rows()[0].columns()[1].width(), 500);
+        // If both rows had a maximized column when shrinking, both stay maximized and each
+        // restores on its own.
+        ws.set_row_layout(&[0.5, 0.5]);
+        ws.move_window_to_row(2, 1).unwrap();
+        ws.focus_row(0);
+        assert!(ws.toggle_maximize_column(1920));
+        ws.focus_row(1);
+        assert!(ws.toggle_maximize_column(1920));
+        ws.set_row_layout(&[1.0]);
+        assert_eq!(ws.rows()[0].columns()[0].width(), 1920);
+        assert_eq!(ws.rows()[0].columns()[1].width(), 1920);
+        assert_eq!(ws.focused_window(), Some(2));
+        assert!(!ws.toggle_maximize_column(1920));
+        assert_eq!(ws.rows()[0].columns()[1].width(), 500);
+        ws.focus_window(1).unwrap();
+        assert!(!ws.toggle_maximize_column(1920));
+        assert_eq!(ws.rows()[0].columns()[0].width(), 400);
+    }
+
+    #[test]
+    fn test_removing_first_window_of_maximized_column_preserves_restore() {
+        let mut ws = Workspace::with_gaps(0, 0);
+        ws.insert_window(1, Some(450)).unwrap();
+        ws.insert_window_in_column(2, 0).unwrap();
+        assert!(ws.toggle_maximize_column(1920));
+
+        ws.remove_window(1).unwrap();
+
+        assert_eq!(ws.columns()[0].windows(), &[2]);
+        assert_eq!(ws.columns()[0].width(), 1920);
+        assert!(!ws.toggle_maximize_column(1920));
+        assert_eq!(ws.columns()[0].width(), 450);
+    }
+
+    #[test]
+    fn test_move_first_window_of_maximized_column_to_another_row_preserves_restore() {
+        let mut ws = Workspace::with_gaps(0, 0);
+        ws.set_row_layout(&[0.5, 0.5]);
+        ws.focus_row(0);
+        ws.insert_window(1, Some(450)).unwrap();
+        ws.insert_window_in_column(2, 0).unwrap();
+        assert!(ws.toggle_maximize_column(1920));
+        assert_eq!(ws.rows()[0].columns()[0].width(), 1920);
+
+        // Move the sentinel window (1) to row 1.
+        ws.move_window_to_row(1, 1).unwrap();
+        // The moved window in row 1 gets the original un-maximized width (450), not 1920.
+        assert_eq!(ws.rows()[1].columns()[0].width(), 450);
+        // The remaining window (2) in row 0 stays maximized and can still be restored to 450!
+        assert_eq!(ws.rows()[0].columns()[0].width(), 1920);
+        ws.focus_row(0);
+        assert!(!ws.toggle_maximize_column(1920));
+        assert_eq!(ws.rows()[0].columns()[0].width(), 450);
+    }
+
+    #[test]
+    fn test_equalize_column_widths_only_clears_focused_row_min_sizes() {
+        let mut ws = Workspace::with_gaps(0, 0);
+        ws.set_row_layout(&[0.5, 0.5]);
+        ws.focus_row(0);
+        ws.insert_window(1, Some(400)).unwrap();
+        ws.insert_window(2, Some(400)).unwrap();
+        ws.set_window_min_width(1, 600);
+
+        ws.focus_row(1);
+        ws.insert_window(3, Some(400)).unwrap();
+        ws.set_window_min_width(3, 700);
+        ws.set_window_min_height(3, 350);
+
+        ws.focus_row(0);
+        ws.equalize_column_widths(1200);
+        assert_eq!(ws.window_min_widths.get(&1).copied(), None);
+        assert_eq!(ws.window_min_widths.get(&3).copied(), Some(700));
+        assert_eq!(ws.window_min_height(3), Some(350));
+    }
+
+    #[test]
+    fn test_land_focus_in_row_clamps_window_index_when_remembered_column_minimized() {
+        let mut ws = Workspace::with_gaps(0, 0);
+        ws.set_row_layout(&[0.5, 0.5]);
+        ws.focus_row(0);
+        // Column A has 1 window; Column B has 3 windows.
+        ws.insert_window(1, Some(400)).unwrap();
+        ws.insert_window(2, Some(400)).unwrap();
+        ws.insert_window_in_column(3, 1).unwrap();
+        ws.insert_window_in_column(4, 1).unwrap();
+        // Focus is on the third window of Column B (index 2).
+        ws.set_focus(1, 2).unwrap();
+        assert_eq!(ws.focused_window(), Some(4));
+
+        // Focus row 1, minimize all windows in Column B, then focus row 0.
+        ws.focus_row(1);
+        ws.insert_window(5, Some(400)).unwrap();
+        ws.mark_minimized(2);
+        ws.mark_minimized(3);
+        ws.mark_minimized(4);
+
+        ws.focus_row(0);
+        assert_eq!(ws.focused_row(), 0);
+        assert_eq!(ws.focused_column_index(), 0);
+        assert_eq!(ws.focused_window_in_column(), 0);
+        assert_eq!(ws.focused_window(), Some(1));
+    }
+
+    #[test]
+    fn test_move_window_up_down_on_empty_row_does_not_panic() {
+        let mut ws = Workspace::with_gaps(0, 0);
+        ws.set_row_layout(&[0.5, 0.5]);
+        ws.focus_row(0);
+        assert!(ws.rows()[0].is_empty());
+        ws.move_window_up(false);
+        ws.move_window_up(true);
+        ws.move_window_down(false);
+        ws.move_window_down(true);
+        ws.move_window_up_in_column();
+        ws.move_window_down_in_column();
+    }
+
+    #[test]
+    fn test_toggle_maximize_column_exits_fullscreen() {
+        let mut ws = Workspace::with_gaps(0, 0);
+        ws.insert_window(1, Some(500)).unwrap();
+        ws.set_window_min_width(1, 600);
+        ws.set_window_min_height(1, 400);
+        assert!(ws.toggle_fullscreen());
+        assert_eq!(ws.fullscreen_window_id(), Some(1));
+
+        assert!(ws.toggle_maximize_column(1920));
+        assert_eq!(ws.fullscreen_window_id(), None);
+        assert_eq!(ws.window_min_widths.get(&1).copied(), None);
+        assert_eq!(ws.window_min_height(1), None);
+    }
+
+    #[test]
+    fn free_resize_height_accounts_for_minimized_sibling() {
+        let mut ws = Workspace::with_gaps(10, 0);
+        ws.insert_window(10, Some(500)).unwrap();
+        ws.insert_window_in_column(11, 0).unwrap();
+        ws.insert_window_in_column(12, 0).unwrap();
+        assert!(ws.mark_minimized(12));
+        let viewport = Rect::new(0, 0, 1000, 1000);
+        let preview = ws.preview_resize_free(10, 500, 400, viewport).unwrap();
+        ws.resize_free(10, 500, 400, viewport);
+        ws.ensure_focused_visible_animated(viewport.width);
+        ws.stop_animation();
+        let landing = ws
+            .compute_placements(viewport)
+            .into_iter()
+            .find(|p| p.window_id == 10)
+            .unwrap()
+            .rect;
+        assert_eq!(landing.height, 400);
+        assert_eq!(preview, landing);
+    }
+
+    #[test]
+    fn free_resize_clears_only_the_resized_maximized_column() {
+        let mut ws = Workspace::with_gaps(0, 0);
+        ws.insert_window(10, Some(400)).unwrap();
+        assert!(ws.toggle_maximize_column(1000));
+        ws.resize_free(10, 650, 600, Rect::new(0, 0, 1000, 1000));
+        assert!(ws.toggle_maximize_column(1000));
+        assert_eq!(ws.columns()[0].width(), 1000);
+        assert!(!ws.toggle_maximize_column(1000));
+        assert_eq!(ws.columns()[0].width(), 650);
+
+        ws.insert_window(11, Some(400)).unwrap();
+        ws.set_focus(0, 0).unwrap();
+        assert!(ws.toggle_maximize_column(1000));
+        ws.resize_free(11, 600, 600, Rect::new(0, 0, 1000, 1000));
+        assert!(!ws.toggle_maximize_column(1000));
+        assert_eq!(ws.columns()[0].width(), 650);
+        assert_eq!(ws.columns()[1].width(), 600);
+    }
+
+    #[test]
+    fn preset_resize_preserves_other_maximized_columns_and_noop_state() {
+        let mut ws = Workspace::with_gaps(0, 0);
+        ws.set_row_layout(&[0.5, 0.5]);
+        ws.insert_window(10, Some(400)).unwrap();
+        ws.insert_window(11, Some(400)).unwrap();
+        ws.set_focus(0, 0).unwrap();
+        assert!(ws.toggle_maximize_column(1000));
+
+        ws.snap_column_width_to_preset_in_row(0, 0, 600, &[], 1000);
+        ws.snap_column_width_to_preset_in_row(0, 1, 600, &[0.5, 0.75], 1000);
+        assert_eq!(ws.rows()[0].columns()[1].width(), 500);
+
+        ws.focus_row(1);
+        ws.insert_window(12, Some(400)).unwrap();
+        ws.snap_column_width_to_preset_in_row(1, 0, 700, &[0.5, 0.75], 1000);
+        assert_eq!(ws.rows()[1].columns()[0].width(), 750);
+
+        ws.focus_row(0);
+        assert!(!ws.toggle_maximize_column(1000));
+        assert_eq!(ws.rows()[0].columns()[0].width(), 400);
+    }
+
+    #[test]
+    fn free_resize_preview_matches_release_scroll_without_mutating_workspace() {
+        for mode in [CenteringMode::Center, CenteringMode::JustInView] {
+            for reduce_motion in [false, true] {
+                let mut ws = Workspace::with_gaps(0, 0);
+                ws.set_row_layout(&[0.5, 0.5]);
+                ws.insert_window(1, Some(1000)).unwrap();
+                ws.insert_window(2, Some(1000)).unwrap();
+                ws.set_scroll_offset(1000.0);
+                ws.focus_row(1);
+                ws.insert_window(3, Some(1000)).unwrap();
+                ws.insert_window(4, Some(1000)).unwrap();
+                ws.set_scroll_offset(1100.0);
+                ws.set_centering_mode(mode);
+                ws.set_reduce_motion(reduce_motion);
+                ws.animate_scroll_to_for_row(0, 300.0, Some(200), Some(Easing::Linear));
+                ws.animate_scroll_to_for_row(1, 1000.0, Some(200), Some(Easing::Linear));
+                let before = ws.clone();
+                let viewport = Rect::new(0, 0, 1000, 1000);
+                let width = if mode == CenteringMode::Center {
+                    800
+                } else {
+                    400
+                };
+                let preview = ws.preview_resize_free(4, width, 500, viewport).unwrap();
+                for (row, original) in ws.rows.iter().zip(&before.rows) {
+                    assert_eq!(row.scroll_offset, original.scroll_offset);
+                    assert_eq!(
+                        format!("{:?}", row.active_animation),
+                        format!("{:?}", original.active_animation)
+                    );
+                    assert_eq!(row.columns, original.columns);
+                }
+                ws.resize_free(4, width, 500, viewport);
+                ws.ensure_focused_visible_animated(viewport.width);
+                ws.stop_animation();
+                assert_ne!(ws.rows()[1].scroll_offset, before.rows()[1].scroll_offset);
+                let landing = ws
+                    .compute_placements(viewport)
+                    .into_iter()
+                    .find(|p| p.window_id == 4)
+                    .unwrap()
+                    .rect;
+                assert_eq!(
+                    preview, landing,
+                    "mode={mode:?}, reduce_motion={reduce_motion}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn preset_resize_preview_matches_release_scroll_without_mutating_workspace() {
+        let mut previews = Vec::new();
+        let mut landings = Vec::new();
+        for mode in [
+            CenteringMode::Center,
+            CenteringMode::JustInView,
+            CenteringMode::OnOverflow,
+        ] {
+            let mut ws = Workspace::with_gaps(0, 0);
+            ws.set_row_layout(&[0.5, 0.5]);
+            ws.insert_window(1, Some(1000)).unwrap();
+            ws.insert_window(2, Some(1000)).unwrap();
+            ws.set_scroll_offset(1000.0);
+            ws.focus_row(1);
+            ws.insert_window(3, Some(1000)).unwrap();
+            ws.insert_window(4, Some(1000)).unwrap();
+            ws.set_scroll_offset(1100.0);
+            ws.set_centering_mode(mode);
+            ws.animate_scroll_to_for_row(0, 300.0, Some(200), Some(Easing::Linear));
+            ws.animate_scroll_to_for_row(1, 1000.0, Some(200), Some(Easing::Linear));
+            let before = ws.clone();
+            let viewport = Rect::new(0, 0, 1000, 1000);
+            let width = if mode == CenteringMode::Center {
+                800
+            } else {
+                400
+            };
+            let width_presets = [0.4, 0.8];
+            let height_presets = [0.5];
+            let preview = ws
+                .preview_resize_snap(4, width, 500, &width_presets, &height_presets, viewport)
+                .unwrap();
+            for (row, original) in ws.rows.iter().zip(&before.rows) {
+                assert_eq!(row.scroll_offset, original.scroll_offset);
+                assert_eq!(
+                    format!("{:?}", row.active_animation),
+                    format!("{:?}", original.active_animation)
+                );
+                assert_eq!(row.columns, original.columns);
+            }
+            ws.resize_snap(4, width, 500, &width_presets, &height_presets, viewport);
+            ws.ensure_focused_visible_animated(viewport.width);
+            ws.stop_animation();
+            assert_ne!(
+                ws.rows()[1].scroll_offset,
+                before.rows()[1].scroll_offset,
+                "mode={mode:?}"
+            );
+            let landing = ws
+                .compute_placements(viewport)
+                .into_iter()
+                .find(|p| p.window_id == 4)
+                .unwrap()
+                .rect;
+            previews.push((mode, preview));
+            landings.push((mode, landing));
+        }
+        assert_eq!(previews, landings);
+    }
+
+    #[test]
+    fn free_resize_preview_matches_release_with_native_minimum() {
+        let mut ws = Workspace::with_directional_gaps(10, 20, 20, 40, 40);
+        ws.set_row_gap(20);
+        ws.set_row_layout(&[0.5, 0.5]);
+        ws.focus_row(1);
+        ws.insert_window(10, Some(600)).unwrap();
+        ws.insert_window_in_column(11, 0).unwrap();
+        ws.set_window_min_width(10, 700);
+        ws.set_window_min_height(10, 100);
+        let viewport = Rect::new(0, 0, 1920, 1080);
+        let preview = ws.preview_resize_free(10, 400, 217, viewport).unwrap();
+        assert_eq!(ws.rows()[1].columns()[0].width(), 600);
+        ws.resize_free(10, 400, 217, viewport);
+        let released = ws
+            .compute_placements(viewport)
+            .into_iter()
+            .find(|p| p.window_id == 10)
+            .unwrap()
+            .rect;
+        assert_eq!(preview, released);
+        assert_eq!(ws.rows()[1].columns()[0].width(), 700);
+        assert!((ws.rows()[1].columns()[0].height_weights()[0] - 217.0 / 480.0).abs() < 1e-9);
+        assert!(!ws.window_min_widths.contains_key(&10));
+        assert!(ws.window_min_height(10).is_none());
+    }
+
+    #[test]
+    fn test_resize_snap_preview_and_release_agree_in_multi_row_with_outer_gaps() {
+        let mut ws = Workspace::with_directional_gaps(10, 20, 20, 40, 40);
+        ws.set_row_gap(20);
+        ws.set_row_layout(&[0.5, 0.5]);
+        ws.focus_row(1);
+        ws.insert_window(10, Some(600)).unwrap();
+        ws.insert_window_in_column(11, 0).unwrap();
+
+        let viewport = Rect::new(0, 0, 1920, 1080);
+        // Total usable vertical height across rows = 1080 - 40 - 40 - 20 = 980 -> each row is 490px.
+        // In row 1, 2 stacked windows have 1 gap of 10px -> available column height = 480px.
+        // 2/3 of 480px = 320px.
+        let width_presets = [0.333, 0.5, 0.667];
+        let height_presets = [0.333, 0.5, 0.667];
+
+        let preview = ws
+            .preview_resize_snap(10, 900, 315, &width_presets, &height_presets, viewport)
+            .unwrap();
+
+        ws.resize_snap(10, 900, 315, &width_presets, &height_presets, viewport);
+        ws.ensure_focused_visible_animated(viewport.width);
+        ws.stop_animation();
+        let released = ws
+            .compute_placements(viewport)
+            .into_iter()
+            .find(|p| p.window_id == 10)
+            .unwrap()
+            .rect;
+
+        assert_eq!(preview, released);
+        assert!((ws.rows()[1].columns()[0].height_weights()[0] - 0.667).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_focus_next_prev_across_rows_lands_on_active_tab() {
+        let mut ws = Workspace::with_gaps(0, 0);
+        ws.set_row_layout(&[0.5, 0.5]);
+
+        ws.focus_row(0);
+        ws.insert_window(1, Some(600)).unwrap();
+        ws.insert_window(2, Some(600)).unwrap();
+        ws.insert_window_in_column(3, 1).unwrap();
+        ws.insert_window_in_column(4, 1).unwrap();
+        ws.set_focus(1, 1).unwrap();
+        ws.toggle_focused_column_tabbed_mode();
+        assert_eq!(ws.rows()[0].columns()[1].active_tab_idx(), Some(1));
+
+        ws.focus_row(1);
+        ws.insert_window(5, Some(600)).unwrap();
+        ws.insert_window_in_column(6, 0).unwrap();
+        ws.insert_window_in_column(7, 0).unwrap();
+        ws.set_focus(0, 2).unwrap();
+        ws.toggle_focused_column_tabbed_mode();
+        assert_eq!(ws.rows()[1].columns()[0].active_tab_idx(), Some(2));
+
+        // Start at row 0, col 0 (window 1).
+        ws.focus_row(0);
+        ws.set_focus(0, 0).unwrap();
+        assert_eq!(ws.focused_window(), Some(1));
+
+        // focus_next into same-row tabbed column lands on active tab (window 3, index 1).
+        ws.focus_next();
+        assert_eq!(ws.focused_row(), 0);
+        assert_eq!(ws.focused_column_index(), 1);
+        assert_eq!(ws.focused_window(), Some(3));
+        assert_eq!(ws.rows()[0].columns()[1].active_tab_idx(), Some(1));
+
+        // Next advances to window 4 inside that tabbed column, then next wraps to row 1's tabbed column on its active tab (window 7, index 2).
+        ws.focus_next();
+        assert_eq!(ws.focused_window(), Some(4));
+        ws.focus_next();
+        assert_eq!(ws.focused_row(), 1);
+        assert_eq!(ws.focused_window(), Some(7));
+        assert_eq!(ws.rows()[1].columns()[0].active_tab_idx(), Some(2));
+
+        // Reset row 0 col 1 active tab to index 1 (window 3), then focus_prev from row 1 col 0 index 0 (window 5).
+        ws.focus_row(0);
+        ws.set_active_tab(1, 1).unwrap();
+        ws.focus_row(1);
+        ws.set_focus(0, 0).unwrap();
+        ws.focus_prev();
+        assert_eq!(ws.focused_row(), 0);
+        assert_eq!(ws.focused_column_index(), 1);
+        assert_eq!(ws.focused_window(), Some(3));
+        assert_eq!(ws.rows()[0].columns()[1].active_tab_idx(), Some(1));
+    }
+
+    #[test]
+    fn test_maximized_column_state_transferred_or_cleared_on_intra_row_moves() {
+        // 1. expel_to_right from a maximized stacked column transfers sentinel and uses original_width
+        let mut ws = Workspace::with_gaps(0, 0);
+        ws.insert_window(1, Some(500)).unwrap();
+        ws.insert_window_in_column(2, 0).unwrap();
+        ws.set_focus(0, 0).unwrap();
+        assert!(ws.toggle_maximize_column(1920));
+        assert_eq!(ws.columns()[0].width(), 1920);
+
+        ws.expel_to_right();
+        assert_eq!(ws.column_count(), 2);
+        // Remaining column (window 2) stays maximized with sentinel transferred to window 2.
+        assert_eq!(ws.columns()[0].windows(), &[2]);
+        assert_eq!(ws.columns()[0].width(), 1920);
+        // Expelled column (window 1) gets original_width (500), not 1920!
+        assert_eq!(ws.columns()[1].windows(), &[1]);
+        assert_eq!(ws.columns()[1].width(), 500);
+        // Toggling maximize on column 0 restores it to 500.
+        ws.set_focus(0, 0).unwrap();
+        assert!(!ws.toggle_maximize_column(1920));
+        assert_eq!(ws.columns()[0].width(), 500);
+
+        // 2. move_window_left emptying a maximized column clears its maximized state
+        let mut ws = Workspace::with_gaps(0, 0);
+        ws.insert_window(1, Some(400)).unwrap();
+        ws.insert_window(2, Some(600)).unwrap();
+        ws.set_focus(1, 0).unwrap();
+        assert!(ws.toggle_maximize_column(1920));
+        ws.move_window_left();
+        assert_eq!(ws.column_count(), 1);
+        assert!(ws.rows()[0].maximized_columns.is_empty());
+
+        // 3. consume_from_right pulling the sentinel from a 2-window maximized column transfers sentinel
+        let mut ws = Workspace::with_gaps(0, 0);
+        ws.insert_window(1, Some(400)).unwrap();
+        ws.insert_window(2, Some(600)).unwrap();
+        ws.insert_window_in_column(3, 1).unwrap();
+        ws.set_focus(1, 0).unwrap();
+        assert!(ws.toggle_maximize_column(1920));
+        ws.set_focus(0, 0).unwrap();
+        ws.consume_from_right();
+        assert_eq!(ws.columns()[0].windows(), &[1, 2]);
+        assert_eq!(ws.columns()[1].windows(), &[3]);
+        assert_eq!(
+            ws.rows()[0]
+                .maximized_columns
+                .iter()
+                .map(|m| m.sentinel_window)
+                .collect::<Vec<_>>(),
+            vec![3]
+        );
+
+        // 4. remove_column_in_row clears its maximized state when removing the maximized column
+        let removed = ws.remove_column_in_row(0, 1);
+        assert!(removed.is_some());
+        assert!(ws.rows()[0].maximized_columns.is_empty());
+    }
+
+    #[test]
+    fn test_set_row_layout_shrink_preserves_focused_window_in_drained_row() {
+        let mut ws = Workspace::with_gaps(0, 0);
+        ws.set_row_layout(&[0.5, 0.5]);
+        ws.focus_row(0);
+        ws.insert_window(1, Some(400)).unwrap();
+        ws.insert_window(2, Some(400)).unwrap();
+
+        ws.focus_row(1);
+        ws.insert_window(10, Some(400)).unwrap();
+        ws.insert_window(11, Some(400)).unwrap();
+        ws.insert_window_in_column(12, 1).unwrap();
+        ws.set_focus(1, 1).unwrap();
+        assert_eq!(ws.focused_window(), Some(12));
+
+        // Shrink from 2 rows to 1 row while focus is in row 1 on window 12 (col 1, win 1).
+        ws.set_row_layout(&[1.0]);
+        assert_eq!(ws.row_count(), 1);
+        assert_eq!(ws.focused_row(), 0);
+        assert_eq!(ws.focused_column_index(), 3);
+        assert_eq!(ws.focused_window_index_in_column(), 1);
+        assert_eq!(ws.focused_window(), Some(12));
+    }
+
+    #[test]
+    fn test_workspace_deserialization_caps_rows_at_max_rows_and_normalizes_shares() {
+        let json = r#"{
+            "rows": [
+                {"columns": [], "focused_column": 0, "focused_window_in_column": 0, "scroll_offset": 0.0},
+                {"columns": [], "focused_column": 0, "focused_window_in_column": 0, "scroll_offset": 0.0},
+                {"columns": [], "focused_column": 0, "focused_window_in_column": 0, "scroll_offset": 0.0},
+                {"columns": [], "focused_column": 0, "focused_window_in_column": 0, "scroll_offset": 0.0},
+                {"columns": [{"windows": [99], "width": 500}], "focused_column": 0, "focused_window_in_column": 0, "scroll_offset": 0.0}
+            ],
+            "row_shares": [1.0],
+            "focused_row": 4,
+            "row_gap": -10,
+            "floating": [],
+            "gap": -5,
+            "outer_gap_left": 0,
+            "outer_gap_right": 0,
+            "outer_gap_top": 0,
+            "outer_gap_bottom": 0,
+            "default_column_width": 10
+        }"#;
+        let ws: Workspace = serde_json::from_str(json).unwrap();
+        assert_eq!(ws.row_count(), MAX_ROWS);
+        assert_eq!(ws.row_shares().len(), MAX_ROWS);
+        assert_eq!(ws.focused_row(), MAX_ROWS - 1);
+        assert_eq!(ws.row_gap(), 0);
+        assert_eq!(ws.gap(), 0);
+        // Window 99 from the 5th row was merged into the 4th row (index 3).
+        assert_eq!(ws.rows()[MAX_ROWS - 1].columns()[0].windows(), &[99]);
     }
 }

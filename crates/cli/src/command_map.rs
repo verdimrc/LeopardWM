@@ -3,6 +3,17 @@ use leopardwm_ipc::IpcCommand;
 
 pub(crate) fn to_ipc_command(cmd: &Commands) -> IpcCommand {
     match cmd {
+        Commands::Record { action } => {
+            let (action, timeout_secs) = match action {
+                RecordAction::Start { timeout } => (leopardwm_ipc::RecordAction::Start, *timeout),
+                RecordAction::Stop => (leopardwm_ipc::RecordAction::Stop, None),
+                RecordAction::Status => (leopardwm_ipc::RecordAction::Status, None),
+            };
+            IpcCommand::Record {
+                action,
+                timeout_secs,
+            }
+        }
         Commands::Focus { direction } => match direction {
             FocusDirection::Left => IpcCommand::FocusLeft,
             FocusDirection::Right => IpcCommand::FocusRight,
@@ -10,6 +21,29 @@ pub(crate) fn to_ipc_command(cmd: &Commands) -> IpcCommand {
             FocusDirection::Down => IpcCommand::FocusDown,
             FocusDirection::Start => IpcCommand::FocusStart,
             FocusDirection::End => IpcCommand::FocusEnd,
+        },
+        Commands::FocusFloating => IpcCommand::FocusFloating,
+        Commands::FocusTiling => IpcCommand::FocusTiling,
+        Commands::SwitchFocusFloatingTiling => IpcCommand::SwitchFocusFloatingTiling,
+        Commands::NudgeLeft => IpcCommand::NudgeLeft,
+        Commands::NudgeRight => IpcCommand::NudgeRight,
+        Commands::FocusRow { target } => match target.to_ascii_lowercase().as_str() {
+            "up" => IpcCommand::FocusRowUp,
+            "down" => IpcCommand::FocusRowDown,
+            other => match other.parse::<usize>() {
+                Ok(idx) if (1..=4).contains(&idx) => IpcCommand::FocusRow { index: idx - 1 },
+                _ => {
+                    eprintln!(
+                        "Invalid row target '{}': expected 'up', 'down', or row number 1-4",
+                        target
+                    );
+                    std::process::exit(1);
+                }
+            },
+        },
+        Commands::MoveToRow { direction } => match direction {
+            RowDirection::Up => IpcCommand::MoveWindowToRowUp,
+            RowDirection::Down => IpcCommand::MoveWindowToRowDown,
         },
         Commands::Scroll { direction } => match direction {
             ScrollDirection::Left { pixels } => IpcCommand::Scroll {
@@ -63,6 +97,8 @@ pub(crate) fn to_ipc_command(cmd: &Commands) -> IpcCommand {
         Commands::Reload => IpcCommand::Reload,
         Commands::CloseWindow => IpcCommand::CloseWindow,
         Commands::ToggleFloating => IpcCommand::ToggleFloating,
+        Commands::Float => IpcCommand::Float,
+        Commands::Tile => IpcCommand::Tile,
         Commands::ToggleFullscreen => IpcCommand::ToggleFullscreen,
         Commands::ScratchpadStash => IpcCommand::ScratchpadStash,
         Commands::ScratchpadToggle => IpcCommand::ScratchpadToggle,
@@ -74,6 +110,8 @@ pub(crate) fn to_ipc_command(cmd: &Commands) -> IpcCommand {
             fraction: *fraction,
         },
         Commands::CenterColumn => IpcCommand::CenterColumn,
+        Commands::AlignColumnLeft => IpcCommand::AlignColumnLeft,
+        Commands::AlignColumnRight => IpcCommand::AlignColumnRight,
         Commands::MaximizeColumn => IpcCommand::MaximizeColumn,
         Commands::EqualizeWidths => IpcCommand::EqualizeColumnWidths,
         Commands::CycleWidth => IpcCommand::CycleWidth,
@@ -118,5 +156,37 @@ pub(crate) fn to_ipc_command(cmd: &Commands) -> IpcCommand {
                 GhostAction::Status => None,
             },
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_focus_row_cli_one_based_converts_to_zero_based_ipc() {
+        for (target, expected_idx) in [("1", 0), ("2", 1), ("3", 2), ("4", 3)] {
+            let cmd = Commands::FocusRow {
+                target: target.to_string(),
+            };
+            assert_eq!(
+                to_ipc_command(&cmd),
+                IpcCommand::FocusRow {
+                    index: expected_idx
+                }
+            );
+        }
+        assert_eq!(
+            to_ipc_command(&Commands::FocusRow {
+                target: "up".to_string()
+            }),
+            IpcCommand::FocusRowUp
+        );
+        assert_eq!(
+            to_ipc_command(&Commands::FocusRow {
+                target: "down".to_string()
+            }),
+            IpcCommand::FocusRowDown
+        );
     }
 }

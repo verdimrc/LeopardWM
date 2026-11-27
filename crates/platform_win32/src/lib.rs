@@ -10,6 +10,7 @@
 
 pub mod autostart;
 pub mod border;
+pub mod clipboard;
 pub mod dialog;
 pub mod focus_placeholder;
 pub mod gestures;
@@ -41,6 +42,7 @@ mod placement;
 mod system;
 mod types;
 mod user_press;
+mod virtual_desktop;
 mod visibility;
 mod window_identity;
 mod window_query;
@@ -50,7 +52,10 @@ pub use gestures::*;
 pub use hotkeys::*;
 pub use keyboard_hook::*;
 pub use mouse_hook::*;
-pub use user_press::{install_mouse_press_hook, user_press_count, MousePressHookHandle};
+pub use user_press::{
+    arm_drag_float, disarm_drag_float, drag_float_requested, install_mouse_press_hook,
+    take_drag_float_request, user_press_count, MousePressHookHandle,
+};
 
 pub use elevation::{
     current_process_integrity, manage_block, window_manage_block, ManageBlock, INTEGRITY_HIGH,
@@ -59,11 +64,11 @@ pub use elevation::{
 pub use enumeration::{
     collect_all_top_level_window_ids, enumerate_monitors, enumerate_windows, find_monitor_by_id,
     find_monitor_for_rect, get_primary_monitor, get_process_executable, get_window_info,
-    is_excluded_tool_window_hwnd, is_excluded_topmost_popup_hwnd, is_excluded_window_class_hwnd,
-    monitor_above, monitor_below, monitor_to_left, monitor_to_right, monitors_by_position,
-    TopLevelWindowIdCollection,
+    get_window_title, is_excluded_tool_window_hwnd, is_excluded_topmost_popup_hwnd,
+    is_excluded_window_class_hwnd, monitor_above, monitor_below, monitor_left_of, monitor_right_of,
+    monitor_to_left, monitor_to_right, monitors_by_position, TopLevelWindowIdCollection,
 };
-pub use event_hooks::{install_event_hooks, EventHookHandle, WindowEvent};
+pub use event_hooks::{install_event_hooks, EventHookHandle, MoveStartCapture, WindowEvent};
 pub use focus::{
     can_raise_normal_window, close_window, current_event_time_ms, get_foreground_window,
     ms_since_last_user_input, raise_normal_window_no_activate, raise_window_no_activate,
@@ -83,10 +88,12 @@ pub use placement::{
     PlacementLanding, WidthViolation,
 };
 pub use system::{
-    are_animations_enabled, get_system_highlight_color_bgr, is_high_contrast_enabled,
-    is_on_battery_or_power_saver, scale_px, set_dpi_awareness,
+    are_animations_enabled, current_session_logon_epoch_seconds, get_system_highlight_color_bgr,
+    get_windows_version, is_high_contrast_enabled, is_on_battery_or_power_saver, scale_px,
+    set_dpi_awareness, set_keep_awake,
 };
 pub use types::{MonitorId, MonitorInfo, PlatformConfig, Win32Error, WindowInfo};
+pub use virtual_desktop::{is_window_on_current_virtual_desktop, warm_virtual_desktop_queries};
 pub use visibility::{
     cascade_windows, emergency_restore_windows, is_move_offscreen_sentinel_position,
     is_move_offscreen_sentinel_rect, move_window_offscreen, position_window,
@@ -102,14 +109,14 @@ pub use window_identity::{
 pub use window_query::{
     cursor_is_over_window, get_cursor_pos, get_window_chrome_rect, get_window_corner_radius,
     get_window_icon, get_window_visible_rect, is_cursor_on_resize_border, is_dialog_like_window,
-    is_frameless_fixed_size_window, is_frameless_popup, is_shift_key_pressed, is_valid_window,
-    is_window_maximized, is_window_shell_cloaked, is_window_valid, is_window_visible,
-    window_minimized_state, window_presence, WindowPresence,
+    is_fixed_caption_window, is_frameless_fixed_size_window, is_frameless_popup,
+    is_shift_key_pressed, is_valid_window, is_window_maximized, is_window_shell_cloaked,
+    is_window_valid, is_window_visible, window_minimized_state, window_presence, WindowPresence,
 };
 pub use window_style::{
-    queue_maximized_window_restore, remove_maximizebox, reset_window_border_color,
-    restore_maximizebox, restore_maximizebox_all, restore_maximizebox_panic_recovery,
-    set_window_border_color, wait_for_window_style_requests,
+    forget_stale_frame_refresh, queue_maximized_window_restore, remove_maximizebox,
+    reset_window_border_color, restore_maximizebox, restore_maximizebox_all,
+    restore_maximizebox_panic_recovery, set_window_border_color, wait_for_window_style_requests,
 };
 
 use leopardwm_core_layout::WindowId;

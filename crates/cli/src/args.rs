@@ -35,11 +35,50 @@ pub(crate) struct Cli {
 }
 
 #[derive(Subcommand)]
+pub(crate) enum RecordAction {
+    /// Start recording (defaults to ten minutes)
+    Start {
+        /// Maximum recording duration in seconds (1 to 3600)
+        #[arg(long)]
+        timeout: Option<u64>,
+    },
+    /// Stop recording
+    Stop,
+    /// Show the recording state
+    Status,
+}
+
+#[derive(Subcommand)]
 pub(crate) enum Commands {
+    /// Start, stop, or inspect a temporary debug recording
+    Record {
+        #[command(subcommand)]
+        action: RecordAction,
+    },
     /// Focus commands
     Focus {
         #[command(subcommand)]
         direction: FocusDirection,
+    },
+    /// Focus a floating window on the current workspace
+    FocusFloating,
+    /// Focus the tiled layer on the current workspace
+    FocusTiling,
+    /// Switch focus between the floating and tiled layers
+    SwitchFocusFloatingTiling,
+    /// Nudge the focused window left by the configured step
+    NudgeLeft,
+    /// Nudge the focused window right by the configured step
+    NudgeRight,
+    /// Focus row: up, down, or 1-based row number
+    FocusRow {
+        /// Target row: "up", "down", or row number (1-4)
+        target: String,
+    },
+    /// Move the focused window to row above or below
+    MoveToRow {
+        #[command(subcommand)]
+        direction: RowDirection,
     },
     /// Scroll the viewport
     Scroll {
@@ -140,6 +179,10 @@ pub(crate) enum Commands {
     CloseWindow,
     /// Toggle floating for the focused window
     ToggleFloating,
+    /// Float the focused window if it is tiled
+    Float,
+    /// Tile the focused window if it is floating
+    Tile,
     /// Toggle fullscreen for the focused window
     ToggleFullscreen,
     /// Designate the focused window as the scratchpad and hide it
@@ -163,6 +206,10 @@ pub(crate) enum Commands {
     },
     /// Center the focused column in the viewport
     CenterColumn,
+    /// Align the focused column with the left edge
+    AlignColumnLeft,
+    /// Align the focused column with the right edge
+    AlignColumnRight,
     /// Maximize the focused column to fill the viewport width
     MaximizeColumn,
     /// Equalize all column widths
@@ -236,7 +283,7 @@ pub(crate) enum Commands {
     },
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FocusDirection {
     /// Focus the column to the left
     Left,
@@ -250,6 +297,14 @@ pub(crate) enum FocusDirection {
     Start,
     /// Focus the last (rightmost) column of the strip
     End,
+}
+
+#[derive(Subcommand, Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RowDirection {
+    /// Move to the row above
+    Up,
+    /// Move to the row below
+    Down,
 }
 
 #[derive(Subcommand)]

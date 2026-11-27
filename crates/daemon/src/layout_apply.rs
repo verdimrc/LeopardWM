@@ -1,6 +1,7 @@
 use crate::animation_worker;
 use crate::state::*;
 use anyhow::{anyhow, Result};
+use leopardwm_ipc::log_text;
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use tracing::{debug, warn};
@@ -17,8 +18,9 @@ fn effective_column_widths(
     workspace: &leopardwm_core_layout::Workspace,
 ) -> impl Iterator<Item = i32> + '_ {
     workspace
-        .columns()
+        .rows()
         .iter()
+        .flat_map(|row| row.columns().iter())
         .map(|column| workspace.effective_column_width(column))
 }
 
@@ -206,6 +208,12 @@ impl AppState {
             );
         }
         if frame_result.apply_result.is_ok() {
+            self.reconcile_floating_landing_sizes(
+                frame_result.physical_request_id,
+                frame_result.physical_invalidation_id,
+                &frame_result.landings,
+                &frame_result.maximized_skipped_window_ids,
+            );
             self.propagate_size_violations(&width_violations, &height_violations);
         }
         AnimationPlacementResult::Current
@@ -444,7 +452,7 @@ impl AppState {
         // composition change occurring during an active animation would leave
         // stale per-sibling constraints in effect for the remaining frames.
         self.commit_pending_min_size_clears();
-        self.reconcile_single_column_scroll_bounds();
+        self.reconcile_workspace_scroll_bounds();
         let mut all_placements = Vec::new();
         for (monitor_id, ws_vec) in &self.workspaces {
             let idx = self.active_workspace_idx(*monitor_id);
@@ -459,6 +467,7 @@ impl AppState {
                         &mut placements,
                         *monitor_id,
                         &self.monitors,
+                        self.config.layout.offscreen_mode,
                     );
                     all_placements.extend(placements);
                 }
@@ -475,6 +484,7 @@ impl AppState {
 
         if let Some(ref transition) = self.layout_transition {
             Self::apply_transition_interpolation(transition, &mut all_placements);
+            self.repark_interpolated_nonvisible(&mut all_placements);
         }
 
         // Filter out the dragged window so SetWindowPos doesn't fight the OS drag.
@@ -546,6 +556,7 @@ impl AppState {
     ) -> anyhow::Error {
         self.display_change_apply_retry = None;
         self.paused = true;
+        leopardwm_platform_win32::disarm_drag_float();
         self.resume_deferred_apply_worker_recovery();
         let msg = layout_apply_timeout_message(timeout);
         let report = LayoutApplyTimeoutReport {
@@ -559,11 +570,11 @@ impl AppState {
         );
         for candidate in &report.candidates {
             warn!(
-                "Timed-out placement batch candidate (not a proven blocker): hwnd={:#x} class={:?} title={:?} executable={:?}",
+                "Timed-out placement batch candidate (not a proven blocker): hwnd={:#x} class={} title={} executable={}",
                 candidate.hwnd,
-                candidate.class_name,
-                candidate.title,
-                candidate.executable
+                log_text::name(candidate.class_name.as_deref().unwrap_or("")),
+                log_text::title(candidate.title.as_deref().unwrap_or("")),
+                log_text::name(candidate.executable.as_deref().unwrap_or(""))
             );
         }
         self.pending_layout_apply_timeout_report = Some(report);
@@ -574,6 +585,7 @@ impl AppState {
 
     pub(crate) fn apply_layout(&mut self) -> Result<LayoutApplyOutcome> {
         self.reap_finished_pending_apply_workers_with_recovery();
+        self.repin_sticky_floating_windows();
 
         if self.paused {
             return Ok(LayoutApplyOutcome::Completed);
@@ -608,7 +620,7 @@ impl AppState {
         // here rather than eagerly at the mutation site so that a timed-out /
         // paused apply path cannot leave constraints cleared indefinitely.
         self.commit_pending_min_size_clears();
-        self.reconcile_single_column_scroll_bounds();
+        self.reconcile_workspace_scroll_bounds();
 
         // While desktop peek is active, handle structural changes in the peeked
         // workspace. A new window arriving (column count grew) auto-exits peek
@@ -655,6 +667,7 @@ impl AppState {
 
         if let Some(ref transition) = self.layout_transition {
             Self::apply_transition_interpolation(transition, &mut all_placements);
+            self.repark_interpolated_nonvisible(&mut all_placements);
         }
 
         // Filter out the dragged window so SetWindowPos doesn't fight the OS drag.
@@ -774,6 +787,12 @@ impl AppState {
                         &landings,
                         &maximized_skipped_window_ids,
                     );
+                    self.reconcile_floating_landing_sizes(
+                        physical_request_id,
+                        physical_invalidation_id,
+                        &landings,
+                        &maximized_skipped_window_ids,
+                    );
                     Ok(())
                 };
                 let constraints_changed = primary_succeeded
@@ -851,11 +870,11 @@ impl AppState {
                     );
                     for candidate in &candidates {
                         warn!(
-                            "Timed-out placement batch candidate (not a proven blocker): hwnd={:#x} class={:?} title={:?} executable={:?}",
+                            "Timed-out placement batch candidate (not a proven blocker): hwnd={:#x} class={} title={} executable={}",
                             candidate.hwnd,
-                            candidate.class_name,
-                            candidate.title,
-                            candidate.executable
+                            log_text::name(candidate.class_name.as_deref().unwrap_or("")),
+                            log_text::title(candidate.title.as_deref().unwrap_or("")),
+                            log_text::name(candidate.executable.as_deref().unwrap_or(""))
                         );
                     }
                     Err(anyhow!(msg))
@@ -948,6 +967,7 @@ impl AppState {
                         &mut placements,
                         *monitor_id,
                         &self.monitors,
+                        self.config.layout.offscreen_mode,
                     );
                     debug!(
                         "Monitor {}: {} placements for viewport {}x{} (animating: {}, scroll: {:.1}, minimized: {})",
@@ -1206,8 +1226,11 @@ impl AppState {
                             let windows: Vec<_> = candidates
                                 .iter()
                                 .map(|candidate| format!(
-                                    "hwnd={:#x} class={:?} title={:?} executable={:?}",
-                                    candidate.hwnd, candidate.class_name, candidate.title, candidate.executable
+                                    "hwnd={:#x} class={} title={} executable={}",
+                                    candidate.hwnd,
+                                    log_text::name(candidate.class_name.as_deref().unwrap_or("")),
+                                    log_text::title(candidate.title.as_deref().unwrap_or("")),
+                                    log_text::name(candidate.executable.as_deref().unwrap_or(""))
                                 ))
                                 .collect();
                             warn!(
@@ -1261,14 +1284,18 @@ impl AppState {
         }
     }
 
-    fn reconcile_single_column_scroll_bounds(&mut self) {
+    fn reconcile_workspace_scroll_bounds(&mut self) {
         for (&monitor_id, workspaces) in &mut self.workspaces {
             let Some(monitor) = self.monitors.get(&monitor_id) else {
                 continue;
             };
             for workspace in workspaces {
-                if workspace.holds_fitting_columns() {
-                    workspace.reconcile_scroll_bounds(crate::monitors::monitor_viewport_width(monitor));
+                if (workspace.center_columns() != leopardwm_core_layout::CenterColumns::Off
+                    || workspace.row_count() > 1)
+                    && workspace.fullscreen_window_id().is_none()
+                {
+                    workspace
+                        .reconcile_scroll_bounds(crate::monitors::monitor_viewport_width(monitor));
                 }
             }
         }
@@ -1430,16 +1457,19 @@ impl AppState {
             self.last_emitted_layout_sig = Some(sig);
             let monitor = self.focused_monitor;
             let workspace_index = self.active_workspace_idx(monitor);
-            let focused_column = self
+            let (focused_column, focused_row) = self
                 .workspaces
                 .get(&monitor)
                 .and_then(|list| list.get(workspace_index))
-                .map(|ws| ws.focused_column_index());
+                .map(|ws| (Some(ws.focused_column_index()), ws.focused_row()))
+                .unwrap_or((None, 0));
             self.broadcast_event(leopardwm_ipc::IpcEvent::LayoutChanged {
                 monitor: monitor as i64,
                 workspace_index: workspace_index as u8,
                 focused_column,
                 columns: self.focused_layout_columns(),
+                focused_row,
+                rows: self.focused_layout_rows(),
             });
         }
 

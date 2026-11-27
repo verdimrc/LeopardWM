@@ -2,10 +2,17 @@
 //! An AtomicBool singleton guard prevents multiple settings windows.
 
 mod html;
+mod issue_report;
+pub(crate) mod troubleshooting;
 mod win32;
 
-pub use win32::{push_failed_binds, push_locale, push_recorded_chord};
+pub use win32::{
+    push_failed_binds, push_locale, push_recorded_chord, push_reload_config, push_report_status,
+    push_tray_config,
+};
+pub(crate) use win32::{push_health, push_snapshot_result};
 
+use leopardwm_ipc::log_text;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 
@@ -17,6 +24,9 @@ use crate::config::Config;
 pub enum SettingsEvent {
     /// The user saved the config (already written to disk).
     Saved,
+    RequestHealth,
+    CreateSnapshot(u64),
+    LogFailure,
     /// The hotkey recorder started (`true`) or stopped (`false`). While
     /// recording, the keyboard hook captures the combo before it can fire its
     /// configured action.
@@ -24,6 +34,11 @@ pub enum SettingsEvent {
     /// The settings window closed. Used as a safety net to resume hotkeys if
     /// the window was closed mid-recording.
     Closed,
+    ReportIssue {
+        url: String,
+        truncated: bool,
+        copied: bool,
+    },
 }
 
 static SETTINGS_OPEN: AtomicBool = AtomicBool::new(false);
@@ -63,7 +78,7 @@ impl SettingsWindowHandle {
                     high_contrast,
                     failed_binds,
                 ) {
-                    warn!("Settings window error: {}", e);
+                    warn!("Settings window error: {}", log_text::text(e));
                 }
                 SETTINGS_OPEN.store(false, Ordering::SeqCst);
             })

@@ -37,7 +37,10 @@ workspace switching. `ReleaseAllWindows` (`{"type":"release_all_windows"}`) is
 an additive v4 command that pauses tiling and cascades every managed window while
 retaining workspace membership. It has no prompt; a failed recovery or live
 placement outcome returns an error and leaves tiling paused.
-`CycleWidth` (`cycle_width`) and `CycleHeight` (`cycle_height`) are additive v4 commands that cycle to the next larger preset, wrapping to the smallest at the end.
+`CycleWidth` (`cycle_width`) and `CycleHeight` (`cycle_height`) are additive v4 commands that cycle to the next larger preset, wrapping to the smallest at the end. `AlignColumnLeft` (`align_column_left`) and `AlignColumnRight` (`align_column_right`) are additive v4 commands that align the focused column or floating window to the corresponding work-area edge.
+`WriteDiagnosticSnapshot` (`{"type":"write_diagnostic_snapshot","requester_version":"0.4.0","requester_integrity":8192}`) is an additive v4 command that writes a local redacted diagnostic file. Both requester fields default when absent. Success returns `{"status":"diagnostic_snapshot_written","path":"..."}`; an unsupported daemon or an error response requires a client-side fallback. This command does not upload the file.
+Multi-row support is an additive v4 extension: `FocusRow` (`{"type":"focus_row","index":0}`), `FocusRowUp` (`{"type":"focus_row_up"}`), `FocusRowDown` (`{"type":"focus_row_down"}`), `MoveWindowToRowUp` (`{"type":"move_window_to_row_up"}`), and `MoveWindowToRowDown` (`{"type":"move_window_to_row_down"}`). The zero-based `focused_row` and `rows` fields are optional additions to `LayoutChanged` events and `WorkspaceState` query responses; `row_index` is an optional addition to `FocusedWindow` responses and `WindowInfo` records, omitted for floating windows and single-row workspaces. Older clients ignore these fields; newer clients must tolerate their absence. Complete workspace-state snapshots also include optional row counts and tiled-window row indices for multi-row workspaces, as described below.
+`Record` is an additive v4 extension: `{"type":"record","action":"start","timeout_secs":600}` starts capture, while `stop` and `status` need no timeout. The timeout defaults to 600 seconds and is clamped to 1–3600. Starting while active returns an error; stopping while idle succeeds. The `recording` response has optional `active` and `path` fields. Older clients map the response to `Unknown`, and older daemons do not support the command.
 See [the hotkey query contract](shortcut-guide.md#ipc-contract) for ordering,
 collision resolution, and the distinction between configuration and runtime
 registration health.
@@ -131,14 +134,18 @@ The example abbreviates the records. A real snapshot includes:
   transient Win32 HMONITOR value, retained for correlation with older events.
 - Nine `workspace` records per monitor, including empty, lazily unallocated slots.
   Workspace indices are **zero-based**. Names use the existing global
-  `[workspaces].names` configuration; unnamed slots contain `null`.
+  `[workspaces].names` configuration; unnamed slots contain `null`. Allocated
+  multi-row workspaces include `rows`, the row count; single-row and lazily
+  unallocated workspaces omit it.
 - One `window` record per managed window in its owning workspace, including
   inactive workspaces, floating windows, minimized windows, and inactive tabs.
   Sticky windows report their actual current ownership with `is_sticky: true`;
   consumers must not count them once on every workspace. Hidden scratchpads and
   drag placeholders are excluded; shown scratchpads are ordinary floating members.
   A dragged window temporarily detached for a preview retains source ownership
-  until the drop commits its new workspace.
+  until the drop commits its new workspace. Tiled windows in multi-row workspaces
+  include `row_index`, a zero-based row index; floating windows and windows in
+  single-row workspaces omit it. Older daemons can omit both row fields.
 - Deterministic order: monitors by device name, workspaces by index, and windows
   within each workspace by HWND. HWNDs are transient and can be reused; consumers
   must invalidate cached metadata appropriately. Icons, titles, geometry and
@@ -154,7 +161,8 @@ produces `{"type":"workspace_snapshot_error","message":"..."}` and closes the pi
 Consumers must accumulate a replacement model and install it **only after the
 matching end**. A new session invalidates all previous revision assumptions.
 Revisions start at zero and advance only when membership, names, monitor topology,
-active workspace or focused monitor changes. Geometry/animation and focus changes
+active workspace or focused monitor changes, a window moves to another row, or
+a workspace's row count changes. Scroll, geometry, animation and focus changes
 within the same monitor do not advance this revision. These are complete
 replacements, so a consumer does not need intervening revisions to reconstruct state.
 
@@ -229,6 +237,27 @@ Do not infer workspace-state support from the numeric version alone; require the
   "type": "layout_changed",
   "monitor": 65537,
   "workspace_index": 0,
+  "focused_row": 0,
+  "rows": [
+    {
+      "focused_column": 1,
+      "scroll_offset": 0.0,
+      "columns": [
+        {
+          "window_ids": [1223496256],
+          "width_px": 1267,
+          "height_weights": [1.0],
+          "mode": { "type": "vertical" }
+        },
+        {
+          "window_ids": [13764602, 1246800],
+          "width_px": 1267,
+          "height_weights": [0.6, 0.4],
+          "mode": { "type": "tabbed", "active_idx": 0 }
+        }
+      ]
+    }
+  ],
   "focused_column": 1,
   "columns": [
     {
@@ -247,7 +276,9 @@ Do not infer workspace-state support from the numeric version alone; require the
 }
 ```
 
-Carries enough column structure to render without a follow-up `QueryWorkspace`.
+Carries enough column structure to render without a follow-up `QueryWorkspace`. The optional v4 additions `focused_row` and `rows` describe all rows in top-to-bottom order. Each `RowSummary` contains `columns`, `focused_column` and `scroll_offset`; the row's index is its position in the array. Top-level `columns` and `focused_column` reflect the focused row for backward compatibility.
+
+The `QueryWorkspace` response (`status: "workspace_state"`) likewise adds `focused_row` and `rows`. In a multi-row workspace, `QueryFocused` (`status: "focused_window"`) reports the zero-based focused `row_index`, even if that row is empty; it omits the field for single-row workspaces and floating focus. `WindowInfo` objects include `row_index` for tiled windows in multi-row workspaces and omit it for floating windows and single-row workspaces. Older daemons may omit these fields. `FocusedWindowChanged` events do not include a row index.
 
 Per-column fields:
 
@@ -352,50 +383,7 @@ lwm subscribe | ForEach-Object { ConvertFrom-Json $_ | Format-Table -AutoSize }
 
 ## Yasb integration
 
-[Yasb](https://github.com/amnweb/yasb) ships komorebi and GlazeWM widgets in-tree but does not have LeopardWM widgets yet (will be revisited once we have user demand for it). Two paths today:
-
-### Pure config (no plugin code)
-
-Use Yasb's `custom` widget to run `lwm subscribe` as a subprocess and render the most recent line. Add this to your Yasb `config.yaml`:
-
-```yaml
-widgets:
-  leopardwm_workspace:
-    type: "yasb.custom.CustomWidget"
-    options:
-      label: "<span>WS {data}</span>"
-      class_name: "leopardwm-workspace"
-      exec_options:
-        run_cmd: ["lwm", "subscribe", "--events", "workspace"]
-        run_interval: 0   # 0 means run once, keep stdout open
-        return_format: "json"
-      callbacks:
-        on_left: "do_nothing"
-```
-
-`run_interval: 0` keeps the subscription open for the life of the bar. `return_format: "json"` parses each newline-delimited frame; `{data}` in the label references the parsed event. Replace `workspace` with any comma-separated filter from the [Event kinds table](#event-kinds).
-
-This won't render a per-workspace strip or a title with executable icon — just whatever a single `{data}` placeholder can show. For richer rendering, write a real Python plugin (sketch below) or wait until a first-class LeopardWM widget set lands in Yasb.
-
-### Plugin sketch (Python)
-
-A real Yasb plugin would consume the stream and update multiple labels:
-
-```python
-import json
-import subprocess
-
-proc = subprocess.Popen(["lwm", "subscribe", "--events", "workspace,focused_window,layout"],
-                        stdout=subprocess.PIPE, text=True, bufsize=1)
-for line in proc.stdout:
-    event = json.loads(line)
-    if event["type"] == "workspace_changed":
-        update_workspace_widget(new_index=event["new_index"])
-    elif event["type"] == "focused_window_changed":
-        update_title_widget(title=event.get("title"))
-    elif event["type"] == "layout_changed":
-        update_layout_widget(columns=event["columns"], focused=event["focused_column"])
-```
+The user-facing setup lives in [`docs/yasb.md`](../docs/yasb.md): the tested Yasb recipe, plus an "Any bar" section for other bars that subscribe to events and run `lwm` commands. Keep that page as the single source for bar setup, and keep this document as the wire contract it builds on.
 
 ## Adding new IPC events (daemon developers)
 
@@ -420,7 +408,7 @@ Check `MEMORY.md` → "IPC bar-integration validation deferred" before building 
 
 - **Per-monitor filter not supported** — `--events` filters by kind only. Filter legacy events by `monitor`, or workspace-state records by `monitor_device_name`, client-side.
 - **No individual `WindowCreated` / `Destroyed` events** — opt-in workspace-state snapshots report complete membership after lifecycle changes. Consumers compare replacements if they need their own deltas.
-- **No WebSocket bridge** — the daemon serves only the named pipe. Browser-based bars need a thin bridge component.
+- **No general WebSocket bridge** — the optional loopback endpoint supports only the GlazeWM workspace subset described in the [Yasb guide](../docs/yasb.md); it rejects browser Origin headers.
 - **Stream mode is uni-directional** — after Subscribe, the pipe only flows daemon→client. Open a second pipe for command queries.
 - **Daemon shutdown** delivers EOF (`BrokenPipe` on next read). Reconnect with backoff if your bar should survive daemon restarts.
 

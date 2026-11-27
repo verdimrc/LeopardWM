@@ -42,6 +42,11 @@ outer_gap_bottom = {outer_gap}
 
 # Width presets (fractions of usable viewport width).
 width_presets = [0.333, 0.5, 0.667]
+# Mouse resize: "presets" (default) or "free".
+# mouse_resize = "presets"
+
+# Off-screen columns: "bleed" (default) or "park" to avoid neighboring monitors.
+# offscreen_mode = "bleed"
 
 # Which preset new columns open at (1-based index into width_presets).
 # 1 = first preset. Out-of-range values fall back to the first preset.
@@ -50,20 +55,17 @@ default_width_preset = 1
 # Height presets (fractions of column height / weight).
 height_presets = [0.333, 0.5, 0.667]
 
-# Centering mode: "center", "just_in_view", "on_overflow", or
-# "center_columns_when_narrower"
+# Centering mode: "center", "just_in_view", or "on_overflow"
 # - center: Always center the focused column
 # - just_in_view: Only scroll if focused column would be outside viewport
 # - on_overflow: Center only when the column is wider than the viewport
-# - center_columns_when_narrower: Center all columns together when they are
-#   narrower than the viewport; otherwise like just_in_view
 centering_mode = "{centering_mode}"
 
-# Center the only active tiled column when it fits, regardless of centering mode.
-center_single_column = false
+# Center columns when they fit: "off", "single", or "fit".
+center_columns = "off"
 
-# With center_columns_when_narrower, columns that leave at most this many
-# pixels free count as filling the screen.
+# With center_columns = "fit", columns that leave at most this many pixels
+# free count as filling the screen.
 # full_screen_tolerance_px = 2
 
 [appearance]
@@ -90,6 +92,9 @@ new_window_monitor = "opening"
 #   get there, i.e. its window rule's column_width, else the default width.
 new_width_on_monitor_move = "upstream"
 
+# Fixed-size caption windows: "float" (default) or "tile". Window rules override this.
+fixed_size_windows = "float"
+
 # Track focus changes from Windows (sync with Alt-Tab, etc.)
 # Changes to focus tracking hooks take effect the next time LeopardWM starts.
 track_focus_changes = true
@@ -99,6 +104,13 @@ log_level = "info"
 
 # Focus follows mouse (hover to focus)
 focus_follows_mouse = false
+
+# Keep the PC and display awake while LeopardWM runs
+# keep_awake = false
+
+# Hold one modifier to temporarily prevent mouse-driven focus changes.
+# Options: none, Ctrl, Alt, Shift, Win, F13 through F24.
+# focus_lock_modifier = "none"
 
 # Disable Windows 11 Snap Layouts for tiled windows (also disables maximize button)
 # disable_snap_layouts = false
@@ -127,21 +139,37 @@ focus_follows_mouse = false
 # right) or "in_column" (stacked into the focused column).
 # new_window_placement = "new_column"
 
+# Plain drag merges a window (default) or reorders its column. Shift drag
+# does the opposite, including moves across monitors or rows.
+# plain_drag_action = "merge" # "merge" or "reorder"
+
 # Taskbar buttons: "hide_offscreen" (default, hide inactive workspaces and
 # scrolled-offscreen windows), "hide_inactive_workspaces" (keep every button
 # on each monitor's active workspace), or "show_all". Floating and minimized
 # windows keep their buttons on the active workspace in every mode.
 # taskbar_buttons = "hide_offscreen"
 
-# Wrap vertical focus/move at a column's top or bottom edge into the adjacent
-# workspace. When on, focus_up/focus_down at the edge switch workspaces and
-# move_window_up/move_window_down at the edge move the window there. Default false.
-# workspace_edge_wrap = false
+# Vertical focus/move at a column edge: "off" (default) stays put, "wrap"
+# switches to the adjacent workspace and wraps between 1 and 9, and "clamp"
+# stops at the ends. Legacy true and false mean "wrap" and "off".
+# With skip_empty_workspaces, clamp focus stops at the first/last occupied workspace.
+# workspace_edge_wrap = "off"
 
 # Skip empty workspaces for prev/next and edge-wrap focus on this monitor.
 # Tiled, floating and minimized windows count; sticky windows do not.
 # No other occupied workspace means no change. Window moves are unaffected.
 # skip_empty_workspaces = false
+
+# Switch to the destination workspace when moving the focused window.
+# follow_window_to_workspace = false
+
+# At a horizontal strip edge, focus the neighboring monitor or move the focused column there.
+# These options are independent of vertical workspace_edge_wrap.
+# focus_crosses_monitors = false
+# move_crosses_monitors = false
+
+# Floating move and keyboard or wheel nudge distance in logical pixels (1-1000).
+# move_step = 50
 
 # Warp the mouse cursor onto the focused window after a focus-navigation command
 # (the inverse of focus_follows_mouse). Default false.
@@ -213,17 +241,22 @@ reduce_motion_on_battery = true
 #   right but fit against the right edge), or "ltr_left_aligned" (like "ltr",
 #   but columns that fit snap back to the left edge after Ctrl+Alt+C centered
 #   a window).
-# - default_width_preset, centering_mode, center_past_edges,
-#   center_single_column, full_screen_tolerance_px: override [layout].
+# - default_width_preset, centering_mode, center_columns, center_past_edges,
+#   full_screen_tolerance_px: override [layout].
 # Options left out keep their default; the first rule for a display wins.
 # [[monitor_rules]]
 # display = 3
 # direction = "ltr"
 # default_width_preset = 1
 # centering_mode = "center"
+# center_columns = "off"
 # center_past_edges = false
-# center_single_column = false
 # full_screen_tolerance_px = 2
+
+[glazewm_compat]
+# Enable the local endpoint for YASB's stock GlazeWM workspaces widget.
+enabled = false
+port = 6123
 
 # Built-in example: Firefox / Zen Picture-in-Picture popups draw their own
 # square frame, so we override the focus-border corner style to match. Edit
@@ -232,10 +265,22 @@ reduce_motion_on_battery = true
 match_class = "MozillaDialogClass"
 corner_style = "square"
 
+# Hide or recolor the border for a matching app (independent options).
+# [[window_rules]]
+# match_executable = "example.exe"
+# border = false
+# border_color = "4285F4"
+
 # [[window_rules]]
 # match_class = "Chrome_WidgetWin_1"
 # match_title = ".*DevTools.*"
 # action = "float"
+# x = 100
+# y = 100
+# x/y are optional 96-DPI logical-pixel offsets from the opening monitor's
+# work-area top-left. An unset axis keeps the window's own position. If either
+# is set, both axes are clamped inside the work area; oversized windows align
+# to its start on that axis. Only floating rules use x/y.
 
 # Ignore small QQ NT helpers using outer sizes in logical pixels, the same units
 # as rule width/height. At 100% scaling these equal the window's pixel dimensions;
@@ -287,6 +332,7 @@ mod tests {
             "[animation]",
             "[overview]",
             "[workspaces]",
+            "[glazewm_compat]",
             "[[window_rules]]",
         ] {
             assert!(config.contains(section), "missing section: {section}");
@@ -296,6 +342,15 @@ mod tests {
         assert!(config.contains("centering_mode = \"center\""));
         assert!(config.contains("\"Win+Ctrl+Escape\" = \"panic_revert\""));
         assert!(config.contains("diagnostic_capture_secs = 0"));
+        let section = config
+            .split_once("[glazewm_compat]")
+            .unwrap()
+            .1
+            .split("\n[")
+            .next()
+            .unwrap();
+        assert!(section.lines().any(|line| line.trim() == "enabled = false"));
+        assert!(section.lines().any(|line| line.trim() == "port = 6123"));
     }
 
     #[test]
@@ -311,5 +366,14 @@ mod tests {
         assert!(config.contains("outer_gap_left = 16"));
         assert!(config.contains("outer_gap_bottom = 16"));
         assert!(config.contains("centering_mode = \"just_in_view\""));
+        let section = config
+            .split_once("[glazewm_compat]")
+            .unwrap()
+            .1
+            .split("\n[")
+            .next()
+            .unwrap();
+        assert!(section.lines().any(|line| line.trim() == "enabled = false"));
+        assert!(section.lines().any(|line| line.trim() == "port = 6123"));
     }
 }

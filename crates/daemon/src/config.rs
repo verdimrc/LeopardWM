@@ -4,11 +4,17 @@
 use anyhow::{Context, Result};
 use directories::ProjectDirs;
 use leopardwm_core_layout::CenteringMode;
+use leopardwm_ipc::log_text;
 use leopardwm_platform_win32::parse_hotkey_string;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::PathBuf;
+use std::io::{ErrorKind, Write};
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+
+#[path = "config_recovery.rs"]
+mod recovery;
 
 /// Executables whose windows should never be tiled (system dialogs, security prompts, etc.).
 /// These are appended as built-in Ignore rules after user-defined rules.
@@ -18,6 +24,10 @@ const BUILTIN_IGNORE_EXECUTABLES: &[&str] = &[
     "msiexec.exe",            // Windows Installer
     "CredentialUIBroker.exe", // Windows credential/login prompt
     "SnippingTool.exe",       // Screen capture overlay — breaks when repositioned
+];
+
+const BUILTIN_FLOAT_RULES: &[(&str, &str)] = &[
+    ("Audacity.exe", "^Importing"), // Audacity import progress popup
 ];
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -52,6 +62,23 @@ pub struct Config {
     /// Overview-mode configuration.
     #[serde(default)]
     pub overview: OverviewConfig,
+    pub glazewm_compat: GlazewmCompatConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GlazewmCompatConfig {
+    pub enabled: bool,
+    pub port: u16,
+}
+
+impl Default for GlazewmCompatConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            port: 6123,
+        }
+    }
 }
 
 /// Per-monitor settings: column direction, and overrides of `[layout]`
@@ -63,10 +90,14 @@ pub struct Config {
 /// [[monitor_rules]]
 /// display = 3  # \\.\DISPLAY3
 /// direction = "rtl"
-/// centering_mode = "center_columns_when_narrower"
+/// center_columns = "fit"
 /// center_past_edges = true
 /// ```
+///
+/// The legacy `center_single_column` and `centering_mode =
+/// "center_columns_when_narrower"` still load (see `migrate_legacy_centering`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(remote = "Self")]
 pub struct MonitorRule {
     /// Windows display number (`3` = `\\.\DISPLAY3`).
     pub display: u32,
@@ -80,17 +111,60 @@ pub struct MonitorRule {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub center_past_edges: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub center_single_column: Option<bool>,
+    pub center_columns: Option<CenterColumnsConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub full_screen_tolerance_px: Option<i32>,
 }
 
+impl Serialize for MonitorRule {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        Self::serialize(self, serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for MonitorRule {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let mut value = serde_json::Value::deserialize(deserializer)?;
+        if let Some(fields) = value.as_object_mut() {
+            migrate_legacy_centering(fields);
+            if let Some(legacy) = fields.remove("center_single_column") {
+                let single = legacy.as_bool().ok_or_else(|| {
+                    serde::de::Error::custom("center_single_column must be a boolean")
+                })?;
+                let mode = if single { "single" } else { "off" };
+                fields
+                    .entry("center_columns")
+                    .or_insert_with(|| serde_json::Value::String(mode.into()));
+            }
+        }
+        Self::deserialize(value).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Read the legacy `centering_mode = "center_columns_when_narrower"` in
+/// `[layout]` or a `[[monitor_rules]]` entry as `centering_mode =
+/// "just_in_view"` plus `center_columns = "fit"`. An explicit
+/// `center_columns` wins; `center_columns_when_narrower` wins over the legacy
+/// `center_single_column`.
+fn migrate_legacy_centering(fields: &mut serde_json::Map<String, serde_json::Value>) {
+    if fields.get("centering_mode").and_then(|v| v.as_str()) == Some("center_columns_when_narrower")
+    {
+        fields.insert(
+            "centering_mode".into(),
+            serde_json::Value::String("just_in_view".into()),
+        );
+        fields
+            .entry("center_columns")
+            .or_insert_with(|| serde_json::Value::String("fit".into()));
+    }
+}
+
 /// Centering settings in effect on one monitor (see `Config::centering_for`).
+/// `center_columns` is separate (see `Config::center_columns_for`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MonitorCentering {
     pub centering_mode: CenteringModeConfig,
     pub center_past_edges: bool,
-    pub center_single_column: bool,
     pub full_screen_tolerance_px: i32,
 }
 
@@ -98,7 +172,6 @@ impl MonitorCentering {
     pub fn apply_to(&self, workspace: &mut leopardwm_core_layout::Workspace) {
         workspace.set_centering_mode(self.centering_mode.into());
         workspace.set_center_past_edges(self.center_past_edges);
-        workspace.set_center_single_column(self.center_single_column);
         workspace.set_full_screen_tolerance_px(self.full_screen_tolerance_px);
     }
 }
@@ -138,7 +211,9 @@ impl Config {
     }
 
     /// Apply the monitor's direction and centering settings (see
-    /// `direction_for` and `centering_for`) to one of its workspaces.
+    /// `direction_for` and `centering_for`) to one of its workspaces. It
+    /// leaves `center_columns` alone: callers set it from
+    /// `center_columns_for`, after any slide back from centered columns.
     pub fn apply_monitor_rules(
         &self,
         device_name: &str,
@@ -146,6 +221,14 @@ impl Config {
     ) {
         self.centering_for(device_name).apply_to(workspace);
         self.direction_for(device_name).apply_to(workspace);
+    }
+
+    /// `center_columns` for the monitor with this device name (e.g.
+    /// `\\.\DISPLAY3`): its first `[[monitor_rules]]` entry's, else `[layout]`'s.
+    pub fn center_columns_for(&self, device_name: &str) -> CenterColumnsConfig {
+        self.monitor_rule(device_name)
+            .and_then(|r| r.center_columns)
+            .unwrap_or(self.layout.center_columns.center_columns)
     }
 
     /// Centering settings for the monitor with this device name (e.g.
@@ -159,9 +242,6 @@ impl Config {
             center_past_edges: rule
                 .and_then(|r| r.center_past_edges)
                 .unwrap_or(self.layout.center_past_edges),
-            center_single_column: rule
-                .and_then(|r| r.center_single_column)
-                .unwrap_or(self.layout.center_single_column),
             full_screen_tolerance_px: rule
                 .and_then(|r| r.full_screen_tolerance_px)
                 .unwrap_or(self.layout.full_screen_tolerance_px),
@@ -220,7 +300,7 @@ impl WorkspacesConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, remote = "Self")]
 pub struct LayoutConfig {
     /// Gap between columns in pixels.
     #[serde(default = "default_gap")]
@@ -246,12 +326,11 @@ pub struct LayoutConfig {
     #[serde(default)]
     pub centering_mode: CenteringModeConfig,
 
-    /// Center the only active tiled column when it fits inside the viewport.
-    #[serde(default)]
-    pub center_single_column: bool,
+    #[serde(flatten)]
+    pub center_columns: CenterColumnsSetting,
 
-    /// With `centering_mode = "center_columns_when_narrower"`, columns that
-    /// leave at most this many pixels free count as filling the screen.
+    /// With `center_columns = "fit"`, columns that leave at most this many
+    /// pixels free count as filling the screen.
     #[serde(default = "default_full_screen_tolerance_px")]
     pub full_screen_tolerance_px: i32,
 
@@ -260,6 +339,12 @@ pub struct LayoutConfig {
     /// When false (default), scroll is clamped to content boundaries.
     #[serde(default = "default_false")]
     pub center_past_edges: bool,
+
+    #[serde(default)]
+    pub mouse_resize: MouseResize,
+
+    #[serde(default)]
+    pub offscreen_mode: OffscreenMode,
 
     /// Width presets for cycling (fractions of usable viewport width).
     #[serde(default = "default_width_presets")]
@@ -279,6 +364,11 @@ pub struct LayoutConfig {
     /// as a fraction of the monitor viewport width. Default: 0.25 (25%).
     #[serde(default = "default_desktop_peek_min_width")]
     pub desktop_peek_min_width: f64,
+
+    /// Multi-row layout configuration.
+    #[serde(default)]
+    pub rows: RowsConfig,
+
     // Legacy fields kept for backward-compatible deserialization; not used.
     #[serde(default, skip_serializing)]
     #[allow(dead_code)]
@@ -294,12 +384,307 @@ pub struct LayoutConfig {
     max_column_width: Option<i32>,
 }
 
+impl Serialize for LayoutConfig {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        Self::serialize(self, serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for LayoutConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let mut value = serde_json::Value::deserialize(deserializer)?;
+        if let Some(fields) = value.as_object_mut() {
+            migrate_legacy_centering(fields);
+        }
+        Self::deserialize(value).map_err(serde::de::Error::custom)
+    }
+}
+
 fn default_desktop_peek_min_width() -> f64 {
     0.25
 }
 
 fn default_full_screen_tolerance_px() -> i32 {
     2
+}
+
+/// Configuration for row splits in specific workspace(s).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WorkspaceRowsConfig {
+    /// Target workspaces (1-based, 1..=9).
+    /// Accepts a single number (`workspace = 1`), an array (`workspaces = [1, 2]`),
+    /// or a comma-separated string (`workspaces = "1, 2"`).
+    #[serde(
+        default,
+        alias = "workspace",
+        deserialize_with = "deserialize_one_or_many_workspaces"
+    )]
+    pub workspaces: Vec<u8>,
+
+    /// Row split as percentages, fractions, or weights, top to bottom (max 4 rows).
+    #[serde(default = "default_row_split", deserialize_with = "deserialize_split")]
+    pub split: Vec<String>,
+}
+
+impl WorkspaceRowsConfig {
+    /// Parse row shares for this workspace configuration.
+    pub fn parse_shares(&self) -> Vec<f64> {
+        parse_split_shares(&self.split)
+    }
+
+    /// Check if this config targets a 1-based workspace number.
+    pub fn matches_workspace(&self, ws_1based: u8) -> bool {
+        self.workspaces.contains(&ws_1based)
+    }
+}
+
+/// Multi-row layout configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct RowsConfig {
+    /// Vertical gap between rows in pixels. Default: 8.
+    pub gap: i32,
+
+    /// Per-workspace row configurations.
+    /// Can specify 1 or more workspaces and the split for those workspaces.
+    #[serde(default)]
+    pub workspaces: Vec<WorkspaceRowsConfig>,
+
+    /// Global/fallback row split as percentages, fractions, or weights, top to bottom.
+    /// Default: ["100%"] (single row).
+    #[serde(default = "default_row_split", deserialize_with = "deserialize_split")]
+    pub split: Vec<String>,
+}
+
+fn default_row_gap() -> i32 {
+    8
+}
+
+fn default_row_split() -> Vec<String> {
+    vec!["100%".to_string()]
+}
+
+impl Default for RowsConfig {
+    fn default() -> Self {
+        Self {
+            gap: default_row_gap(),
+            workspaces: Vec::new(),
+            split: default_row_split(),
+        }
+    }
+}
+
+impl RowsConfig {
+    /// Parse row shares for a specific 0-based workspace index.
+    ///
+    /// By default, any unconfigured workspace has only 1 row (`vec![1.0]`).
+    /// If per-workspace row configs are specified, the first matching entry is used.
+    /// If no per-workspace configs are defined and a legacy/global `split` was configured,
+    /// falls back to parsing `self.split`.
+    pub fn parse_shares_for_workspace(&self, ws_idx_0based: usize) -> Vec<f64> {
+        let ws_1based = (ws_idx_0based + 1) as u8;
+        for entry in &self.workspaces {
+            if entry.matches_workspace(ws_1based) {
+                return entry.parse_shares();
+            }
+        }
+
+        // Fall back to global split (which defaults to ["100%"] -> vec![1.0]).
+        self.parse_shares()
+    }
+
+    /// Parse row shares from the global `split` field.
+    pub fn parse_shares(&self) -> Vec<f64> {
+        parse_split_shares(&self.split)
+    }
+}
+
+/// Parse row shares from a list of split strings (percentages, fractions, or weights).
+///
+/// Validates that:
+/// - Each entry parses as a percentage, fraction, or number > 0.
+/// - At most 4 rows are accepted (entries beyond the 4th are ignored with a warning).
+/// - Shares are normalized to sum to 1.0 (with a warning if raw percentages don't sum to ~100%).
+/// - If no valid entries are found, falls back to `vec![1.0]` (single row).
+pub fn parse_split_shares(split: &[String]) -> Vec<f64> {
+    let mut raw_values = Vec::new();
+    for entry in split.iter().take(4) {
+        let trimmed = entry.trim().trim_end_matches('%').trim();
+        if trimmed.contains('/') {
+            let parts: Vec<&str> = trimmed.split('/').collect();
+            if parts.len() == 2 {
+                if let (Ok(num), Ok(den)) = (
+                    parts[0].trim().parse::<f64>(),
+                    parts[1].trim().parse::<f64>(),
+                ) {
+                    if den > 0.0 && num > 0.0 && (num / den).is_finite() {
+                        raw_values.push(num / den);
+                        continue;
+                    }
+                }
+            }
+        }
+        if let Ok(val) = trimmed.parse::<f64>() {
+            if val > 0.0 && val.is_finite() {
+                raw_values.push(val);
+            } else {
+                tracing::warn!(
+                    "Row split entry '{}' must be greater than 0; ignoring",
+                    log_text::text(entry)
+                );
+            }
+        } else {
+            tracing::warn!(
+                "Failed to parse row split entry '{}'; ignoring",
+                log_text::text(entry)
+            );
+        }
+    }
+
+    if split.len() > 4 {
+        tracing::warn!(
+            "Configured {} rows, but at most 4 rows are supported; truncating to 4",
+            split.len()
+        );
+    }
+
+    if raw_values.is_empty() {
+        tracing::warn!("No valid row split entries; falling back to 100% (single row)");
+        return vec![1.0];
+    }
+
+    let sum: f64 = raw_values.iter().sum();
+    if sum <= 0.0 || !sum.is_finite() {
+        return vec![1.0];
+    }
+
+    if (sum - 100.0).abs() > 0.5 && (sum - 1.0).abs() > 0.01 {
+        tracing::warn!(
+            "Row split entries sum to {:.1} (expected 100%); normalizing shares",
+            sum
+        );
+    }
+
+    raw_values.iter().map(|&v| v / sum).collect()
+}
+
+fn deserialize_one_or_many_workspaces<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Vec<u8>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Helper {
+        SingleNum(u8),
+        NumList(Vec<u8>),
+        SingleStr(String),
+        StrList(Vec<String>),
+    }
+
+    let helper = Helper::deserialize(deserializer)?;
+    let mut result = Vec::new();
+
+    match helper {
+        Helper::SingleNum(n) => {
+            if (1..=9).contains(&n) {
+                result.push(n);
+            } else {
+                tracing::warn!("Workspace index {} out of range 1..=9; ignoring", n);
+            }
+        }
+        Helper::NumList(list) => {
+            for n in list {
+                if (1..=9).contains(&n) {
+                    if !result.contains(&n) {
+                        result.push(n);
+                    }
+                } else {
+                    tracing::warn!("Workspace index {} out of range 1..=9; ignoring", n);
+                }
+            }
+        }
+        Helper::SingleStr(s) => {
+            parse_workspaces_str(&s, &mut result);
+        }
+        Helper::StrList(list) => {
+            for s in list {
+                parse_workspaces_str(&s, &mut result);
+            }
+        }
+    }
+
+    Ok(result)
+}
+
+fn parse_workspaces_str(s: &str, out: &mut Vec<u8>) {
+    for part in s.split(',') {
+        let trimmed = part.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Some((start_s, end_s)) = trimmed.split_once('-') {
+            if let (Ok(start), Ok(end)) = (start_s.trim().parse::<u8>(), end_s.trim().parse::<u8>())
+            {
+                for n in start..=end {
+                    if (1..=9).contains(&n) {
+                        if !out.contains(&n) {
+                            out.push(n);
+                        }
+                    } else {
+                        tracing::warn!("Workspace index {} out of range 1..=9; ignoring", n);
+                    }
+                }
+                continue;
+            }
+        }
+        if let Ok(n) = trimmed.parse::<u8>() {
+            if (1..=9).contains(&n) {
+                if !out.contains(&n) {
+                    out.push(n);
+                }
+            } else {
+                tracing::warn!("Workspace index {} out of range 1..=9; ignoring", n);
+            }
+        } else {
+            tracing::warn!(
+                "Invalid workspace entry '{}'; ignoring",
+                log_text::text(trimmed)
+            );
+        }
+    }
+}
+
+fn deserialize_split<'de, D>(deserializer: D) -> std::result::Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum SplitHelper {
+        Single(String),
+        List(Vec<String>),
+        NumList(Vec<f64>),
+    }
+
+    let helper = SplitHelper::deserialize(deserializer)?;
+    match helper {
+        SplitHelper::Single(s) => {
+            let list: Vec<String> = s
+                .split(',')
+                .map(|p| p.trim().to_string())
+                .filter(|p| !p.is_empty())
+                .collect();
+            if list.is_empty() {
+                Ok(default_row_split())
+            } else {
+                Ok(list)
+            }
+        }
+        SplitHelper::List(list) => Ok(list),
+        SplitHelper::NumList(nums) => Ok(nums.into_iter().map(|n| n.to_string()).collect()),
+    }
 }
 
 fn default_width_presets() -> Vec<f64> {
@@ -324,12 +709,15 @@ impl Default for LayoutConfig {
             outer_gap_bottom: default_outer_gap(),
             centering_mode: CenteringModeConfig::default(),
             center_past_edges: false,
-            center_single_column: false,
+            center_columns: CenterColumnsSetting::default(),
             full_screen_tolerance_px: default_full_screen_tolerance_px(),
+            mouse_resize: MouseResize::default(),
+            offscreen_mode: OffscreenMode::default(),
             width_presets: default_width_presets(),
             default_width_preset: default_width_preset(),
             height_presets: default_height_presets(),
             desktop_peek_min_width: default_desktop_peek_min_width(),
+            rows: RowsConfig::default(),
             outer_gap: None,
             default_column_width: None,
             min_column_width: None,
@@ -437,6 +825,67 @@ impl LayoutConfig {
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum CenterColumnsConfig {
+    #[default]
+    Off,
+    Single,
+    Fit,
+}
+
+impl From<CenterColumnsConfig> for leopardwm_core_layout::CenterColumns {
+    fn from(mode: CenterColumnsConfig) -> Self {
+        match mode {
+            CenterColumnsConfig::Off => Self::Off,
+            CenterColumnsConfig::Single => Self::Single,
+            CenterColumnsConfig::Fit => Self::Fit,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct CenterColumnsSetting {
+    pub center_columns: CenterColumnsConfig,
+}
+
+impl<'de> Deserialize<'de> for CenterColumnsSetting {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize, Default)]
+        #[serde(default)]
+        struct Values {
+            center_columns: Option<CenterColumnsConfig>,
+            center_single_column: bool,
+        }
+        let values = Values::deserialize(deserializer)?;
+        Ok(Self {
+            center_columns: values
+                .center_columns
+                .unwrap_or(if values.center_single_column {
+                    CenterColumnsConfig::Single
+                } else {
+                    CenterColumnsConfig::Off
+                }),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum MouseResize {
+    #[default]
+    Presets,
+    Free,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OffscreenMode {
+    #[default]
+    Bleed,
+    Park,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CenteringModeConfig {
     /// Center the focused column in the viewport.
@@ -447,9 +896,6 @@ pub enum CenteringModeConfig {
     /// Center only when the focused column is wider than the viewport;
     /// otherwise behave like `JustInView`.
     OnOverflow,
-    /// Center all columns together when they are narrower than the viewport;
-    /// otherwise behave like `JustInView`.
-    CenterColumnsWhenNarrower,
 }
 
 impl From<CenteringModeConfig> for CenteringMode {
@@ -458,9 +904,6 @@ impl From<CenteringModeConfig> for CenteringMode {
             CenteringModeConfig::Center => CenteringMode::Center,
             CenteringModeConfig::JustInView => CenteringMode::JustInView,
             CenteringModeConfig::OnOverflow => CenteringMode::OnOverflow,
-            CenteringModeConfig::CenterColumnsWhenNarrower => {
-                CenteringMode::CenterColumnsWhenNarrower
-            }
         }
     }
 }
@@ -567,6 +1010,15 @@ pub enum TaskbarButtons {
     ShowAll,
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceEdgeWrap {
+    #[default]
+    Off,
+    Wrap,
+    Clamp,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, remote = "Self")]
 pub struct BehaviorConfig {
@@ -578,6 +1030,8 @@ pub struct BehaviorConfig {
 
     /// Width a tiled window gets when it moves to another monitor.
     pub new_width_on_monitor_move: NewWidthOnMonitorMove,
+
+    pub fixed_size_windows: FixedSizeWindows,
 
     /// Whether to track window focus changes from Windows.
     #[serde(default = "default_true")]
@@ -592,10 +1046,16 @@ pub struct BehaviorConfig {
     #[serde(default = "default_false")]
     pub focus_follows_mouse: bool,
 
+    #[serde(default)]
+    pub keep_awake: bool,
+
     /// Delay in milliseconds before focus changes on mouse enter.
     /// Only applies when focus_follows_mouse is true.
     #[serde(default = "default_focus_delay")]
     pub focus_follows_mouse_delay_ms: u32,
+
+    #[serde(default = "default_focus_lock_modifier")]
+    pub focus_lock_modifier: String,
 
     /// Whether to disable Windows 11 Snap Layouts for tiled windows.
     /// Removes WS_MAXIMIZEBOX from managed tiled windows to prevent edge-drag
@@ -628,18 +1088,22 @@ pub struct BehaviorConfig {
     #[serde(default)]
     pub new_window_placement: NewWindowPlacement,
 
+    #[serde(default)]
+    pub plain_drag_action: DragAction,
+
     /// Taskbar button visibility policy. Inactive workspaces hide all buttons
     /// unless ShowAll is selected. On the active workspace, HideOffscreen
     /// keeps buttons for visible, floating, and minimized windows.
     #[serde(default)]
     pub taskbar_buttons: TaskbarButtons,
 
-    /// Wrap vertical focus/move at a column's top or bottom edge into the
-    /// adjacent workspace. When on, focus_up/focus_down at the edge switch to
-    /// the previous/next workspace, and move_window_up/move_window_down at the
-    /// edge move the focused window there. Off by default.
-    #[serde(default = "default_false")]
-    pub workspace_edge_wrap: bool,
+    /// Vertical focus and moves at a column edge stay put (off), switch
+    /// workspaces with wrapping (wrap), or stop at the ends (clamp).
+    #[serde(default)]
+    pub workspace_edge_wrap: WorkspaceEdgeWrap,
+
+    #[serde(skip)]
+    pub(crate) invalid_workspace_edge_wrap: Option<String>,
 
     /// Warp the mouse cursor onto the focused window after a focus-navigation
     /// command (focus left/right/up/down/next/prev/start/end and the monitor
@@ -670,6 +1134,35 @@ pub struct BehaviorConfig {
 
     #[serde(default = "default_false")]
     pub skip_empty_workspaces: bool,
+
+    #[serde(default = "default_false")]
+    pub follow_window_to_workspace: bool,
+
+    #[serde(default)]
+    pub focus_crosses_monitors: bool,
+
+    #[serde(default)]
+    pub move_crosses_monitors: bool,
+
+    #[serde(default = "default_move_step")]
+    pub move_step: i32,
+
+    /// Move a window into the adjacent row when moving up/down at its column edge.
+    /// Default: false (no-op, current behavior).
+    #[serde(default = "default_false")]
+    pub move_window_across_rows: bool,
+}
+
+fn default_move_step() -> i32 {
+    50
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum FixedSizeWindows {
+    #[default]
+    Float,
+    Tile,
 }
 
 /// Width a tiled window gets when it moves to another monitor.
@@ -707,29 +1200,53 @@ pub enum NewWindowPlacement {
     InColumn,
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DragAction {
+    #[default]
+    Merge,
+    Reorder,
+}
+
+impl DragAction {
+    pub(crate) fn reorders(self, shift_held: bool) -> bool {
+        (self == Self::Reorder) != shift_held
+    }
+}
+
 impl Default for BehaviorConfig {
     fn default() -> Self {
         Self {
             focus_new_windows: true,
             new_window_monitor: NewWindowMonitor::default(),
             new_width_on_monitor_move: NewWidthOnMonitorMove::default(),
+            fixed_size_windows: FixedSizeWindows::default(),
             track_focus_changes: true,
             log_level: default_log_level(),
             focus_follows_mouse: false,
+            keep_awake: false,
             focus_follows_mouse_delay_ms: default_focus_delay(),
+            focus_lock_modifier: default_focus_lock_modifier(),
             disable_snap_layouts: true,
             check_for_updates: true,
             tab_close_action: TabCloseAction::default(),
             swap_chain_ghost_animation: true,
             floating_above_tiled: false,
             new_window_placement: NewWindowPlacement::default(),
+            plain_drag_action: DragAction::default(),
             taskbar_buttons: TaskbarButtons::default(),
-            workspace_edge_wrap: false,
+            workspace_edge_wrap: WorkspaceEdgeWrap::Off,
+            invalid_workspace_edge_wrap: None,
             mouse_follows_focus: false,
             fullscreen_follows_focus: true,
             notify_elevation_blocked: true,
             symmetric_modifiers: false,
             skip_empty_workspaces: false,
+            follow_window_to_workspace: false,
+            focus_crosses_monitors: false,
+            move_crosses_monitors: false,
+            move_step: default_move_step(),
+            move_window_across_rows: false,
         }
     }
 }
@@ -743,7 +1260,22 @@ impl Serialize for BehaviorConfig {
 impl<'de> Deserialize<'de> for BehaviorConfig {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let mut value = serde_json::Value::deserialize(deserializer)?;
+        let mut invalid_workspace_edge_wrap = None;
         if let Some(fields) = value.as_object_mut() {
+            if let Some(edge) = fields.get_mut("workspace_edge_wrap") {
+                match edge {
+                    serde_json::Value::Bool(enabled) => {
+                        *edge =
+                            serde_json::Value::String(if *enabled { "wrap" } else { "off" }.into());
+                    }
+                    serde_json::Value::String(mode)
+                        if matches!(mode.as_str(), "off" | "wrap" | "clamp") => {}
+                    _ => {
+                        invalid_workspace_edge_wrap = Some(edge.to_string());
+                        fields.remove("workspace_edge_wrap");
+                    }
+                }
+            }
             if let Some(legacy) = fields.remove("hide_offscreen_taskbar_buttons") {
                 if !fields.contains_key("taskbar_buttons") {
                     let enabled = legacy.as_bool().ok_or_else(|| {
@@ -763,7 +1295,9 @@ impl<'de> Deserialize<'de> for BehaviorConfig {
                 }
             }
         }
-        Self::deserialize(value).map_err(serde::de::Error::custom)
+        let mut config = Self::deserialize(value).map_err(serde::de::Error::custom)?;
+        config.invalid_workspace_edge_wrap = invalid_workspace_edge_wrap;
+        Ok(config)
     }
 }
 
@@ -785,6 +1319,23 @@ fn default_log_level() -> String {
 
 fn default_focus_delay() -> u32 {
     100
+}
+
+fn default_focus_lock_modifier() -> String {
+    "none".to_string()
+}
+
+fn normalize_focus_lock_modifier(modifier: &str) -> Option<String> {
+    match modifier.to_ascii_lowercase().as_str() {
+        "none" => Some("none".to_string()),
+        "ctrl" => Some("Ctrl".to_string()),
+        "alt" => Some("Alt".to_string()),
+        "shift" => Some("Shift".to_string()),
+        "win" => Some("Win".to_string()),
+        _ => leopardwm_platform_win32::parse_vk(modifier)
+            .filter(|vk| leopardwm_platform_win32::fn_mod_bit(*vk).is_some())
+            .map(|vk| format!("F{}", vk - 0x6f)),
+    }
 }
 
 fn default_active_border_color() -> String {
@@ -920,9 +1471,27 @@ pub struct WindowRule {
     #[serde(default)]
     pub height: Option<i32>,
 
+    /// Floating window's left offset from the opening monitor's work-area left edge,
+    /// in 96-DPI logical pixels, scaled by that monitor's DPI. If either offset
+    /// is set, both axes are clamped into that work area, with oversized
+    /// dimensions aligned to its start.
+    #[serde(default)]
+    pub x: Option<i32>,
+
+    /// Floating window's top offset from the opening monitor's work-area top edge,
+    /// in 96-DPI logical pixels. An unset axis retains the window's own position
+    /// before the work-area clamp.
+    #[serde(default)]
+    pub y: Option<i32>,
+
     /// `None` = auto-detect from DWM corner preference.
     #[serde(default)]
     pub corner_style: Option<CornerStyle>,
+
+    #[serde(default)]
+    pub border: Option<bool>,
+    #[serde(default)]
+    pub border_color: Option<String>,
 
     /// Open the window on this workspace (1-9) instead of the active one.
     #[serde(default)]
@@ -942,6 +1511,11 @@ pub struct WindowRule {
     /// past the end append; 0 is ignored. Tiled windows only.
     #[serde(default)]
     pub open_in_column: Option<u8>,
+
+    /// Open the window on this row (1-based, 1-4). Clamped to workspace row
+    /// count; 0 is ignored; ignored if action is float. Tiled windows only.
+    #[serde(default)]
+    pub row: Option<u8>,
 
     /// Make the window sticky on open so it follows across workspaces. Pair
     /// with `action = "float"` for a floating overlay; on its own the window
@@ -1000,7 +1574,9 @@ impl CornerStyle {
 /// (e.g., "focus_left"). Available actions and labels come from
 /// `leopardwm_ipc::hotkeys::hotkey_catalog`.
 /// Unbound actions include focus_next/focus_prev (linear window navigation)
-/// and scroll_left/scroll_right (move the strip viewport by 100 px).
+/// scroll_left/scroll_right (move the strip viewport by 100 px),
+/// nudge_left/nudge_right (move windows by the configured step), and
+/// align_column_left/align_column_right (align to a work-area edge).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct HotkeyConfig {
@@ -1258,6 +1834,22 @@ pub struct ConfigWarning {
     pub message: String,
 }
 
+fn focus_lock_hotkey_warning(
+    behavior: &BehaviorConfig,
+    hotkeys: &HotkeyConfig,
+) -> Option<ConfigWarning> {
+    let vk = leopardwm_platform_win32::parse_vk(&behavior.focus_lock_modifier)?;
+    leopardwm_platform_win32::fn_mod_bit(vk)?;
+    let binding = crate::hotkey_resolution::resolve_hotkeys(hotkeys)
+        .bindings
+        .into_iter()
+        .find(|binding| binding.executable && binding.hook_binding.vk == vk)?;
+    Some(ConfigWarning {
+        field: "behavior.focus_lock_modifier".to_string(),
+        message: format!("focus_lock_modifier '{}' is also the trigger of hotkey '{}'; the hotkey may prevent focus lock from engaging", behavior.focus_lock_modifier, binding.binding),
+    })
+}
+
 /// A window rule with pre-compiled regex patterns for efficient matching.
 #[derive(Debug, Clone)]
 pub struct CompiledWindowRule {
@@ -1275,8 +1867,12 @@ pub struct CompiledWindowRule {
     pub width: Option<i32>,
     /// Fixed height for floating windows (optional).
     pub height: Option<i32>,
+    pub x: Option<i32>,
+    pub y: Option<i32>,
     /// Optional corner-style override for the focus border.
     pub corner_style: Option<CornerStyle>,
+    pub border_hidden: bool,
+    pub border_color_bgr: Option<u32>,
     /// Open on this workspace (0-based index) instead of the active one.
     pub open_on_workspace: Option<usize>,
     /// Maximize the window's column after opening.
@@ -1286,6 +1882,9 @@ pub struct CompiledWindowRule {
     /// Open at this 0-based column slot as its own column (validated from the
     /// 1-based config; high values append, 0 is dropped).
     pub open_in_column: Option<usize>,
+    /// Open on this 0-based row slot (validated from 1-based config;
+    /// clamped to workspace row count on insert, 0 is dropped). Tiled only.
+    pub row: Option<usize>,
     /// Make the window sticky on open.
     pub sticky: bool,
     /// Per-rule override of `behavior.new_window_monitor`.
@@ -1390,17 +1989,7 @@ impl Config {
 
     /// Load the first existing path from [`config_paths`], or defaults if none exists.
     pub fn load() -> Result<Self> {
-        let paths = config_paths();
-
-        for path in &paths {
-            if path.exists() {
-                tracing::info!("Loading config from: {}", path.display());
-                return Self::load_from_path(path);
-            }
-        }
-
-        tracing::info!("No config file found, using defaults");
-        Ok(Self::default())
+        CONFIG_FILE.lock().unwrap().load(&config_paths())
     }
 
     /// Validate configuration values, clamping out-of-range fields and returning warnings.
@@ -1415,6 +2004,17 @@ impl Config {
                 ),
             });
             self.appearance.language = "en".to_string();
+        }
+
+        if !(1..=1000).contains(&self.behavior.move_step) {
+            warnings.push(ConfigWarning {
+                field: "behavior.move_step".to_string(),
+                message: format!(
+                    "move_step ({}) out of range 1..=1000, clamped",
+                    self.behavior.move_step
+                ),
+            });
+            self.behavior.move_step = self.behavior.move_step.clamp(1, 1000);
         }
 
         if self.behavior.floating_above_tiled && !self.behavior.track_focus_changes {
@@ -1480,6 +2080,49 @@ impl Config {
             }
         }
 
+        // row gap must be >= 0
+        if self.layout.rows.gap < 0 {
+            warnings.push(ConfigWarning {
+                field: "layout.rows.gap".to_string(),
+                message: format!("Negative row gap ({}) clamped to 0", self.layout.rows.gap),
+            });
+            self.layout.rows.gap = 0;
+        }
+
+        for (idx, rule) in self.window_rules.iter_mut().enumerate() {
+            match rule.row {
+                Some(_) if rule.action == WindowAction::Float => {
+                    warnings.push(ConfigWarning {
+                        field: format!("window_rules[{}].row", idx),
+                        message: "row is not applicable with action = \"float\"; ignoring"
+                            .to_string(),
+                    });
+                    rule.row = None;
+                }
+                Some(0) => {
+                    warnings.push(ConfigWarning {
+                        field: format!("window_rules[{}].row", idx),
+                        message: "row = 0 is invalid (1-based, 1..=4); ignoring".to_string(),
+                    });
+                    rule.row = None;
+                }
+                Some(n) if (n as usize) > leopardwm_core_layout::MAX_ROWS => {
+                    warnings.push(ConfigWarning {
+                        field: format!("window_rules[{}].row", idx),
+                        message: format!(
+                            "row ({}) exceeds max {}, clamped to {}",
+                            n,
+                            leopardwm_core_layout::MAX_ROWS,
+                            leopardwm_core_layout::MAX_ROWS
+                        ),
+                    });
+                    rule.row = Some(leopardwm_core_layout::MAX_ROWS as u8);
+                }
+                _ => {}
+            }
+        }
+
+        // width_presets must not be empty
         if self.layout.width_presets.is_empty() {
             warnings.push(ConfigWarning {
                 field: "layout.width_presets".to_string(),
@@ -1501,23 +2144,7 @@ impl Config {
             self.layout.default_width_preset = 1;
         }
 
-        // A monitor rule's preset must be a valid index; a bad one is dropped
-        // (that display then uses default_width_preset).
-        for rule in &mut self.monitor_rules {
-            let Some(n) = rule.default_width_preset else {
-                continue;
-            };
-            if n == 0 || n > preset_count {
-                warnings.push(ConfigWarning {
-                    field: format!(
-                        "monitor_rules.display {}.default_width_preset",
-                        rule.display
-                    ),
-                    message: format!("preset ({}) out of range 1..={}; ignoring", n, preset_count),
-                });
-                rule.default_width_preset = None;
-            }
-        }
+        self.drop_invalid_monitor_rule_presets(preset_count, &mut warnings);
 
         if self.layout.height_presets.is_empty() {
             warnings.push(ConfigWarning {
@@ -1526,6 +2153,17 @@ impl Config {
             });
             self.layout.height_presets = default_height_presets();
         }
+
+        let modifier = self.behavior.focus_lock_modifier.trim();
+        let canonical = normalize_focus_lock_modifier(modifier);
+        self.behavior.focus_lock_modifier = canonical.unwrap_or_else(|| {
+            warnings.push(ConfigWarning {
+                field: "behavior.focus_lock_modifier".to_string(),
+                message: format!("Invalid focus_lock_modifier '{modifier}', reset to none"),
+            });
+            default_focus_lock_modifier()
+        });
+        warnings.extend(focus_lock_hotkey_warning(&self.behavior, &self.hotkeys));
 
         if self.behavior.focus_follows_mouse && self.behavior.focus_follows_mouse_delay_ms < 50 {
             warnings.push(ConfigWarning {
@@ -1561,6 +2199,21 @@ impl Config {
                     ),
                 });
                 self.appearance.active_border_color = default_active_border_color();
+            }
+        }
+
+        for (index, rule) in self.window_rules.iter_mut().enumerate() {
+            if let Some(color) = &rule.border_color {
+                if color.len() != 6 || !color.chars().all(|c| c.is_ascii_hexdigit()) {
+                    warnings.push(ConfigWarning {
+                        field: format!("window_rules[{index}].border_color"),
+                        message: format!(
+                            "Invalid hex color '{}' (must be 6 hex chars, e.g. \"4285F4\"), reset to default",
+                            color
+                        ),
+                    });
+                    rule.border_color = None;
+                }
             }
         }
 
@@ -1624,6 +2277,13 @@ impl Config {
             self.appearance.tab_strip_height = default_tab_strip_height();
         }
 
+        if let Some(value) = self.behavior.invalid_workspace_edge_wrap.take() {
+            warnings.push(ConfigWarning {
+                field: "behavior.workspace_edge_wrap".to_string(),
+                message: format!("Invalid workspace_edge_wrap {value} (must be off/wrap/clamp or true/false), falling back to off"),
+            });
+        }
+
         {
             let normalized = self.behavior.log_level.to_lowercase();
             let valid = matches!(
@@ -1659,24 +2319,47 @@ impl Config {
         warnings
     }
 
+    /// A monitor rule's preset must be a valid index; a bad one is dropped
+    /// (that display then uses default_width_preset).
+    fn drop_invalid_monitor_rule_presets(
+        &mut self,
+        preset_count: usize,
+        warnings: &mut Vec<ConfigWarning>,
+    ) {
+        for rule in &mut self.monitor_rules {
+            let Some(n) = rule.default_width_preset else {
+                continue;
+            };
+            if n == 0 || n > preset_count {
+                warnings.push(ConfigWarning {
+                    field: format!(
+                        "monitor_rules.display {}.default_width_preset",
+                        rule.display
+                    ),
+                    message: format!("preset ({}) out of range 1..={}; ignoring", n, preset_count),
+                });
+                rule.default_width_preset = None;
+            }
+        }
+    }
+
     /// Compile window rules into pre-compiled regex patterns for efficient matching.
     ///
     /// Invalid regex patterns are logged as warnings and their rules are skipped.
     pub fn compile_window_rules(&self) -> Vec<CompiledWindowRule> {
         let mut compiled = Vec::new();
 
-        for rule in &self.window_rules {
+        for (index, rule) in self.window_rules.iter().enumerate() {
             let class_regex = match &rule.match_class {
                 Some(pattern) => match regex::RegexBuilder::new(pattern)
                     .size_limit(1_000_000)
                     .build()
                 {
                     Ok(re) => Some(re),
-                    Err(e) => {
+                    Err(_) => {
                         tracing::warn!(
-                            "Invalid regex in window rule match_class '{}': {}. Skipping rule.",
-                            pattern,
-                            e
+                            "Window rule {}: invalid regex in match_class; skipping rule",
+                            index + 1
                         );
                         continue;
                     }
@@ -1690,11 +2373,10 @@ impl Config {
                     .build()
                 {
                     Ok(re) => Some(re),
-                    Err(e) => {
+                    Err(_) => {
                         tracing::warn!(
-                            "Invalid regex in window rule match_title '{}': {}. Skipping rule.",
-                            pattern,
-                            e
+                            "Window rule {}: invalid regex in match_title; skipping rule",
+                            index + 1
                         );
                         continue;
                     }
@@ -1757,6 +2439,24 @@ impl Config {
                 }
                 None => None,
             };
+            // 1-based row -> 0-based index. Clamped at insert time; 0 is invalid and dropped.
+            // Ignored with warning if action is float.
+            let row = match rule.row {
+                Some(_) if rule.action == WindowAction::Float => {
+                    tracing::warn!(
+                        "Window rule row is not applicable with action = \"float\"; ignoring"
+                    );
+                    None
+                }
+                Some(n) if n >= 1 => {
+                    Some(((n as usize) - 1).min(leopardwm_core_layout::MAX_ROWS - 1))
+                }
+                Some(_) => {
+                    tracing::warn!("Window rule row = 0 is invalid (1-based); ignoring");
+                    None
+                }
+                None => None,
+            };
 
             let positive_limit = |value: Option<i32>, field: &str| {
                 value.filter(|&n| {
@@ -1782,32 +2482,58 @@ impl Config {
                 action: rule.action,
                 width: rule.width,
                 height: rule.height,
+                x: rule.x,
+                y: rule.y,
                 corner_style: rule.corner_style,
+                border_hidden: rule.border == Some(false),
+                border_color_bgr: rule
+                    .border_color
+                    .as_deref()
+                    .and_then(crate::ui_sync::hex_rgb_to_bgr),
                 open_on_workspace,
                 open_maximized: rule.open_maximized,
                 column_width,
                 open_in_column,
+                row,
                 sticky: rule.sticky,
                 new_window_monitor: rule.new_window_monitor,
             });
         }
 
-        // Append built-in ignore rules (after user rules so user can override)
-        for exe in BUILTIN_IGNORE_EXECUTABLES {
+        // Append built-in rules after user rules so users can override them.
+        let builtin_rules = BUILTIN_IGNORE_EXECUTABLES
+            .iter()
+            .map(|&exe| (exe, None, WindowAction::Ignore))
+            .chain(
+                BUILTIN_FLOAT_RULES
+                    .iter()
+                    .map(|&(exe, title)| (exe, Some(title), WindowAction::Float)),
+            );
+        for (exe, title, action) in builtin_rules {
             compiled.push(CompiledWindowRule {
                 class_regex: None,
-                title_regex: None,
+                title_regex: title.map(|pattern| {
+                    regex::RegexBuilder::new(pattern)
+                        .size_limit(1_000_000)
+                        .build()
+                        .expect("invalid built-in window rule title regex")
+                }),
                 match_executable: Some(exe.to_string()),
                 match_max_width: None,
                 match_max_height: None,
-                action: WindowAction::Ignore,
+                action,
                 width: None,
                 height: None,
+                x: None,
+                y: None,
                 corner_style: None,
+                border_hidden: false,
+                border_color_bgr: None,
                 open_on_workspace: None,
                 open_maximized: false,
                 column_width: None,
                 open_in_column: None,
+                row: None,
                 sticky: false,
                 new_window_monitor: None,
             });
@@ -1816,12 +2542,17 @@ impl Config {
         compiled
     }
 
+    #[cfg(test)]
     pub fn load_from_path(path: &PathBuf) -> Result<Self> {
         let content = fs::read_to_string(path)
             .with_context(|| format!("Failed to read config file: {}", path.display()))?;
 
-        let mut config: Config = toml::from_str(&content)
-            .with_context(|| format!("Failed to parse config file: {}", path.display()))?;
+        Self::parse(&content)
+            .with_context(|| format!("Failed to parse config file: {}", path.display()))
+    }
+
+    fn parse(content: &str) -> std::result::Result<Self, toml::de::Error> {
+        let mut config: Config = toml::from_str(content)?;
 
         config.layout.migrate_outer_gap();
 
@@ -1852,52 +2583,520 @@ impl Config {
         }
     }
 
-    /// Save configuration to the primary config path.
+    /// Save configuration to the loaded path, or the primary path if none was loaded.
     ///
-    /// Serializes the config to TOML and writes to `config_paths()[0]`.
-    /// Creates parent directories if they don't exist. Only the settings
-    /// GUI configurator calls this — runtime toggles (tray menu, hotkeys,
-    /// IPC commands) mutate `Config` in memory only, so config.toml never
-    /// changes underneath the user outside of an explicit configurator save.
-    /// If a config file already exists at that path, it's copied to
-    /// `config.toml.bak` (single rotating backup) before being overwritten.
-    /// If that backup fails, the save is aborted and the existing config.toml
-    /// is left untouched.
+    /// Only the Settings window calls this. Runtime toggles (tray menu,
+    /// hotkeys, IPC commands) change `Config` in memory only, so config.toml
+    /// never changes outside an explicit save from the Settings window.
     pub fn save(&self) -> Result<()> {
         // Unit tests exercise command handlers that persist config; never
         // let them overwrite the developer's real config file.
         if cfg!(test) {
             return Ok(());
         }
-        let paths = config_paths();
-        let path = paths
-            .first()
-            .ok_or_else(|| anyhow::anyhow!("No config path available"))?;
+        let result = CONFIG_FILE.lock().unwrap().save(self, &config_paths());
+        if let Err(error) = &result {
+            tracing::warn!(
+                "Failed to save config: {}",
+                log_text::text(format_args!("{error:#}"))
+            );
+            let message = if let Some(recovery) = error.downcast_ref::<HardLinkWriteError>() {
+                format!(
+                    "The settings were not saved. The original config is backed up at {}.",
+                    recovery.backup.display()
+                )
+            } else {
+                "The settings were not saved. config.toml may have changed outside LeopardWM, or no backup slot is free. Reload the config or move the .corrupt files, then try again.".to_string()
+            };
+            crate::notify::show_toast("Settings not saved", &message);
+        }
+        result
+    }
+}
 
-        if let Some(parent) = path.parent() {
+#[derive(Clone, Debug)]
+pub(crate) struct ConfigRejection {
+    pub path: PathBuf,
+    pub reason: String,
+    pub location: Option<(usize, usize)>,
+    pub preserved_at: Option<PathBuf>,
+    pub recovered_fields: Vec<recovery::DroppedField>,
+    bytes: Option<Vec<u8>>,
+    pending: bool,
+}
+
+fn serialize_config_file(config: &Config) -> Result<String> {
+    let mut content =
+        toml::to_string_pretty(config).context("Failed to serialize config to TOML")?;
+    let legacy = match config.behavior.workspace_edge_wrap {
+        WorkspaceEdgeWrap::Off => "false",
+        WorkspaceEdgeWrap::Wrap => "true",
+        WorkspaceEdgeWrap::Clamp => return Ok(content),
+    };
+    #[derive(Deserialize)]
+    struct FileBehavior {
+        workspace_edge_wrap: toml::Spanned<String>,
+    }
+    #[derive(Deserialize)]
+    struct FileConfig {
+        behavior: FileBehavior,
+    }
+    let parsed: FileConfig =
+        toml::from_str(&content).context("Failed to inspect serialized config")?;
+    content.replace_range(parsed.behavior.workspace_edge_wrap.span(), legacy);
+    Ok(content)
+}
+
+#[derive(Default)]
+struct ConfigFile {
+    path: Option<PathBuf>,
+    last_seen: Option<Vec<u8>>,
+    rejections: Vec<ConfigRejection>,
+    rejected_paths: Vec<PathBuf>,
+    unknown_keys: Vec<String>,
+}
+
+static CONFIG_FILE: Mutex<ConfigFile> = Mutex::new(ConfigFile {
+    path: None,
+    last_seen: None,
+    rejections: Vec::new(),
+    rejected_paths: Vec::new(),
+    unknown_keys: Vec::new(),
+});
+
+pub(crate) fn unknown_config_keys() -> Vec<String> {
+    CONFIG_FILE.lock().unwrap().unknown_keys.clone()
+}
+
+pub(crate) fn config_rejection() -> Option<ConfigRejection> {
+    CONFIG_FILE.lock().unwrap().rejections.last().cloned()
+}
+
+fn corrupt_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("Failed to write hard-linked config; original copy kept at {}", backup.display())]
+struct HardLinkWriteError {
+    backup: PathBuf,
+    #[source]
+    source: std::io::Error,
+}
+
+fn replace_config_file(target: &Path, temp: &Path, content: &[u8]) -> Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+
+    let source = match fs::File::open(target) {
+        Ok(source) => source,
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            return fs::rename(temp, target).map_err(Into::into)
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    unsafe {
+        GetFileInformationByHandle(HANDLE(source.as_raw_handle()), &mut info)?;
+    }
+    if info.nNumberOfLinks > 1 {
+        let mut destination = fs::OpenOptions::new().write(true).open(target)?;
+        let backup = corrupt_path(target, &format!(".{}.backup", uuid::Uuid::new_v4()));
+        let mut copy = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&backup)?;
+        let mut source = source;
+        if let Err(error) = std::io::copy(&mut source, &mut copy).and_then(|_| copy.sync_all()) {
+            drop(copy);
+            let _ = fs::remove_file(&backup);
+            return Err(error).with_context(|| {
+                format!("Failed to back up hard-linked config: {}", backup.display())
+            });
+        }
+        drop(copy);
+        drop(source);
+        if let Err(error) = destination.set_len(0) {
+            let _ = fs::remove_file(&backup);
+            return Err(error.into());
+        }
+        destination
+            .write_all(content)
+            .and_then(|()| destination.sync_all())
+            .map_err(|source| HardLinkWriteError {
+                backup: backup.clone(),
+                source,
+            })?;
+        if let Err(error) = fs::remove_file(&backup) {
+            tracing::warn!(
+                "Could not remove config backup {}: {}",
+                log_text::path(backup.display()),
+                log_text::text(&error)
+            );
+        }
+        if let Err(error) = fs::remove_file(temp) {
+            tracing::warn!(
+                "Could not remove temporary config {}: {}",
+                log_text::path(temp.display()),
+                log_text::text(&error)
+            );
+        }
+        Ok(())
+    } else {
+        drop(source);
+        fs::rename(temp, target).map_err(Into::into)
+    }
+}
+
+fn preserve_config_bytes(path: &Path, bytes: &[u8]) -> Result<PathBuf> {
+    let mut free = None;
+    for suffix in [".corrupt", ".corrupt.1"] {
+        let copy = corrupt_path(path, suffix);
+        match fs::read(&copy) {
+            Ok(existing) if existing == bytes => return Ok(copy),
+            Ok(_) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                if free.is_none() {
+                    free = Some(copy);
+                }
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("Failed to read config backup {}", copy.display()))
+            }
+        }
+    }
+    let copy = free.ok_or_else(|| {
+        anyhow::anyhow!("No free backup slot for rejected config {}", path.display())
+    })?;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&copy)
+        .with_context(|| format!("Failed to preserve config at {}", copy.display()))?;
+    if let Err(error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+        drop(file);
+        let _ = fs::remove_file(&copy);
+        return Err(error)
+            .with_context(|| format!("Failed to preserve config at {}", copy.display()));
+    }
+    Ok(copy)
+}
+
+fn find_unknown_config_keys(
+    content: &str,
+    config: &Config,
+    dropped: &[recovery::DroppedField],
+) -> Vec<String> {
+    fn walk(
+        input: &toml::Value,
+        output: &toml::Value,
+        path: &str,
+        pattern: &str,
+        dropped: &[recovery::DroppedField],
+        keys: &mut Vec<String>,
+    ) {
+        match (input, output) {
+            (toml::Value::Table(input), toml::Value::Table(output)) => {
+                for (key, value) in input {
+                    let name = if path.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{path}.{key}")
+                    };
+                    let canonical = if pattern.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{pattern}.{key}")
+                    };
+                    if matches!(
+                        canonical.as_str(),
+                        "hotkeys"
+                            | "layout.center_single_column"
+                            | "monitor_rules[].center_single_column"
+                            | "layout.outer_gap"
+                            | "layout.default_column_width"
+                            | "layout.min_column_width"
+                            | "layout.max_column_width"
+                            | "behavior.hide_offscreen_taskbar_buttons"
+                            | "layout.rows.workspaces[].workspace"
+                            | "gestures.raw_input"
+                            | "gestures.diagnostic_capture_secs"
+                    ) {
+                        continue;
+                    }
+                    if dropped.iter().any(|field| field.path == name) {
+                        continue;
+                    }
+                    if let Some(other) = output.get(key) {
+                        walk(value, other, &name, &canonical, dropped, keys);
+                    } else {
+                        keys.push(name);
+                    }
+                }
+            }
+            (toml::Value::Array(input), toml::Value::Array(output)) => {
+                let mut retained = output.iter();
+                for (index, value) in input.iter().enumerate() {
+                    let name = format!("{path}[{index}]");
+                    // Recovery already reports the whole dropped element.
+                    if dropped.iter().any(|field| field.path == name) {
+                        continue;
+                    }
+                    if let Some(other) = retained.next() {
+                        walk(value, other, &name, &format!("{pattern}[]"), dropped, keys);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let Ok(input) = toml::from_str::<toml::Table>(content) else {
+        return Vec::new();
+    };
+    let Ok(output) = toml::Value::try_from(config) else {
+        return Vec::new();
+    };
+    let mut keys = Vec::new();
+    walk(
+        &toml::Value::Table(input),
+        &output,
+        "",
+        "",
+        dropped,
+        &mut keys,
+    );
+    keys
+}
+
+impl ConfigFile {
+    fn record_unknown_keys(
+        &mut self,
+        content: &str,
+        config: &Config,
+        dropped: &[recovery::DroppedField],
+    ) {
+        self.unknown_keys = find_unknown_config_keys(content, config, dropped);
+        for key in &self.unknown_keys {
+            tracing::warn!("Unknown config key: {}", log_text::text(key));
+        }
+    }
+
+    fn load(&mut self, paths: &[PathBuf]) -> Result<Config> {
+        for path in paths {
+            let bytes = match fs::read(path) {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == ErrorKind::NotFound => {
+                    self.rejections
+                        .retain(|rejection| rejection.path != *path || rejection.bytes.is_some());
+                    continue;
+                }
+                Err(error) => {
+                    let reason = format!("Failed to read config file {}: {error}", path.display());
+                    self.last_seen = None;
+                    self.reject(path, reason.clone(), None, None);
+                    return Err(anyhow::anyhow!(reason));
+                }
+            };
+            self.rejections
+                .retain(|rejection| rejection.path != *path || rejection.bytes.is_some());
+            self.path = Some(path.clone());
+            self.last_seen = Some(bytes.clone());
+            let content = match std::str::from_utf8(&bytes) {
+                Ok(content) => content,
+                Err(error) => {
+                    let reason = format!(
+                        "Failed to read config file {} as UTF-8: {error}",
+                        path.display()
+                    );
+                    self.reject(path, reason.clone(), None, Some(bytes));
+                    return Err(anyhow::anyhow!(reason));
+                }
+            };
+            match Config::parse(content) {
+                Ok(config) => {
+                    self.record_unknown_keys(content, &config, &[]);
+                    self.rejections.clear();
+                    tracing::info!("Loading config from: {}", log_text::path(path.display()));
+                    return Ok(config);
+                }
+                Err(error) => {
+                    if let Some((config, fields)) = recovery::recover(content) {
+                        self.record_unknown_keys(content, &config, &fields);
+                        for field in &fields {
+                            tracing::warn!(
+                                "Config: {} reset to default: {}",
+                                log_text::path(&field.path),
+                                log_text::text(&field.reason)
+                            );
+                        }
+                        let reason = format!("Recovered config file {}: {error}", path.display());
+                        let location = fields.first().and_then(|field| field.location);
+                        self.reject(path, reason, location, Some(bytes));
+                        self.rejections.last_mut().unwrap().recovered_fields = fields;
+                        return Ok(config);
+                    }
+                    let location = error.span().and_then(|span| {
+                        content.get(..span.start).map(|prefix| {
+                            (
+                                prefix.bytes().filter(|&byte| byte == b'\n').count() + 1,
+                                prefix.rsplit('\n').next().unwrap_or("").chars().count() + 1,
+                            )
+                        })
+                    });
+                    let reason = format!("Failed to parse config file {}: {error}", path.display());
+                    self.reject(path, reason.clone(), location, Some(bytes));
+                    return Err(anyhow::anyhow!(reason));
+                }
+            }
+        }
+        self.path = None;
+        self.last_seen = None;
+        self.rejections.clear();
+        self.unknown_keys.clear();
+        tracing::info!("No config file found, using defaults");
+        Ok(Config::default())
+    }
+
+    fn reject(
+        &mut self,
+        path: &Path,
+        reason: String,
+        location: Option<(usize, usize)>,
+        bytes: Option<Vec<u8>>,
+    ) {
+        self.path = Some(path.to_path_buf());
+        if !self.rejected_paths.iter().any(|rejected| rejected == path) {
+            self.rejected_paths.push(path.to_path_buf());
+        }
+        if let Some(index) = self
+            .rejections
+            .iter()
+            .position(|r| r.path == path && r.bytes == bytes)
+        {
+            let mut rejection = self.rejections.remove(index);
+            rejection.reason = reason;
+            rejection.location = location;
+            rejection.pending = true;
+            rejection.recovered_fields.clear();
+            self.rejections.push(rejection);
+        } else {
+            self.rejections.push(ConfigRejection {
+                path: path.to_path_buf(),
+                reason,
+                location,
+                preserved_at: None,
+                recovered_fields: Vec::new(),
+                bytes,
+                pending: true,
+            });
+        }
+    }
+
+    fn save(&mut self, config: &Config, paths: &[PathBuf]) -> Result<()> {
+        let path = self
+            .path
+            .as_ref()
+            .or_else(|| paths.first())
+            .ok_or_else(|| anyhow::anyhow!("No config path available"))?
+            .clone();
+        let content = serialize_config_file(config)?;
+        for rejection in self
+            .rejections
+            .iter_mut()
+            .filter(|rejection| rejection.pending)
+        {
+            let bytes = rejection.bytes.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Cannot preserve unreadable config file: {}",
+                    rejection.path.display()
+                )
+            })?;
+            rejection.preserved_at = Some(preserve_config_bytes(&rejection.path, bytes)?);
+        }
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             fs::create_dir_all(parent).with_context(|| {
                 format!("Failed to create config directory: {}", parent.display())
             })?;
         }
-
-        if path.exists() {
-            let backup_path = path.with_extension("toml.bak");
-            fs::copy(path, &backup_path).with_context(|| {
-                format!(
-                    "Failed to back up existing config to {}; aborting save",
-                    backup_path.display()
-                )
+        let target = match fs::canonicalize(&path) {
+            Ok(target) => target,
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                match fs::symlink_metadata(&path) {
+                    Err(missing) if missing.kind() == ErrorKind::NotFound => path.clone(),
+                    Ok(metadata) if metadata.file_type().is_symlink() => {
+                        fs::write(&path, &content).with_context(|| {
+                            format!("Failed to write config file: {}", path.display())
+                        })?;
+                        self.finish_save(path, content);
+                        return Ok(());
+                    }
+                    _ => {
+                        return Err(error).with_context(|| {
+                            format!("Failed to resolve config file: {}", path.display())
+                        })
+                    }
+                }
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("Failed to resolve config file: {}", path.display()))
+            }
+        };
+        let temp = corrupt_path(&target, &format!(".{}.tmp", uuid::Uuid::new_v4()));
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)
+            .with_context(|| {
+                format!("Failed to create temporary config file: {}", temp.display())
             })?;
-            tracing::info!("Backed up previous config to: {}", backup_path.display());
+        let result = (|| -> Result<()> {
+            file.write_all(content.as_bytes())?;
+            file.sync_all()?;
+            drop(file);
+            if self.rejected_paths.contains(&path) {
+                match fs::read(&target) {
+                    Ok(current) => {
+                        if self.last_seen.as_deref() != Some(current.as_slice()) {
+                            preserve_config_bytes(&path, &current)?;
+                        }
+                    }
+                    Err(error) if error.kind() == ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(error).with_context(|| {
+                            format!(
+                                "Failed to read config file before saving: {}",
+                                path.display()
+                            )
+                        })
+                    }
+                }
+            }
+            replace_config_file(&target, &temp, content.as_bytes())?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temp);
         }
-
-        let content = toml::to_string_pretty(self).context("Failed to serialize config to TOML")?;
-
-        fs::write(path, &content)
-            .with_context(|| format!("Failed to write config file: {}", path.display()))?;
-
-        tracing::info!("Config saved to: {}", path.display());
+        result.with_context(|| format!("Failed to write config file {}", path.display()))?;
+        self.finish_save(path, content);
         Ok(())
+    }
+
+    fn finish_save(&mut self, path: PathBuf, content: String) {
+        self.unknown_keys.clear();
+        for rejection in &mut self.rejections {
+            rejection.pending = false;
+        }
+        tracing::info!("Config saved to: {}", log_text::path(path.display()));
+        self.path = Some(path);
+        self.last_seen = Some(content.into_bytes());
     }
 }
 
@@ -1906,8 +3105,13 @@ impl Config {
 pub fn ensure_config_on_disk() -> Result<Option<PathBuf>> {
     let paths = config_paths();
     for path in &paths {
-        if path.exists() {
-            return Ok(None);
+        match fs::metadata(path) {
+            Ok(_) => return Ok(None),
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("Failed to inspect config file: {}", path.display()))
+            }
         }
     }
     let path = paths
@@ -1958,6 +3162,124 @@ fn dirs_home() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plain_drag_action_defaults_and_round_trips() {
+        let omitted: Config = toml::from_str("[behavior]").unwrap();
+        assert_eq!(omitted.behavior.plain_drag_action, DragAction::Merge);
+        for (name, action) in [
+            ("merge", DragAction::Merge),
+            ("reorder", DragAction::Reorder),
+        ] {
+            let config: Config =
+                toml::from_str(&format!("[behavior]\nplain_drag_action = \"{name}\"")).unwrap();
+            assert_eq!(config.behavior.plain_drag_action, action);
+            let serialized = toml::to_string(&config).unwrap();
+            let reloaded: Config = toml::from_str(&serialized).unwrap();
+            assert_eq!(reloaded.behavior.plain_drag_action, action);
+        }
+    }
+
+    #[test]
+    fn glazewm_compat_defaults_and_explicit_config_round_trip() {
+        let omitted: Config = toml::from_str("").unwrap();
+        assert_eq!(
+            omitted.glazewm_compat,
+            GlazewmCompatConfig {
+                enabled: false,
+                port: 6123
+            }
+        );
+        let partial: Config = toml::from_str("[glazewm_compat]\nenabled = true").unwrap();
+        assert_eq!(
+            partial.glazewm_compat,
+            GlazewmCompatConfig {
+                enabled: true,
+                port: 6123
+            }
+        );
+        let configured: Config =
+            toml::from_str("[glazewm_compat]\nenabled = true\nport = 17000").unwrap();
+        let restored: Config = toml::from_str(&toml::to_string(&configured).unwrap()).unwrap();
+        assert_eq!(restored.glazewm_compat, configured.glazewm_compat);
+    }
+
+    #[test]
+    fn workspace_edge_wrap_config_compatibility_and_validation() {
+        for (input, expected, saved) in [
+            ("true", WorkspaceEdgeWrap::Wrap, toml::Value::Boolean(true)),
+            ("false", WorkspaceEdgeWrap::Off, toml::Value::Boolean(false)),
+            (
+                "\"wrap\"",
+                WorkspaceEdgeWrap::Wrap,
+                toml::Value::Boolean(true),
+            ),
+            (
+                "\"clamp\"",
+                WorkspaceEdgeWrap::Clamp,
+                toml::Value::String("clamp".into()),
+            ),
+            (
+                "\"off\"",
+                WorkspaceEdgeWrap::Off,
+                toml::Value::Boolean(false),
+            ),
+        ] {
+            let mut config: Config =
+                toml::from_str(&format!("[behavior]\nworkspace_edge_wrap = {input}")).unwrap();
+            config.appearance.language =
+                "test\n[behavior]\nworkspace_edge_wrap = \"wrap\"\nend".into();
+            assert_eq!(config.behavior.workspace_edge_wrap, expected);
+            let settings = serde_json::to_value(&config).unwrap();
+            let expected_setting = match expected {
+                WorkspaceEdgeWrap::Off => "off",
+                WorkspaceEdgeWrap::Wrap => "wrap",
+                WorkspaceEdgeWrap::Clamp => "clamp",
+            };
+            assert_eq!(
+                settings["behavior"]["workspace_edge_wrap"],
+                expected_setting
+            );
+            let settings_config: Config = serde_json::from_value(settings).unwrap();
+            assert_eq!(settings_config.behavior.workspace_edge_wrap, expected);
+            let fixture = ConfigFileFixture::new();
+            let path = fixture.0.join("config.toml");
+            ConfigFile::default()
+                .save(&config, std::slice::from_ref(&path))
+                .unwrap();
+            let serialized = fs::read_to_string(&path).unwrap();
+            let value: toml::Value = toml::from_str(&serialized).unwrap();
+            assert_eq!(value["behavior"]["workspace_edge_wrap"], saved);
+            let reloaded: Config = toml::from_str(&serialized).unwrap();
+            assert_eq!(reloaded.behavior.workspace_edge_wrap, expected);
+            assert_eq!(reloaded.appearance.language, config.appearance.language);
+        }
+        let omitted: Config = toml::from_str("[behavior]").unwrap();
+        assert_eq!(omitted.behavior.workspace_edge_wrap, WorkspaceEdgeWrap::Off);
+        assert!(!omitted.behavior.focus_crosses_monitors);
+        assert!(!omitted.behavior.move_crosses_monitors);
+        let enabled: Config = toml::from_str(
+            "[behavior]\nfocus_crosses_monitors = true\nmove_crosses_monitors = true",
+        )
+        .unwrap();
+        assert!(enabled.behavior.focus_crosses_monitors);
+        assert!(enabled.behavior.move_crosses_monitors);
+        for bad in ["\"sideways\"", "42"] {
+            let mut config: Config =
+                toml::from_str(&format!("[behavior]\nworkspace_edge_wrap = {bad}")).unwrap();
+            assert_eq!(config.behavior.workspace_edge_wrap, WorkspaceEdgeWrap::Off);
+            let warnings = config.validate();
+            assert_eq!(warnings.len(), 1);
+            assert_eq!(warnings[0].field, "behavior.workspace_edge_wrap");
+            assert!(warnings[0].message.contains(bad));
+            assert!(warnings[0].message.contains("off/wrap/clamp"));
+            assert!(warnings[0].message.contains("true/false"));
+            assert!(warnings[0].message.contains("falling back to off"));
+            assert!(config.validate().is_empty());
+        }
+        let _: Config =
+            toml::from_str(&leopardwm_ipc::config_template::render_default_config()).unwrap();
+    }
 
     #[test]
     fn language_default_round_trip_and_validation() {
@@ -2044,6 +3366,45 @@ mod tests {
     }
 
     #[test]
+    fn fixed_size_windows_config_defaults_and_rejects_invalid_values() {
+        assert_eq!(
+            Config::default().behavior.fixed_size_windows,
+            FixedSizeWindows::Float
+        );
+        for (value, expected) in [
+            ("float", FixedSizeWindows::Float),
+            ("tile", FixedSizeWindows::Tile),
+        ] {
+            let config: Config =
+                toml::from_str(&format!("[behavior]\nfixed_size_windows = '{value}'")).unwrap();
+            assert_eq!(config.behavior.fixed_size_windows, expected);
+            let json = serde_json::to_string(&config).unwrap();
+            let roundtrip: Config = serde_json::from_str(&json).unwrap();
+            assert_eq!(roundtrip.behavior.fixed_size_windows, expected);
+        }
+        assert!(toml::from_str::<Config>("[behavior]\nfixed_size_windows = 'invalid'").is_err());
+    }
+
+    #[test]
+    fn mouse_resize_config_defaults_and_rejects_invalid_values() {
+        let default: Config = toml::from_str("[layout]").unwrap();
+        assert_eq!(default.layout.mouse_resize, MouseResize::Presets);
+        let free: Config = toml::from_str("[layout]\nmouse_resize = 'free'").unwrap();
+        assert_eq!(free.layout.mouse_resize, MouseResize::Free);
+        assert!(toml::from_str::<Config>("[layout]\nmouse_resize = 'invalid'").is_err());
+        assert!(toml::from_str::<Config>("[layout]\ncentering_mode = 'invalid'").is_err());
+    }
+
+    #[test]
+    fn offscreen_mode_config_defaults_and_rejects_invalid_values() {
+        let default: Config = toml::from_str("[layout]").unwrap();
+        assert_eq!(default.layout.offscreen_mode, OffscreenMode::Bleed);
+        let park: Config = toml::from_str("[layout]\noffscreen_mode = 'park'").unwrap();
+        assert_eq!(park.layout.offscreen_mode, OffscreenMode::Park);
+        assert!(toml::from_str::<Config>("[layout]\noffscreen_mode = 'invalid'").is_err());
+    }
+
+    #[test]
     fn test_centering_mode_conversion() {
         let config_center = CenteringModeConfig::Center;
         let config_just_in_view = CenteringModeConfig::JustInView;
@@ -2112,34 +3473,41 @@ mod tests {
 
             [[monitor_rules]]
             display = 2
-            centering_mode = "center_columns_when_narrower"
+            centering_mode = "center"
+            center_columns = "fit"
             center_past_edges = true
             full_screen_tolerance_px = 8
 
             [[monitor_rules]]
             display = 2
-            centering_mode = "center"
-            center_single_column = false
+            centering_mode = "on_overflow"
+            center_columns = "off"
             "#,
         )
         .unwrap();
         let layout = MonitorCentering {
             centering_mode: CenteringModeConfig::JustInView,
             center_past_edges: false,
-            center_single_column: true,
             full_screen_tolerance_px: 2,
         };
         assert_eq!(config.centering_for(r"\\.\DISPLAY1"), layout);
         assert_eq!(config.centering_for(""), layout);
+        assert_eq!(
+            config.center_columns_for(r"\\.\DISPLAY1"),
+            CenterColumnsConfig::Single
+        );
         // The first rule for display 2 wins; what it leaves out comes from [layout].
         assert_eq!(
             config.centering_for(r"\\.\DISPLAY2"),
             MonitorCentering {
-                centering_mode: CenteringModeConfig::CenterColumnsWhenNarrower,
+                centering_mode: CenteringModeConfig::Center,
                 center_past_edges: true,
-                center_single_column: true,
                 full_screen_tolerance_px: 8,
             }
+        );
+        assert_eq!(
+            config.center_columns_for(r"\\.\DISPLAY2"),
+            CenterColumnsConfig::Fit
         );
 
         let saved = toml::to_string_pretty(&config).unwrap();
@@ -2153,19 +3521,97 @@ mod tests {
     }
 
     #[test]
-    fn test_center_columns_when_narrower_parses_and_roundtrips() {
-        let config: Config =
-            toml::from_str("[layout]\ncentering_mode = \"center_columns_when_narrower\"\n").unwrap();
+    fn legacy_centering_keys_load_as_center_columns() {
+        let config: Config = toml::from_str(
+            r#"
+            [layout]
+            center_single_column = true
+            centering_mode = "center_columns_when_narrower"
+
+            [[monitor_rules]]
+            display = 2
+            center_single_column = false
+            centering_mode = "just_in_view"
+
+            [[monitor_rules]]
+            display = 3
+            full_screen_tolerance_px = 6
+            "#,
+        )
+        .unwrap();
+        // center_columns_when_narrower wins over center_single_column.
+        assert_eq!(
+            config.layout.center_columns.center_columns,
+            CenterColumnsConfig::Fit
+        );
         assert_eq!(
             config.layout.centering_mode,
-            CenteringModeConfig::CenterColumnsWhenNarrower
+            CenteringModeConfig::JustInView
+        );
+        let monitor = |n: u32| {
+            let name = format!(r"\\.\DISPLAY{n}");
+            (
+                config.center_columns_for(&name),
+                config.centering_for(&name),
+            )
+        };
+        let fit_just_in_view = |tolerance| MonitorCentering {
+            centering_mode: CenteringModeConfig::JustInView,
+            center_past_edges: false,
+            full_screen_tolerance_px: tolerance,
+        };
+        assert_eq!(monitor(1), (CenterColumnsConfig::Fit, fit_just_in_view(2)));
+        assert_eq!(monitor(2), (CenterColumnsConfig::Off, fit_just_in_view(2)));
+        assert_eq!(monitor(3), (CenterColumnsConfig::Fit, fit_just_in_view(6)));
+
+        // Saving writes only the new keys, and they load back the same.
+        let saved = toml::to_string_pretty(&config).unwrap();
+        assert!(!saved.contains("center_single_column"), "{saved}");
+        assert!(!saved.contains("center_columns_when_narrower"), "{saved}");
+        let parsed: Config = toml::from_str(&saved).unwrap();
+        assert_eq!(parsed.monitor_rules, config.monitor_rules, "{saved}");
+        assert_eq!(
+            parsed.layout.center_columns.center_columns,
+            CenterColumnsConfig::Fit
         );
         assert_eq!(
-            CenteringMode::from(config.layout.centering_mode),
-            CenteringMode::CenterColumnsWhenNarrower
+            parsed.layout.centering_mode,
+            CenteringModeConfig::JustInView
         );
-        let parsed: Config = toml::from_str(&toml::to_string_pretty(&config).unwrap()).unwrap();
-        assert_eq!(parsed.layout.centering_mode, config.layout.centering_mode);
+    }
+
+    #[test]
+    fn explicit_center_columns_wins_over_legacy_centering_keys() {
+        let config: Config = toml::from_str(
+            r#"
+            [layout]
+            center_columns = "single"
+            centering_mode = "center_columns_when_narrower"
+
+            [[monitor_rules]]
+            display = 2
+            center_columns = "off"
+            center_single_column = true
+            centering_mode = "center_columns_when_narrower"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.layout.center_columns.center_columns,
+            CenterColumnsConfig::Single
+        );
+        assert_eq!(
+            config.layout.centering_mode,
+            CenteringModeConfig::JustInView
+        );
+        assert_eq!(
+            config.center_columns_for(r"\\.\DISPLAY2"),
+            CenterColumnsConfig::Off
+        );
+        assert_eq!(
+            config.centering_for(r"\\.\DISPLAY2").centering_mode,
+            CenteringModeConfig::JustInView
+        );
     }
 
     #[test]
@@ -2178,9 +3624,47 @@ mod tests {
     }
 
     #[test]
+    fn test_default_and_merged_hotkeys_leave_rows_unbound() {
+        let defaults = HotkeyConfig::default();
+        let mut saved = HotkeyConfig {
+            scroll_modifier: default_scroll_modifier(),
+            disabled: Vec::new(),
+            bindings: HashMap::from([("Ctrl+Alt+X".to_string(), "focus_left".to_string())]),
+        };
+        Config::merge_default_hotkeys(&mut saved);
+        let row_actions = [
+            "focus_row_up",
+            "focus_row_down",
+            "focus_row",
+            "move_window_to_row_up",
+            "move_window_to_row_down",
+        ];
+        let mut violations = Vec::new();
+        for (label, config) in [("defaults", &defaults), ("merged", &saved)] {
+            for (key, action) in &config.bindings {
+                if row_actions.contains(&action.as_str())
+                    || ["Ctrl+Alt+PageUp", "Ctrl+Alt+PageDown"].contains(&key.as_str())
+                {
+                    violations.push(format!("{label}: {key} = {action}"));
+                }
+            }
+        }
+        violations.sort();
+        assert!(violations.is_empty(), "{}", violations.join("; "));
+    }
+
+    #[test]
     fn test_hotkey_config_default() {
         let config = HotkeyConfig::default();
         assert_eq!(config.bindings.len(), 72);
+        assert_eq!(
+            config.bindings.get("Ctrl+Alt+Shift+PageUp"),
+            Some(&"move_to_workspace_prev".to_string())
+        );
+        assert_eq!(
+            config.bindings.get("Ctrl+Alt+Shift+PageDown"),
+            Some(&"move_to_workspace_next".to_string())
+        );
         assert_eq!(
             config.bindings.get("Ctrl+Alt+Space"),
             Some(&"toggle_overview".to_string())
@@ -2407,6 +3891,27 @@ mod tests {
     }
 
     #[test]
+    fn test_merge_does_not_overwrite_user_bound_default_key() {
+        let mut hk = HotkeyConfig {
+            scroll_modifier: default_scroll_modifier(),
+            disabled: Vec::new(),
+            bindings: HashMap::new(),
+        };
+        // User bound Ctrl+Alt+Shift+PageUp (the default for move_to_workspace_prev) to move_window_to_row_up.
+        hk.bindings.insert(
+            "Ctrl+Alt+Shift+PageUp".to_string(),
+            "move_window_to_row_up".to_string(),
+        );
+        Config::merge_default_hotkeys(&mut hk);
+
+        assert_eq!(
+            hk.bindings.get("Ctrl+Alt+Shift+PageUp").map(String::as_str),
+            Some("move_window_to_row_up"),
+            "merge_default_hotkeys must not overwrite a key the user already bound"
+        );
+    }
+
+    #[test]
     fn test_disabled_deserializes_from_json_save_payload() {
         // Mirrors the settings-save path (JS object -> serde_json -> Config).
         let json = serde_json::json!({
@@ -2516,6 +4021,46 @@ centering_mode = "center"
     }
 
     #[test]
+    fn border_rule_config_round_trip_and_validation() {
+        let source = r##"
+            [[window_rules]]
+            match_class = "One"
+            border = false
+            border_color = "a1B2c3"
+            [[window_rules]]
+            match_class = "Two"
+            [[window_rules]]
+            match_class = "Three"
+            border_color = "#12345"
+        "##;
+        let mut config: Config = toml::from_str(source).unwrap();
+        assert_eq!(config.window_rules[0].border, Some(false));
+        assert_eq!(
+            config.window_rules[0].border_color.as_deref(),
+            Some("a1B2c3")
+        );
+        assert_eq!(config.window_rules[1].border, None);
+        assert_eq!(config.window_rules[1].border_color, None);
+        let round_trip: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        assert_eq!(round_trip.window_rules[0].border, Some(false));
+        assert_eq!(
+            round_trip.window_rules[0].border_color.as_deref(),
+            Some("a1B2c3")
+        );
+        assert_eq!(round_trip.window_rules[1].border, None);
+        assert_eq!(round_trip.window_rules[1].border_color, None);
+        let warnings = config.validate();
+        assert!(warnings
+            .iter()
+            .any(|w| w.field == "window_rules[2].border_color"));
+        assert_eq!(config.window_rules[2].border_color, None);
+        assert_eq!(
+            config.window_rules[0].border_color.as_deref(),
+            Some("a1B2c3")
+        );
+    }
+
+    #[test]
     fn test_window_rule_matches_class() {
         let rule = WindowRule {
             match_class: Some("Notepad".to_string()),
@@ -2525,14 +4070,18 @@ centering_mode = "center"
             width: None,
             height: None,
             corner_style: None,
+            border: None,
+            border_color: None,
             open_on_workspace: None,
             open_maximized: false,
             column_width: None,
             open_in_column: None,
+            row: None,
             sticky: false,
             new_window_monitor: None,
             match_max_width: None,
             match_max_height: None,
+            ..Default::default()
         };
 
         let rule = compile_rule(rule);
@@ -2552,14 +4101,18 @@ centering_mode = "center"
             width: Some(800),
             height: Some(600),
             corner_style: None,
+            border: None,
+            border_color: None,
             open_on_workspace: None,
             open_maximized: false,
             column_width: None,
             open_in_column: None,
+            row: None,
             sticky: false,
             new_window_monitor: None,
             match_max_width: None,
             match_max_height: None,
+            ..Default::default()
         };
 
         let rule = compile_rule(rule);
@@ -2616,6 +4169,21 @@ centering_mode = "center"
     }
 
     #[test]
+    fn floating_rule_position_survives_config_and_settings_roundtrip() {
+        let config: Config = toml::from_str("[[window_rules]]\nmatch_class = 'App'\naction = 'float'\nx = -25\ny = 0\n\n[[window_rules]]\nmatch_class = 'Other'\naction = 'float'\n").unwrap();
+        let settings = serde_json::to_value(&config).unwrap();
+        assert_eq!(settings["window_rules"][0]["x"], -25);
+        assert_eq!(settings["window_rules"][0]["y"], 0);
+        assert!(settings["window_rules"][1]["x"].is_null());
+        assert!(settings["window_rules"][1]["y"].is_null());
+        let saved: Config = serde_json::from_value(settings).unwrap();
+        let restored: Config = toml::from_str(&toml::to_string(&saved).unwrap()).unwrap();
+        let result = serde_json::to_value(restored).unwrap();
+        assert_eq!(result["window_rules"][0]["x"], -25);
+        assert_eq!(result["window_rules"][0]["y"], 0);
+    }
+
+    #[test]
     fn test_window_action_default() {
         let action = WindowAction::default();
         assert_eq!(action, WindowAction::Tile);
@@ -2644,10 +4212,106 @@ centering_mode = "center"
     }
 
     #[test]
+    fn move_step_defaults_roundtrips_and_clamps() {
+        let missing: Config = toml::from_str("[behavior]\n").unwrap();
+        assert_eq!(missing.behavior.move_step, 50);
+        let explicit: Config = toml::from_str("[behavior]\nmove_step = 125\n").unwrap();
+        let roundtrip: Config = toml::from_str(&toml::to_string(&explicit).unwrap()).unwrap();
+        assert_eq!(roundtrip.behavior.move_step, 125);
+        for (input, expected) in [(-1, 1), (0, 1), (1001, 1000)] {
+            let mut config: Config =
+                toml::from_str(&format!("[behavior]\nmove_step = {input}\n")).unwrap();
+            assert!(config
+                .validate()
+                .iter()
+                .any(|w| w.field == "behavior.move_step"));
+            assert_eq!(config.behavior.move_step, expected);
+        }
+    }
+
+    #[test]
+    fn keep_awake_defaults_off_and_round_trips() {
+        let missing: Config = toml::from_str("[behavior]").unwrap();
+        assert!(!missing.behavior.keep_awake);
+        assert!(!Config::default().behavior.keep_awake);
+        let enabled: Config = toml::from_str("[behavior]\nkeep_awake = true").unwrap();
+        assert!(enabled.behavior.keep_awake);
+        let roundtrip: Config = toml::from_str(&toml::to_string(&enabled).unwrap()).unwrap();
+        assert!(roundtrip.behavior.keep_awake);
+    }
+
+    #[test]
     fn test_focus_follows_mouse_default() {
         let config = Config::default();
         assert!(!config.behavior.focus_follows_mouse);
         assert_eq!(config.behavior.focus_follows_mouse_delay_ms, 100);
+    }
+
+    #[test]
+    fn focus_lock_modifier_defaults_and_validates() {
+        let old: Config = toml::from_str("[behavior]\nfocus_follows_mouse = true\n").unwrap();
+        assert_eq!(old.behavior.focus_lock_modifier, "none");
+        for (input, expected) in [
+            ("none", "none"),
+            ("cTrL", "Ctrl"),
+            ("alt", "Alt"),
+            ("shift", "Shift"),
+            ("win", "Win"),
+            ("f13", "F13"),
+            ("f24", "F24"),
+        ] {
+            let mut config: Config =
+                toml::from_str(&format!("[behavior]\nfocus_lock_modifier = '{input}'\n")).unwrap();
+            assert!(!config
+                .validate()
+                .iter()
+                .any(|w| w.field == "behavior.focus_lock_modifier"));
+            assert_eq!(config.behavior.focus_lock_modifier, expected);
+        }
+        for input in ["F12", "F25", "Ctrl+Alt", "garbage"] {
+            let mut config: Config =
+                toml::from_str(&format!("[behavior]\nfocus_lock_modifier = '{input}'\n")).unwrap();
+            assert!(config
+                .validate()
+                .iter()
+                .any(|w| w.field == "behavior.focus_lock_modifier"));
+            assert_eq!(config.behavior.focus_lock_modifier, "none");
+        }
+    }
+
+    #[test]
+    fn focus_lock_warns_when_function_key_is_hotkey_trigger() {
+        let mut config = Config::default();
+        config.behavior.focus_lock_modifier = "f13".to_string();
+        config.hotkeys.bindings.clear();
+        config
+            .hotkeys
+            .bindings
+            .insert("F13+H".into(), "focus_left".into());
+        assert!(!config
+            .validate()
+            .iter()
+            .any(|warning| warning.field == "behavior.focus_lock_modifier"));
+        config.hotkeys.bindings.clear();
+        config
+            .hotkeys
+            .bindings
+            .insert("F13".into(), "focus_left".into());
+        let warnings = config.validate();
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.field == "behavior.focus_lock_modifier"
+                && warning.message.contains("F13")));
+        assert_eq!(config.behavior.focus_lock_modifier, "F13");
+        config
+            .hotkeys
+            .bindings
+            .insert("F13+H".into(), "focus_left".into());
+        assert!(!config
+            .validate()
+            .iter()
+            .any(|warning| warning.field == "behavior.focus_lock_modifier"));
+        assert_eq!(config.behavior.focus_lock_modifier, "F13");
     }
 
     #[test]
@@ -2673,14 +4337,18 @@ centering_mode = "center"
                 width: Some(800),
                 height: Some(600),
                 corner_style: None,
+                border: None,
+                border_color: None,
                 open_on_workspace: None,
                 open_maximized: false,
                 column_width: None,
                 open_in_column: None,
+                row: None,
                 sticky: false,
                 new_window_monitor: None,
                 match_max_width: None,
                 match_max_height: None,
+                ..Default::default()
             },
             WindowRule {
                 match_class: Some("Notepad".to_string()),
@@ -2690,14 +4358,18 @@ centering_mode = "center"
                 width: None,
                 height: None,
                 corner_style: None,
+                border: None,
+                border_color: None,
                 open_on_workspace: None,
                 open_maximized: false,
                 column_width: None,
                 open_in_column: None,
+                row: None,
                 sticky: false,
                 new_window_monitor: None,
                 match_max_width: None,
                 match_max_height: None,
+                ..Default::default()
             },
         ];
 
@@ -2722,14 +4394,18 @@ centering_mode = "center"
             width: None,
             height: None,
             corner_style: None,
+            border: None,
+            border_color: None,
             open_on_workspace: None,
             open_maximized: false,
             column_width: None,
             open_in_column: None,
+            row: None,
             sticky: false,
             new_window_monitor: None,
             match_max_width: None,
             match_max_height: None,
+            ..Default::default()
         };
 
         let rule = compile_rule(rule);
@@ -2747,14 +4423,18 @@ centering_mode = "center"
             width: None,
             height: None,
             corner_style: None,
+            border: None,
+            border_color: None,
             open_on_workspace: None,
             open_maximized: false,
             column_width: None,
             open_in_column: None,
+            row: None,
             sticky: false,
             new_window_monitor: None,
             match_max_width: None,
             match_max_height: None,
+            ..Default::default()
         };
 
         let rule = compile_rule(rule);
@@ -2772,14 +4452,18 @@ centering_mode = "center"
             width: None,
             height: None,
             corner_style: None,
+            border: None,
+            border_color: None,
             open_on_workspace: None,
             open_maximized: false,
             column_width: None,
             open_in_column: None,
+            row: None,
             sticky: false,
             new_window_monitor: None,
             match_max_width: None,
             match_max_height: None,
+            ..Default::default()
         };
 
         let rule = compile_rule(rule);
@@ -2798,14 +4482,18 @@ centering_mode = "center"
             width: None,
             height: None,
             corner_style: None,
+            border: None,
+            border_color: None,
             open_on_workspace: None,
             open_maximized: false,
             column_width: None,
             open_in_column: None,
+            row: None,
             sticky: false,
             new_window_monitor: None,
             match_max_width: None,
             match_max_height: None,
+            ..Default::default()
         };
 
         let config = Config {
@@ -2813,7 +4501,10 @@ centering_mode = "center"
             ..Default::default()
         };
         let compiled = config.compile_window_rules();
-        assert_eq!(compiled.len(), BUILTIN_IGNORE_EXECUTABLES.len());
+        assert_eq!(
+            compiled.len(),
+            BUILTIN_IGNORE_EXECUTABLES.len() + BUILTIN_FLOAT_RULES.len()
+        );
         assert!(!compiled.iter().any(|rule| rule.matches(
             "AnyClass",
             "Any Title",
@@ -2832,14 +4523,18 @@ centering_mode = "center"
             width: None,
             height: None,
             corner_style: None,
+            border: None,
+            border_color: None,
             open_on_workspace: None,
             open_maximized: false,
             column_width: None,
             open_in_column: None,
+            row: None,
             sticky: false,
             new_window_monitor: None,
             match_max_width: None,
             match_max_height: None,
+            ..Default::default()
         };
 
         let rule = compile_rule(rule);
@@ -3293,14 +4988,18 @@ centering_mode = "center"
                     width: Some(1024),
                     height: Some(768),
                     corner_style: None,
+                    border: None,
+                    border_color: None,
                     open_on_workspace: None,
                     open_maximized: false,
                     column_width: None,
                     open_in_column: None,
+                    row: None,
                     sticky: false,
                     new_window_monitor: None,
                     match_max_width: None,
                     match_max_height: None,
+                    ..Default::default()
                 },
                 WindowRule {
                     match_class: None,
@@ -3310,21 +5009,28 @@ centering_mode = "center"
                     width: None,
                     height: None,
                     corner_style: None,
+                    border: None,
+                    border_color: None,
                     open_on_workspace: None,
                     open_maximized: false,
                     column_width: None,
                     open_in_column: None,
+                    row: None,
                     sticky: false,
                     new_window_monitor: None,
                     match_max_width: None,
                     match_max_height: None,
+                    ..Default::default()
                 },
             ],
             ..Default::default()
         };
 
         let compiled = config.compile_window_rules();
-        assert_eq!(compiled.len(), 2 + BUILTIN_IGNORE_EXECUTABLES.len());
+        assert_eq!(
+            compiled.len(),
+            2 + BUILTIN_IGNORE_EXECUTABLES.len() + BUILTIN_FLOAT_RULES.len()
+        );
 
         assert!(compiled[0].matches(
             "Chrome_WidgetWin_1",
@@ -3341,6 +5047,87 @@ centering_mode = "center"
     }
 
     #[test]
+    fn audacity_import_float_rule_and_user_override() {
+        let defaults = Config::default().compile_window_rules();
+        let override_rules = Config {
+            window_rules: vec![WindowRule {
+                match_executable: Some("Audacity.exe".into()),
+                match_title: Some("^Importing".into()),
+                action: WindowAction::Tile,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+        .compile_window_rules();
+
+        for (rules, title, executable, expected) in [
+            (
+                &defaults,
+                "Importing WAV (Microsoft)",
+                "Audacity.exe",
+                Some(WindowAction::Float),
+            ),
+            (&defaults, "Audacity", "Audacity.exe", None),
+            (&defaults, "Importing WAV (Microsoft)", "other.exe", None),
+            (
+                &override_rules,
+                "Importing WAV (Microsoft)",
+                "Audacity.exe",
+                Some(WindowAction::Tile),
+            ),
+        ] {
+            let action = rules
+                .iter()
+                .find(|rule| rule.matches("AnyClass", title, executable, None))
+                .map(|rule| rule.action);
+            assert_eq!(action, expected, "title={title}, executable={executable}");
+        }
+    }
+
+    #[test]
+    fn invalid_rule_warnings_do_not_log_private_patterns() {
+        use std::io::{self, Write};
+        use std::sync::{Arc, Mutex};
+
+        struct Capture(Arc<Mutex<Vec<u8>>>);
+        impl Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().write(bytes)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let writer = output.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || Capture(writer.clone()))
+            .finish();
+        let config = Config {
+            window_rules: vec![
+                WindowRule {
+                    match_class: Some("private-class(".into()),
+                    ..Default::default()
+                },
+                WindowRule {
+                    match_title: Some("private-title(".into()),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        tracing::subscriber::with_default(subscriber, || config.compile_window_rules());
+        let text = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert!(!text.contains("private-class"), "{text}");
+        assert!(!text.contains("private-title"), "{text}");
+        assert!(!text.contains("regex parse error"), "{text}");
+        assert!(text.contains("Window rule 1: invalid regex"), "{text}");
+        assert!(text.contains("Window rule 2: invalid regex"), "{text}");
+    }
+
+    #[test]
     fn test_compiled_window_rule_invalid_regex_skipped() {
         let config = Config {
             window_rules: vec![
@@ -3352,14 +5139,18 @@ centering_mode = "center"
                     width: None,
                     height: None,
                     corner_style: None,
+                    border: None,
+                    border_color: None,
                     open_on_workspace: None,
                     open_maximized: false,
                     column_width: None,
                     open_in_column: None,
+                    row: None,
                     sticky: false,
                     new_window_monitor: None,
                     match_max_width: None,
                     match_max_height: None,
+                    ..Default::default()
                 },
                 WindowRule {
                     match_class: Some("ValidClass".to_string()),
@@ -3369,21 +5160,28 @@ centering_mode = "center"
                     width: None,
                     height: None,
                     corner_style: None,
+                    border: None,
+                    border_color: None,
                     open_on_workspace: None,
                     open_maximized: false,
                     column_width: None,
                     open_in_column: None,
+                    row: None,
                     sticky: false,
                     new_window_monitor: None,
                     match_max_width: None,
                     match_max_height: None,
+                    ..Default::default()
                 },
             ],
             ..Default::default()
         };
 
         let compiled = config.compile_window_rules();
-        assert_eq!(compiled.len(), 1 + BUILTIN_IGNORE_EXECUTABLES.len());
+        assert_eq!(
+            compiled.len(),
+            1 + BUILTIN_IGNORE_EXECUTABLES.len() + BUILTIN_FLOAT_RULES.len()
+        );
         assert!(compiled[0].matches("ValidClass", "Any Title", "any.exe", None));
     }
 
@@ -3565,6 +5363,260 @@ centering_mode = "center"
     }
 
     #[test]
+    fn test_rows_config_parse_shares() {
+        let rows = RowsConfig {
+            split: vec!["100%".to_string()],
+            gap: 8,
+            ..Default::default()
+        };
+        assert_eq!(rows.parse_shares(), vec![1.0]);
+
+        let rows = RowsConfig {
+            split: vec!["60%".to_string(), "40%".to_string()],
+            gap: 8,
+            ..Default::default()
+        };
+        let shares = rows.parse_shares();
+        assert_eq!(shares.len(), 2);
+        assert!((shares[0] - 0.6).abs() < 1e-6);
+        assert!((shares[1] - 0.4).abs() < 1e-6);
+
+        // Normalized when sum != 100%
+        let rows = RowsConfig {
+            split: vec!["50%".to_string(), "30%".to_string()],
+            gap: 8,
+            ..Default::default()
+        };
+        let shares = rows.parse_shares();
+        assert_eq!(shares.len(), 2);
+        assert!((shares[0] - 0.625).abs() < 1e-6);
+        assert!((shares[1] - 0.375).abs() < 1e-6);
+
+        // Clamped to at most 4 rows
+        let rows = RowsConfig {
+            split: vec![
+                "20%".to_string(),
+                "20%".to_string(),
+                "20%".to_string(),
+                "20%".to_string(),
+                "20%".to_string(),
+            ],
+            gap: 8,
+            ..Default::default()
+        };
+        let shares = rows.parse_shares();
+        assert_eq!(shares.len(), 4);
+        for s in shares {
+            assert!((s - 0.25).abs() < 1e-6);
+        }
+
+        // Invalid and zero entries ignored; fallback to 1.0 if empty
+        let rows = RowsConfig {
+            split: vec!["invalid".to_string(), "0%".to_string()],
+            gap: 8,
+            ..Default::default()
+        };
+        assert_eq!(rows.parse_shares(), vec![1.0]);
+
+        let rows = RowsConfig {
+            split: vec![],
+            gap: 8,
+            ..Default::default()
+        };
+        assert_eq!(rows.parse_shares(), vec![1.0]);
+    }
+
+    #[test]
+    fn test_per_workspace_rows_config_parse_shares() {
+        let rows = RowsConfig {
+            workspaces: vec![
+                WorkspaceRowsConfig {
+                    workspaces: vec![1, 2],
+                    split: vec!["50%".to_string(), "50%".to_string()],
+                },
+                WorkspaceRowsConfig {
+                    workspaces: vec![3],
+                    split: vec!["1/3".to_string(), "1/3".to_string(), "1/3".to_string()],
+                },
+            ],
+            gap: 8,
+            ..Default::default()
+        };
+
+        // Workspace 1 (index 0) and Workspace 2 (index 1) get 2 rows (50% each)
+        assert_eq!(rows.parse_shares_for_workspace(0), vec![0.5, 0.5]);
+        assert_eq!(rows.parse_shares_for_workspace(1), vec![0.5, 0.5]);
+
+        // Workspace 3 (index 2) gets 3 rows
+        let ws3_shares = rows.parse_shares_for_workspace(2);
+        assert_eq!(ws3_shares.len(), 3);
+        for s in ws3_shares {
+            assert!((s - 1.0 / 3.0).abs() < 1e-4);
+        }
+
+        // Workspace 4 through 9 (indices 3..9) default to 1 row
+        for ws_idx in 3..9 {
+            assert_eq!(
+                rows.parse_shares_for_workspace(ws_idx),
+                vec![1.0],
+                "Workspace index {} should default to 1 row",
+                ws_idx
+            );
+        }
+    }
+
+    #[test]
+    fn test_per_workspace_rows_toml_roundtrip() {
+        let toml_str = r#"
+            [layout.rows]
+            gap = 12
+
+            [[layout.rows.workspaces]]
+            workspaces = [1, 2]
+            split = ["1/2", "1/2"]
+
+            [[layout.rows.workspaces]]
+            workspace = 3
+            split = ["40%", "30%", "30%"]
+        "#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.layout.rows.gap, 12);
+        assert_eq!(config.layout.rows.workspaces.len(), 2);
+        assert_eq!(config.layout.rows.workspaces[0].workspaces, vec![1, 2]);
+        assert_eq!(config.layout.rows.workspaces[1].workspaces, vec![3]);
+
+        // Workspace 1 and 2: 2 rows
+        assert_eq!(
+            config.layout.rows.parse_shares_for_workspace(0),
+            vec![0.5, 0.5]
+        );
+        assert_eq!(
+            config.layout.rows.parse_shares_for_workspace(1),
+            vec![0.5, 0.5]
+        );
+
+        // Workspace 3: 3 rows
+        assert_eq!(
+            config.layout.rows.parse_shares_for_workspace(2),
+            vec![0.4, 0.3, 0.3]
+        );
+
+        // Workspace 4: default to 1 row
+        assert_eq!(config.layout.rows.parse_shares_for_workspace(3), vec![1.0]);
+
+        // When global split is set alongside per-workspace overrides, unmatched workspaces fall back to global split.
+        let toml_with_global = r#"
+            [layout.rows]
+            split = ["60%", "40%"]
+            gap = 12
+
+            [[layout.rows.workspaces]]
+            workspace = 1
+            split = ["100%"]
+        "#;
+        let cfg2: Config = toml::from_str(toml_with_global).unwrap();
+        assert_eq!(cfg2.layout.rows.parse_shares_for_workspace(0), vec![1.0]);
+        assert_eq!(
+            cfg2.layout.rows.parse_shares_for_workspace(1),
+            vec![0.6, 0.4]
+        );
+    }
+
+    #[test]
+    fn test_workspace_rows_deserialization_formats() {
+        let toml_str = r#"
+            [layout.rows]
+            gap = 8
+
+            [[layout.rows.workspaces]]
+            workspaces = "1, 2"
+            split = "60%, 40%"
+
+            [[layout.rows.workspaces]]
+            workspace = 4
+            split = ["100%"]
+
+            [[layout.rows.workspaces]]
+            workspaces = "5-7"
+            split = ["50%", "50%"]
+        "#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.layout.rows.workspaces[0].workspaces, vec![1, 2]);
+        assert_eq!(config.layout.rows.workspaces[0].split, vec!["60%", "40%"]);
+        assert_eq!(config.layout.rows.workspaces[1].workspaces, vec![4]);
+        assert_eq!(config.layout.rows.workspaces[2].workspaces, vec![5, 6, 7]);
+
+        assert_eq!(
+            config.layout.rows.parse_shares_for_workspace(0),
+            vec![0.6, 0.4]
+        );
+        assert_eq!(
+            config.layout.rows.parse_shares_for_workspace(4),
+            vec![0.5, 0.5]
+        );
+        assert_eq!(config.layout.rows.parse_shares_for_workspace(7), vec![1.0]);
+    }
+
+    #[test]
+    fn test_layout_rows_toml_roundtrip() {
+        let toml_str = r#"
+            [layout.rows]
+            split = ["70%", "30%"]
+            gap = 12
+        "#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.layout.rows.split, vec!["70%", "30%"]);
+        assert_eq!(config.layout.rows.gap, 12);
+        let shares = config.layout.rows.parse_shares();
+        assert_eq!(shares.len(), 2);
+        assert!((shares[0] - 0.7).abs() < 1e-6);
+        assert!((shares[1] - 0.3).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_compiled_window_rule_row_validation() {
+        let mut config = Config {
+            window_rules: vec![
+                WindowRule {
+                    match_class: Some("A".to_string()),
+                    row: Some(2), // 1-based 2 -> 0-based 1
+                    ..Default::default()
+                },
+                WindowRule {
+                    match_class: Some("B".to_string()),
+                    row: Some(0), // 0 violates 1-based, dropped
+                    ..Default::default()
+                },
+                WindowRule {
+                    match_class: Some("C".to_string()),
+                    action: WindowAction::Float,
+                    row: Some(2), // float ignores row
+                    ..Default::default()
+                },
+                WindowRule {
+                    match_class: Some("D".to_string()),
+                    row: Some(6), // > MAX_ROWS (4), clamped to 4 -> 0-based 3
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let compiled = config.compile_window_rules();
+        assert_eq!(compiled[0].row, Some(1));
+        assert_eq!(compiled[1].row, None);
+        assert_eq!(compiled[2].row, None);
+        assert_eq!(compiled[3].row, Some(3));
+
+        let warnings = config.validate();
+        assert!(warnings.iter().any(|w| w.field == "window_rules[1].row"));
+        assert!(warnings.iter().any(|w| w.field == "window_rules[2].row"));
+        assert!(warnings.iter().any(|w| w.field == "window_rules[3].row"));
+        assert_eq!(config.window_rules[1].row, None);
+        assert_eq!(config.window_rules[2].row, None);
+        assert_eq!(config.window_rules[3].row, Some(4));
+    }
+
+    #[test]
     fn test_focus_new_windows_false_parsed() {
         let toml_str = r#"
             [behavior]
@@ -3585,14 +5637,31 @@ centering_mode = "center"
     }
 
     #[test]
-    fn test_center_single_column_defaults_false_and_roundtrips() {
-        let absent: Config = toml::from_str("[layout]\n").unwrap();
-        assert!(!absent.layout.center_single_column);
-        assert!(!Config::default().layout.center_single_column);
-        let enabled: Config = toml::from_str("[layout]\ncenter_single_column = true\n").unwrap();
-        assert!(enabled.layout.center_single_column);
-        let parsed: Config = toml::from_str(&toml::to_string_pretty(&enabled).unwrap()).unwrap();
-        assert!(parsed.layout.center_single_column);
+    fn center_columns_migrates_legacy_and_roundtrips_through_settings() {
+        use CenterColumnsConfig::*;
+        for (fields, expected) in [
+            ("", Off),
+            ("center_single_column = false", Off),
+            ("center_single_column = true", Single),
+            ("center_columns = \"fit\"", Fit),
+            ("center_single_column = true\ncenter_columns = \"off\"", Off),
+            (
+                "center_single_column = false\ncenter_columns = \"single\"",
+                Single,
+            ),
+        ] {
+            let config: Config = toml::from_str(&format!("[layout]\n{fields}\n")).unwrap();
+            assert_eq!(
+                config.layout.center_columns.center_columns, expected,
+                "{fields}"
+            );
+            let json = serde_json::to_value(&config).unwrap();
+            let settings_config: Config = serde_json::from_value(json).unwrap();
+            let saved = toml::to_string_pretty(&settings_config).unwrap();
+            assert!(!saved.contains("center_single_column"));
+            let parsed: Config = toml::from_str(&saved).unwrap();
+            assert_eq!(parsed.layout.center_columns.center_columns, expected);
+        }
     }
 
     #[test]
@@ -3872,9 +5941,894 @@ centering_mode = "center"
         fs::remove_dir_all(&dir).unwrap();
     }
 
+    struct ConfigFileFixture(PathBuf);
+
+    impl ConfigFileFixture {
+        fn new() -> Self {
+            let path =
+                std::env::temp_dir().join(format!("leopardwm-config-{}", uuid::Uuid::new_v4()));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for ConfigFileFixture {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+
+    #[test]
+    fn unknown_keys_are_reported_and_compatibility_keys_are_accepted() {
+        let fixture = ConfigFileFixture::new();
+        let path = fixture.0.join("config.toml");
+        fs::write(
+            &path,
+            r#"
+            typo = true
+            [layout]
+            center_single_colum = true
+            center_single_column = true
+            outer_gap = 8
+            default_column_width = 200
+            min_column_width = 100
+            max_column_width = 800
+            [layout.rows]
+            bogus = true
+            [[layout.rows.workspaces]]
+            workspace = 1
+            split = ["100%"]
+            [behavior]
+            hide_offscreen_taskbar_buttons = true
+            [gestures]
+            raw_input = false
+            diagnostic_capture_secs = 0
+            [[window_rules]]
+            match_clas = "example"
+        "#,
+        )
+        .unwrap();
+        let mut file = ConfigFile::default();
+        file.load(std::slice::from_ref(&path)).unwrap();
+        assert_eq!(
+            file.unknown_keys,
+            [
+                "layout.center_single_colum",
+                "layout.rows.bogus",
+                "typo",
+                "window_rules[0].match_clas"
+            ]
+        );
+        fs::write(&path, "[layout]\ngap = 8\n").unwrap();
+        file.load(std::slice::from_ref(&path)).unwrap();
+        assert!(file.unknown_keys.is_empty());
+    }
+
+    #[test]
+    fn unknown_keys_follow_successful_saves_but_not_failed_saves() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let fixture = ConfigFileFixture::new();
+        let path = fixture.0.join("config.toml");
+        fs::write(&path, "[layout]\ncenter_single_colum = true\n").unwrap();
+        let mut file = ConfigFile::default();
+        let config = file.load(std::slice::from_ref(&path)).unwrap();
+        assert_eq!(file.unknown_keys, ["layout.center_single_colum"]);
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1)
+            .open(&path)
+            .unwrap();
+        assert!(file.save(&config, std::slice::from_ref(&path)).is_err());
+        assert_eq!(file.unknown_keys, ["layout.center_single_colum"]);
+        drop(lock);
+        file.save(&config, std::slice::from_ref(&path)).unwrap();
+        assert!(file.unknown_keys.is_empty());
+        assert!(!fs::read_to_string(&path)
+            .unwrap()
+            .contains("center_single_colum ="));
+    }
+
+    #[test]
+    fn unknown_keys_survive_failed_reload_but_clear_for_missing_file() {
+        let fixture = ConfigFileFixture::new();
+        let path = fixture.0.join("config.toml");
+        fs::write(&path, "[layout]\ncenter_single_colum = true\n").unwrap();
+        let mut file = ConfigFile::default();
+        file.load(std::slice::from_ref(&path)).unwrap();
+        assert_eq!(file.unknown_keys, ["layout.center_single_colum"]);
+        fs::write(&path, "[layout\n").unwrap();
+        assert!(file.load(std::slice::from_ref(&path)).is_err());
+        assert_eq!(file.unknown_keys, ["layout.center_single_colum"]);
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert!(file.load(std::slice::from_ref(&path)).is_err());
+        assert_eq!(file.unknown_keys, ["layout.center_single_colum"]);
+        fs::remove_dir(&path).unwrap();
+        file.load(std::slice::from_ref(&path)).unwrap();
+        assert!(file.unknown_keys.is_empty());
+    }
+
+    #[test]
+    fn default_template_has_no_unknown_keys() {
+        let content = leopardwm_ipc::config_template::render_default_config();
+        let config = Config::parse(&content).unwrap();
+        assert_eq!(
+            find_unknown_config_keys(&content, &config, &[]),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn recovered_config_still_reports_unknown_keys() {
+        let fixture = ConfigFileFixture::new();
+        let path = fixture.0.join("config.toml");
+        fs::write(&path, "[layout]\ngap = 'bad'\ncenter_single_colum = true\n").unwrap();
+        let mut file = ConfigFile::default();
+        file.load(std::slice::from_ref(&path)).unwrap();
+        assert!(!file.rejections.is_empty());
+        assert_eq!(file.unknown_keys, ["layout.center_single_colum"]);
+    }
+
+    #[test]
+    fn recovered_rule_indices_remain_aligned_after_a_rule_is_dropped() {
+        let fixture = ConfigFileFixture::new();
+        let path = fixture.0.join("config.toml");
+        fs::write(&path, "[[window_rules]]\nwidth = 'bad'\n[[window_rules]]\nmatch_class = 'second'\nmatch_clas = 'typo'\n").unwrap();
+        let mut file = ConfigFile::default();
+        let config = file.load(std::slice::from_ref(&path)).unwrap();
+        assert_eq!(config.window_rules.len(), 1);
+        assert_eq!(file.unknown_keys, ["window_rules[1].match_clas"]);
+    }
+
+    #[test]
+    fn recovery_handles_same_errors_containers_datetimes_and_rule_elements() {
+        let cases: &[(&str, &[&str])] = &[
+            ("[behavior]\nfocus_new_windows = 123\ntrack_focus_changes = 123\n", &["behavior.focus_new_windows", "behavior.track_focus_changes"]),
+            ("[layout]\ngap = { x = 1 }\n", &["layout.gap"]),
+            ("[layout]\ngap = {}\n", &["layout.gap"]),
+            ("[layout]\ngap = 1979-05-27T07:32:00Z\n", &["layout.gap"]),
+            ("mystery_timestamp = 1979-05-27T07:32:00Z\n[layout]\ngap = 'bad'\n", &["layout.gap"]),
+            ("[[window_rules]]\nmatch_class = 'First'\nwidth = 'bad'\n[[window_rules]]\nmatch_class = 'Second'\nwidth = 321\n", &["window_rules[0]"]),
+        ];
+        for (source, expected) in cases {
+            let fixture = ConfigFileFixture::new();
+            let path = fixture.0.join("config.toml");
+            fs::write(
+                &path,
+                format!("{source}\n[appearance]\nactive_border_width = 7\n"),
+            )
+            .unwrap();
+            let mut file = ConfigFile::default();
+            let config = file
+                .load(std::slice::from_ref(&path))
+                .unwrap_or_else(|error| panic!("{source}: {error:#}"));
+            assert_eq!(config.appearance.active_border_width, 7, "{source}");
+            let mut actual: Vec<_> = file.rejections[0]
+                .recovered_fields
+                .iter()
+                .map(|field| field.path.as_str())
+                .collect();
+            actual.sort_unstable();
+            assert_eq!(&actual, expected, "{source}");
+            if source.contains("[[window_rules]]") {
+                assert_eq!(config.window_rules.len(), 1);
+                assert_eq!(
+                    config.window_rules[0].match_class.as_deref(),
+                    Some("Second")
+                );
+                assert_eq!(config.window_rules[0].width, Some(321));
+            }
+        }
+    }
+
+    #[test]
+    fn snapshot_health_reports_recovery_without_config_values_or_unknown_names() {
+        use leopardwm_ipc::diagnostic_snapshot::{render, ConfigLoadStatus, SnapshotInput};
+        let fixture = ConfigFileFixture::new();
+        let path = fixture.0.join("config.toml");
+        fs::write(
+            &path,
+            "[behavior]\nmove_step = 'private-value'\nprivate_unknown = 'another-value'\n",
+        )
+        .unwrap();
+        let mut file = ConfigFile::default();
+        file.load(std::slice::from_ref(&path)).unwrap();
+        let rows = crate::diagnostic_snapshot::config_health_rows(
+            file.rejections.last().cloned(),
+            file.unknown_keys.len(),
+        );
+        let input = SnapshotInput {
+            requester: "test".into(),
+            requester_version: "1.0.0".into(),
+            requester_integrity: None,
+            daemon_version: None,
+            daemon_integrity: None,
+            daemon_uptime: None,
+            unavailable_reason: "test".into(),
+            windows_version: "test".into(),
+            monitors: None,
+            health: Some(rows),
+            config_path: path,
+            config_status: ConfigLoadStatus::Loaded,
+            config_text: None,
+            workspaces: None,
+            known_titles: vec![],
+            userprofile: None,
+            log_dir: fixture.0.clone(),
+            timestamp: std::time::SystemTime::now(),
+        };
+        let report = render(&input);
+        assert!(report.contains("Config rejected at line"), "{report}");
+        assert!(report.contains("<redacted>"), "{report}");
+        assert!(
+            report.contains("Recovered settings: behavior.move_step"),
+            "{report}"
+        );
+        assert!(report.contains("Unknown configuration keys: 1"), "{report}");
+        for secret in ["private-value", "another-value", "private_unknown"] {
+            assert!(!report.contains(secret), "{report}");
+        }
+    }
+
+    #[test]
+    fn invalid_behavior_field_recovers_and_preserves_original() {
+        let fixture = ConfigFileFixture::new();
+        let path = fixture.0.join("config.toml");
+        let original = b"[layout]\ngap = 42\n[behavior]\nmove_step = 'bad'\n[[window_rules]]\nmatch_class = 'Example'\naction = 'float'\n";
+        fs::write(&path, original).unwrap();
+        let mut file = ConfigFile::default();
+        let config = file.load(std::slice::from_ref(&path)).unwrap();
+        assert_eq!(config.layout.gap, 42);
+        assert_eq!(
+            config.behavior.move_step,
+            Config::default().behavior.move_step
+        );
+        assert_eq!(
+            config.window_rules[0].match_class.as_deref(),
+            Some("Example")
+        );
+        let fields = &file.rejections[0].recovered_fields;
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].path, "behavior.move_step");
+        assert_eq!(fields[0].location, Some((4, 13)));
+        assert!(fields[0].reason.contains("invalid type"));
+        file.save(&config, std::slice::from_ref(&path)).unwrap();
+        assert_eq!(fs::read(corrupt_path(&path, ".corrupt")).unwrap(), original);
+        assert!(file.load(std::slice::from_ref(&path)).is_ok());
+        assert!(file.rejections.is_empty());
+    }
+
+    #[test]
+    fn invalid_match_title_drops_entire_rule() {
+        let fixture = ConfigFileFixture::new();
+        let path = fixture.0.join("config.toml");
+        let source = "[[window_rules]]\nmatch_class = 'Chrome'\nmatch_title = 123\naction = 'ignore'\n[[window_rules]]\nmatch_class = 'Other'\naction = 'float'\n";
+        fs::write(&path, source).unwrap();
+        let mut file = ConfigFile::default();
+        let config = file.load(std::slice::from_ref(&path)).unwrap();
+        assert_eq!(config.window_rules.len(), 1);
+        assert_eq!(config.window_rules[0].match_class.as_deref(), Some("Other"));
+        assert_eq!(
+            file.rejections[0].recovered_fields[0].path,
+            "window_rules[0]"
+        );
+        file.save(&config, std::slice::from_ref(&path)).unwrap();
+        let saved = Config::load_from_path(&path).unwrap();
+        assert_eq!(saved.window_rules.len(), 1);
+        assert_eq!(saved.window_rules[0].match_class.as_deref(), Some("Other"));
+    }
+
+    #[test]
+    fn recovery_reports_original_indices_for_multiple_removed_rules() {
+        let fixture = ConfigFileFixture::new();
+        let path = fixture.0.join("config.toml");
+        let source = "[[window_rules]]\nmatch_class = 'A'\n[[window_rules]]\nmatch_class = 'B'\nmatch_title = 123\n[[window_rules]]\nmatch_class = 'C'\n[[window_rules]]\nmatch_class = 'D'\nmatch_title = 456\n";
+        fs::write(&path, source).unwrap();
+        let mut file = ConfigFile::default();
+        let config = file.load(std::slice::from_ref(&path)).unwrap();
+        assert_eq!(config.window_rules.len(), 2);
+        assert_eq!(config.window_rules[0].match_class.as_deref(), Some("A"));
+        assert_eq!(config.window_rules[1].match_class.as_deref(), Some("C"));
+        let paths: Vec<_> = file.rejections[0]
+            .recovered_fields
+            .iter()
+            .map(|field| field.path.as_str())
+            .collect();
+        assert_eq!(paths, ["window_rules[1]", "window_rules[3]"]);
+    }
+
+    #[test]
+    fn recovery_drops_invalid_row_rule_without_widening_it() {
+        let fixture = ConfigFileFixture::new();
+        let path = fixture.0.join("config.toml");
+        let source = "[[layout.rows.workspaces]]\nworkspace = 1\nsplit = 123\n[[layout.rows.workspaces]]\nworkspace = 2\nsplit = ['50%', '50%']\n";
+        fs::write(&path, source).unwrap();
+        let mut file = ConfigFile::default();
+        let config = file.load(std::slice::from_ref(&path)).unwrap();
+        assert_eq!(config.layout.rows.workspaces.len(), 1);
+        assert_eq!(config.layout.rows.workspaces[0].workspaces, [2]);
+        assert_eq!(
+            file.rejections[0].recovered_fields[0].path,
+            "layout.rows.workspaces[0]"
+        );
+    }
+
+    #[test]
+    fn invalid_window_rule_field_does_not_discard_other_rules() {
+        let fixture = ConfigFileFixture::new();
+        let path = fixture.0.join("config.toml");
+        fs::write(&path, "[[window_rules]]\nmatch_class = 'First'\nwidth = 'bad'\n[[window_rules]]\nmatch_class = 'Second'\nwidth = 321\n").unwrap();
+        let mut file = ConfigFile::default();
+        let config = file.load(std::slice::from_ref(&path)).unwrap();
+        assert_eq!(config.window_rules.len(), 1);
+        assert_eq!(
+            config.window_rules[0].match_class.as_deref(),
+            Some("Second")
+        );
+        assert_eq!(config.window_rules[0].width, Some(321));
+        assert_eq!(
+            file.rejections[0].recovered_fields[0].path,
+            "window_rules[0]"
+        );
+    }
+
+    #[test]
+    fn multiple_invalid_behavior_fields_recover_but_syntax_errors_do_not() {
+        let fixture = ConfigFileFixture::new();
+        let path = fixture.0.join("config.toml");
+        fs::write(
+            &path,
+            "[behavior]\nmove_step = 'bad'\nfocus_new_windows = 123\n[appearance]\nactive_border = 'bad'\n",
+        )
+        .unwrap();
+        let mut file = ConfigFile::default();
+        let config = file.load(std::slice::from_ref(&path)).unwrap();
+        assert_eq!(
+            config.behavior.move_step,
+            Config::default().behavior.move_step
+        );
+        assert_eq!(
+            config.behavior.focus_new_windows,
+            Config::default().behavior.focus_new_windows
+        );
+        let fields = &file.rejections[0].recovered_fields;
+        assert_eq!(fields.len(), 3);
+        assert!(fields
+            .iter()
+            .any(|field| field.path == "appearance.active_border"));
+        assert!(fields
+            .iter()
+            .any(|field| field.path == "behavior.move_step"));
+        assert!(fields
+            .iter()
+            .any(|field| field.path == "behavior.focus_new_windows"));
+        fs::write(&path, "[layout\ngap = 42\n").unwrap();
+        assert!(file.load(std::slice::from_ref(&path)).is_err());
+    }
+
+    #[test]
+    fn invalid_array_values_reset_their_containing_field() {
+        let fixture = ConfigFileFixture::new();
+        let path = fixture.0.join("config.toml");
+        for (source, field) in [
+            ("[layout]\ngap = []\n", "layout.gap"),
+            (
+                "[layout]\nwidth_presets = [0.5, 'bad']\n",
+                "layout.width_presets",
+            ),
+        ] {
+            fs::write(&path, source).unwrap();
+            let mut file = ConfigFile::default();
+            assert!(file.load(std::slice::from_ref(&path)).is_ok());
+            assert_eq!(file.rejections[0].recovered_fields[0].path, field);
+        }
+    }
+
+    #[test]
+    fn recovery_is_bounded_and_preserves_last_allowed_field() {
+        let fixture = ConfigFileFixture::new();
+        let path = fixture.0.join("config.toml");
+        let mut file = ConfigFile::default();
+        let rule = "[[window_rules]]\nwidth = 'bad'\n";
+        fs::write(&path, rule.repeat(64)).unwrap();
+        let config = file.load(std::slice::from_ref(&path)).unwrap();
+        assert!(config.window_rules.is_empty());
+        assert_eq!(file.rejections[0].recovered_fields.len(), 64);
+        fs::write(&path, rule.repeat(65)).unwrap();
+        assert!(file.load(std::slice::from_ref(&path)).is_err());
+        assert!(file.rejections.last().unwrap().recovered_fields.is_empty());
+    }
+
+    #[test]
+    fn rejected_config_is_preserved_before_save() {
+        let fixture = ConfigFileFixture::new();
+        let path = fixture.0.join("config.toml");
+        let original = b"[layout]\ngap = [\n";
+        fs::write(&path, original).unwrap();
+        let mut file = ConfigFile::default();
+        assert!(file.load(std::slice::from_ref(&path)).is_err());
+        assert!(file.rejections[0].location.is_some());
+        file.save(&Config::default(), std::slice::from_ref(&path))
+            .unwrap();
+        assert_eq!(fs::read(corrupt_path(&path, ".corrupt")).unwrap(), original);
+        assert!(Config::load_from_path(&path).is_ok());
+        assert_eq!(
+            file.rejections[0].preserved_at,
+            Some(corrupt_path(&path, ".corrupt"))
+        );
+        assert!(file.load(std::slice::from_ref(&path)).is_ok());
+        assert!(file.rejections.is_empty());
+    }
+
+    #[test]
+    fn rejected_config_backup_slots_fail_closed_or_reuse_identical_bytes() {
+        for (first, second, expected) in [
+            (Some(&b"different"[..]), None, Some(".corrupt.1")),
+            (None, Some(&b"broken = ["[..]), Some(".corrupt.1")),
+            (
+                Some(&b"broken = ["[..]),
+                Some(&b"different"[..]),
+                Some(".corrupt"),
+            ),
+            (
+                Some(&b"different"[..]),
+                Some(&b"broken = ["[..]),
+                Some(".corrupt.1"),
+            ),
+            (Some(&b"different"[..]), Some(&b"also different"[..]), None),
+        ] {
+            let fixture = ConfigFileFixture::new();
+            let path = fixture.0.join("config.toml");
+            let original = b"broken = [";
+            fs::write(&path, original).unwrap();
+            if let Some(bytes) = first {
+                fs::write(corrupt_path(&path, ".corrupt"), bytes).unwrap();
+            }
+            if let Some(bytes) = second {
+                fs::write(corrupt_path(&path, ".corrupt.1"), bytes).unwrap();
+            }
+            let mut file = ConfigFile::default();
+            assert!(file.load(std::slice::from_ref(&path)).is_err());
+            let result = file.save(&Config::default(), std::slice::from_ref(&path));
+            if let Some(suffix) = expected {
+                result.unwrap();
+                assert_eq!(fs::read(corrupt_path(&path, suffix)).unwrap(), original);
+                assert_eq!(
+                    file.rejections[0].preserved_at,
+                    Some(corrupt_path(&path, suffix))
+                );
+                if first.is_none() {
+                    assert!(!corrupt_path(&path, ".corrupt").exists());
+                }
+            } else {
+                assert!(result.is_err());
+                assert_eq!(fs::read(&path).unwrap(), original);
+            }
+        }
+    }
+
+    #[test]
+    fn successive_rejected_reloads_are_preserved() {
+        let fixture = ConfigFileFixture::new();
+        let path = fixture.0.join("config.toml");
+        let mut file = ConfigFile::default();
+        fs::write(&path, "[layout]\ngap = 42\n").unwrap();
+        assert!(file.load(std::slice::from_ref(&path)).is_ok());
+        for bytes in [&b"first = ["[..], &b"second = ["[..]] {
+            fs::write(&path, bytes).unwrap();
+            assert!(file.load(std::slice::from_ref(&path)).is_err());
+        }
+        file.save(&Config::default(), std::slice::from_ref(&path))
+            .unwrap();
+        assert_eq!(
+            fs::read(corrupt_path(&path, ".corrupt")).unwrap(),
+            b"first = ["
+        );
+        assert_eq!(
+            fs::read(corrupt_path(&path, ".corrupt.1")).unwrap(),
+            b"second = ["
+        );
+    }
+
+    #[test]
+    fn config_save_failure_does_not_modify_destination() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let fixture = ConfigFileFixture::new();
+        let path = fixture.0.join("config.toml");
+        let original = b"[layout]\ngap = 42\n";
+        fs::write(&path, original).unwrap();
+        let mut file = ConfigFile::default();
+        let config = file.load(std::slice::from_ref(&path)).unwrap();
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1)
+            .open(&path)
+            .unwrap();
+        assert!(file.save(&config, std::slice::from_ref(&path)).is_err());
+        drop(lock);
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert_eq!(fs::read_dir(&fixture.0).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn unreadable_config_cannot_be_saved_and_non_utf8_is_preserved() {
+        let fixture = ConfigFileFixture::new();
+        let path = fixture.0.join("config.toml");
+        fs::create_dir(&path).unwrap();
+        let mut file = ConfigFile::default();
+        assert!(file.load(std::slice::from_ref(&path)).is_err());
+        assert!(file
+            .save(&Config::default(), std::slice::from_ref(&path))
+            .is_err());
+        assert!(path.is_dir());
+        fs::remove_dir(&path).unwrap();
+        let bytes = [0xff, 0xfe, 0x00];
+        fs::write(&path, bytes).unwrap();
+        let mut file = ConfigFile::default();
+        assert!(file.load(std::slice::from_ref(&path)).is_err());
+        assert_eq!(file.rejections[0].location, None);
+        file.save(&Config::default(), std::slice::from_ref(&path))
+            .unwrap();
+        assert_eq!(fs::read(corrupt_path(&path, ".corrupt")).unwrap(), bytes);
+    }
+
+    #[test]
+    fn unreadable_rejection_is_cleared_after_readable_recovery() {
+        let fixture = ConfigFileFixture::new();
+        let path = fixture.0.join("config.toml");
+        fs::create_dir(&path).unwrap();
+        let mut file = ConfigFile::default();
+        assert!(file.load(std::slice::from_ref(&path)).is_err());
+        fs::remove_dir(&path).unwrap();
+        let original = "[layout]\ngap = 'bad'\n";
+        fs::write(&path, original).unwrap();
+        let config = file.load(std::slice::from_ref(&path)).unwrap();
+        file.save(&config, std::slice::from_ref(&path)).unwrap();
+        assert_eq!(
+            fs::read(corrupt_path(&path, ".corrupt")).unwrap(),
+            original.as_bytes()
+        );
+    }
+
+    #[test]
+    fn missing_unreadable_config_does_not_block_recovered_secondary_save() {
+        let fixture = ConfigFileFixture::new();
+        let paths = [
+            fixture.0.join("primary.toml"),
+            fixture.0.join("secondary.toml"),
+        ];
+        fs::create_dir(&paths[0]).unwrap();
+        let original = b"[layout]\ngap = 'bad'\n";
+        fs::write(&paths[1], original).unwrap();
+        let mut file = ConfigFile::default();
+        assert!(file.load(&paths).is_err());
+        fs::remove_dir(&paths[0]).unwrap();
+        let config = file.load(&paths).unwrap();
+        file.save(&config, &paths).unwrap();
+        assert_eq!(
+            fs::read(corrupt_path(&paths[1], ".corrupt")).unwrap(),
+            original
+        );
+        assert!(file.rejected_paths.contains(&paths[0]));
+        assert!(Config::load_from_path(&paths[1]).is_ok());
+    }
+
+    #[test]
+    fn save_updates_all_hard_links() {
+        let fixture = ConfigFileFixture::new();
+        let path = fixture.0.join("config.toml");
+        let linked = fixture.0.join("linked.toml");
+        fs::write(&path, "[layout]\ngap = 42\n").unwrap();
+        fs::hard_link(&path, &linked).unwrap();
+        let mut file = ConfigFile::default();
+        let mut config = file.load(std::slice::from_ref(&path)).unwrap();
+        config.layout.gap = 17;
+        file.save(&config, std::slice::from_ref(&path)).unwrap();
+        assert_eq!(Config::load_from_path(&path).unwrap().layout.gap, 17);
+        assert_eq!(Config::load_from_path(&linked).unwrap().layout.gap, 17);
+    }
+
+    #[test]
+    fn blocked_hard_link_writes_leave_no_backups() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let fixture = ConfigFileFixture::new();
+        let path = fixture.0.join("config.toml");
+        let linked = fixture.0.join("linked.toml");
+        let original = b"[layout]\ngap = 42\n";
+        fs::write(&path, original).unwrap();
+        fs::hard_link(&path, &linked).unwrap();
+        let mut file = ConfigFile::default();
+        let config = file.load(std::slice::from_ref(&path)).unwrap();
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1)
+            .open(&path)
+            .unwrap();
+        for _ in 0..3 {
+            assert!(file.save(&config, std::slice::from_ref(&path)).is_err());
+        }
+        drop(lock);
+        assert!(!fs::read_dir(&fixture.0)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .any(|entry| entry.extension().is_some_and(|ext| ext == "backup")));
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert_eq!(fs::read(&linked).unwrap(), original);
+    }
+
+    #[test]
+    fn config_save_uses_loaded_path_and_existing_serializer() {
+        let fixture = ConfigFileFixture::new();
+        let paths = [
+            fixture.0.join("primary.toml"),
+            fixture.0.join("secondary.toml"),
+        ];
+        fs::write(&paths[1], "[layout]\ngap = 42\n").unwrap();
+        let mut file = ConfigFile::default();
+        let config = file.load(&paths).unwrap();
+        let expected = toml::to_string_pretty(&config).unwrap().replace(
+            "workspace_edge_wrap = \"off\"",
+            "workspace_edge_wrap = false",
+        );
+        file.save(&config, &paths).unwrap();
+        assert!(!paths[0].exists());
+        assert_eq!(fs::read_to_string(&paths[1]).unwrap(), expected);
+        assert_eq!(file.load(&paths).unwrap().layout.gap, 42);
+    }
+
+    #[test]
+    fn save_preserves_intervening_edits_or_fails_closed() {
+        for occupied in [false, true] {
+            let fixture = ConfigFileFixture::new();
+            let path = fixture.0.join("config.toml");
+            let rejected = b"[layout]\ngap = [\n";
+            let edited = b"[layout]\ngap = 32\n";
+            fs::write(&path, rejected).unwrap();
+            let mut file = ConfigFile::default();
+            assert!(file.load(std::slice::from_ref(&path)).is_err());
+            fs::write(&path, edited).unwrap();
+            if occupied {
+                fs::write(corrupt_path(&path, ".corrupt.1"), b"another backup").unwrap();
+            }
+            let result = file.save(&Config::default(), std::slice::from_ref(&path));
+            assert_eq!(fs::read(corrupt_path(&path, ".corrupt")).unwrap(), rejected);
+            if occupied {
+                assert!(result.is_err());
+                assert_eq!(fs::read(&path).unwrap(), edited);
+            } else {
+                result.unwrap();
+                assert_eq!(fs::read(corrupt_path(&path, ".corrupt.1")).unwrap(), edited);
+            }
+        }
+    }
+
+    #[test]
+    fn edits_after_preserved_save_are_backed_up_or_blocked() {
+        for (source, recovered) in [("broken = [", false), ("[layout]\ngap = 'bad'\n", true)] {
+            for event in [
+                "save",
+                "clean reload",
+                "recovered reload",
+                "reload and save",
+                "missing reload",
+            ] {
+                let fixture = ConfigFileFixture::new();
+                let path = fixture.0.join("config.toml");
+                let paths = std::slice::from_ref(&path);
+                fs::write(&path, source).unwrap();
+                let mut file = ConfigFile::default();
+                assert_eq!(file.load(paths).is_ok(), recovered);
+                file.save(&Config::default(), paths).unwrap();
+                assert_eq!(
+                    file.rejections[0].preserved_at,
+                    Some(corrupt_path(&path, ".corrupt"))
+                );
+                match event {
+                    "clean reload" => {
+                        file.load(paths).unwrap();
+                    }
+                    "recovered reload" => {
+                        fs::write(&path, "[layout]\ngap = 'bad'\n").unwrap();
+                        file.load(paths).unwrap();
+                    }
+                    "reload and save" => {
+                        let config = file.load(paths).unwrap();
+                        file.save(&config, paths).unwrap();
+                    }
+                    "missing reload" => {
+                        fs::remove_file(&path).unwrap();
+                        let config = file.load(paths).unwrap();
+                        file.save(&config, paths).unwrap();
+                    }
+                    "save" => {}
+                    _ => unreachable!(),
+                }
+                let first_edit = "[layout]\ngap = 21\n";
+                fs::write(&path, first_edit).unwrap();
+                let result = file.save(&Config::default(), paths);
+                if event == "recovered reload" && !recovered {
+                    assert!(result.is_err(), "{source:?} / {event}");
+                    assert_eq!(fs::read(&path).unwrap(), first_edit.as_bytes());
+                } else {
+                    result.unwrap();
+                    assert_eq!(
+                        fs::read(corrupt_path(&path, ".corrupt.1")).unwrap(),
+                        first_edit.as_bytes(),
+                        "{source:?} / {event}"
+                    );
+                    let second_edit = "[layout]\ngap = 31\n";
+                    fs::write(&path, second_edit).unwrap();
+                    assert!(file.save(&Config::default(), paths).is_err());
+                    assert_eq!(fs::read(&path).unwrap(), second_edit.as_bytes());
+                }
+                assert_eq!(
+                    fs::read(corrupt_path(&path, ".corrupt")).unwrap(),
+                    source.as_bytes()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn archived_backup_stays_gone_until_a_new_rejection() {
+        for (source, recovered) in [("broken = [", false), ("[layout]\ngap = 'bad'\n", true)] {
+            let fixture = ConfigFileFixture::new();
+            let path = fixture.0.join("config.toml");
+            let backup = corrupt_path(&path, ".corrupt");
+            fs::write(&path, source).unwrap();
+            let mut file = ConfigFile::default();
+            assert_eq!(file.load(std::slice::from_ref(&path)).is_ok(), recovered);
+            file.save(&Config::default(), std::slice::from_ref(&path))
+                .unwrap();
+            fs::remove_file(&backup).unwrap();
+            file.save(&Config::default(), std::slice::from_ref(&path))
+                .unwrap();
+            assert!(!backup.exists());
+            assert_eq!(file.rejections[0].preserved_at, Some(backup.clone()));
+            fs::write(&path, source).unwrap();
+            assert_eq!(file.load(std::slice::from_ref(&path)).is_ok(), recovered);
+            file.save(&Config::default(), std::slice::from_ref(&path))
+                .unwrap();
+            assert_eq!(fs::read(&backup).unwrap(), source.as_bytes());
+        }
+    }
+
+    #[test]
+    fn repeated_saves_after_rejection_do_not_preserve_own_writes() {
+        let fixture = ConfigFileFixture::new();
+        let path = fixture.0.join("config.toml");
+        let rejected = b"broken = [";
+        fs::write(&path, rejected).unwrap();
+        let mut file = ConfigFile::default();
+        assert!(file.load(std::slice::from_ref(&path)).is_err());
+        let mut config = Config::default();
+        for gap in [10, 20, 30, 40] {
+            config.layout.gap = gap;
+            file.save(&config, std::slice::from_ref(&path)).unwrap();
+            assert_eq!(Config::load_from_path(&path).unwrap().layout.gap, gap);
+            assert_eq!(fs::read(corrupt_path(&path, ".corrupt")).unwrap(), rejected);
+            assert!(!corrupt_path(&path, ".corrupt.1").exists());
+        }
+    }
+
+    #[test]
+    #[ignore = "needs SeCreateSymbolicLinkPrivilege"]
+    fn save_follows_config_file_symlink() {
+        use std::os::windows::fs::symlink_file;
+
+        let fixture = ConfigFileFixture::new();
+        let path = fixture.0.join("config.toml");
+        let target = fixture.0.join("dotfiles.toml");
+        fs::write(&target, "[layout]\ngap = 42\n").unwrap();
+        if let Err(error) = symlink_file(&target, &path) {
+            if error.raw_os_error() == Some(1314) {
+                panic!("symlink test requires SeCreateSymbolicLinkPrivilege: {error}");
+            }
+            panic!("failed to create test symlink: {error}");
+        }
+        let mut file = ConfigFile::default();
+        let mut config = file.load(std::slice::from_ref(&path)).unwrap();
+        config.layout.gap = 17;
+        file.save(&config, std::slice::from_ref(&path)).unwrap();
+        assert!(fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(Config::load_from_path(&target).unwrap().layout.gap, 17);
+    }
+
+    #[test]
+    #[ignore = "needs SeCreateSymbolicLinkPrivilege"]
+    fn save_creates_missing_symlink_target() {
+        use std::os::windows::fs::symlink_file;
+
+        let fixture = ConfigFileFixture::new();
+        let path = fixture.0.join("config.toml");
+        let target = fixture.0.join("missing.toml");
+        if let Err(error) = symlink_file(&target, &path) {
+            if error.raw_os_error() == Some(1314) {
+                panic!("symlink test requires SeCreateSymbolicLinkPrivilege: {error}");
+            }
+            panic!("failed to create test symlink: {error}");
+        }
+        let mut file = ConfigFile::default();
+        let mut config = Config::default();
+        config.layout.gap = 17;
+        file.save(&config, std::slice::from_ref(&path)).unwrap();
+        assert!(fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(Config::load_from_path(&target).unwrap().layout.gap, 17);
+
+        fs::write(&target, "broken = [").unwrap();
+        assert!(file.load(std::slice::from_ref(&path)).is_err());
+        fs::remove_file(&target).unwrap();
+        file.save(&config, std::slice::from_ref(&path)).unwrap();
+        let backup = corrupt_path(&path, ".corrupt");
+        assert_eq!(fs::read(&backup).unwrap(), b"broken = [");
+        fs::remove_file(&backup).unwrap();
+        file.save(&config, std::slice::from_ref(&path)).unwrap();
+        assert!(!backup.exists());
+    }
+
+    #[test]
+    fn save_rechecks_backup_after_failed_replace_and_rejection() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        for reload in [false, true] {
+            let fixture = ConfigFileFixture::new();
+            let path = fixture.0.join("config.toml");
+            let original = b"broken = [";
+            fs::write(&path, original).unwrap();
+            let mut file = ConfigFile::default();
+            assert!(file.load(std::slice::from_ref(&path)).is_err());
+            let lock = fs::OpenOptions::new()
+                .read(true)
+                .share_mode(1)
+                .open(&path)
+                .unwrap();
+            assert!(file
+                .save(&Config::default(), std::slice::from_ref(&path))
+                .is_err());
+            drop(lock);
+            fs::remove_file(corrupt_path(&path, ".corrupt")).unwrap();
+            if reload {
+                assert!(file.load(std::slice::from_ref(&path)).is_err());
+            }
+            file.save(&Config::default(), std::slice::from_ref(&path))
+                .unwrap();
+            assert_eq!(fs::read(corrupt_path(&path, ".corrupt")).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn missing_config_clears_rejection_and_returns_to_primary_path() {
+        let fixture = ConfigFileFixture::new();
+        let paths = [
+            fixture.0.join("primary.toml"),
+            fixture.0.join("secondary.toml"),
+        ];
+        fs::create_dir(&paths[1]).unwrap();
+        let mut file = ConfigFile::default();
+        assert!(file.load(&paths).is_err());
+        fs::remove_dir(&paths[1]).unwrap();
+        assert!(file.load(&paths).is_ok());
+        file.save(&Config::default(), &paths).unwrap();
+        assert!(paths[0].is_file());
+        assert!(!paths[1].exists());
+        assert!(file.rejections.is_empty());
+    }
+
     #[test]
     fn test_config_save_roundtrip() {
-        let dir = std::env::temp_dir().join("leopardwm_test_save_roundtrip");
+        let dir = std::env::temp_dir().join(format!(
+            "leopardwm_test_save_roundtrip_{}",
+            std::process::id()
+        ));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.toml");

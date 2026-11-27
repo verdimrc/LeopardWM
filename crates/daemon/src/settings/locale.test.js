@@ -1,6 +1,6 @@
 const assert = require('node:assert/strict');
 const vm = require('node:vm');
-const { page, english, chinese, hotkeyCatalog, languages: bundledLanguages } = JSON.parse(require('node:fs').readFileSync(0, 'utf8'));
+const { page, english, chinese, hotkeyCatalog, hotkeyCategories, languages: bundledLanguages } = JSON.parse(require('node:fs').readFileSync(0, 'utf8'));
 const script = page.split('<script>')[1].split('</script>')[0];
 const languagePopup = {};
 const initialLanguageCombo = { querySelector: () => languagePopup };
@@ -10,8 +10,17 @@ const document = {
   getElementById: id => id === 'cb-appearance-language' ? initialLanguageCombo : null,
   addEventListener: () => {}
 };
+function runSettings(source, ctx) {
+  const original = ctx.document.getElementById;
+  const report = {};
+  ctx.document.getElementById = id => id.startsWith('report-')
+    ? (report[id] ||= { value: '', addEventListener() {} }) : original.call(ctx.document, id);
+  ctx.window.addEventListener ||= () => {};
+  vm.runInContext(source, ctx);
+  ctx.document.getElementById = original;
+}
 const context = vm.createContext({ document, window: { _localeStrings: english, _language: 'en', _languages: bundledLanguages } });
-vm.runInContext(script, context);
+runSettings(script, context);
 const readPresetEntries = context.readPresetEntries;
 const languageMarkup = languagePopup.innerHTML;
 assert.equal((languageMarkup.match(/class="combobox-option"/g) || []).length, bundledLanguages.length);
@@ -65,7 +74,7 @@ row.isConnected = true;
 row.querySelector = selector => selector === '.preset-val' ? draft : deleteButton;
 const languageText = {};
 const languages = [['en', 'English'], ['zh-CN', '简体中文']].map(([value, textContent]) => ({
-  dataset: { value }, textContent, classList: { add: () => {}, remove: () => {} }
+  dataset: { value }, textContent, classList: { add: () => {}, remove: () => {}, contains: () => false }, setAttribute() {}
 }));
 const languageCombo = {
   dataset: { value: 'en' },
@@ -92,6 +101,18 @@ context.refreshLocale(english, 'en');
 assert.equal(text.textContent, 'Settings');
 assert.equal(languageText.textContent, 'English');
 assert.equal(draft.value, 'unfinished preset');
+const windowsVersion = { textContent: 'Windows 11 (24H2, Build 26100)' };
+const previousGetElement = document.getElementById;
+document.getElementById = id => id === 'report-windows' ? windowsVersion : previousGetElement(id);
+context.window._windowsVersion = 'Windows 11 (24H2, Build 26100)';
+context.refreshLocale(chinese, 'zh-CN');
+assert.equal(windowsVersion.textContent, 'Windows 11 (24H2, 内部版本 26100)');
+context.window._windowsVersion = 'Unknown';
+context.refreshLocale(english, 'en');
+assert.equal(windowsVersion.textContent, 'Unknown');
+context.refreshLocale(chinese, 'zh-CN');
+assert.equal(windowsVersion.textContent, '未知');
+document.getElementById = previousGetElement;
 const warnings = Object.fromEntries(['hotkey-warn-bar', 'hotkey-warn-title', 'hotkey-warn-msg']
   .map(id => [id, {}]));
 document.getElementById = id => warnings[id];
@@ -142,7 +163,7 @@ function ruleFixture(source, rule = {}) {
     getElementById: () => null
   };
   const ctx = vm.createContext({ document: doc, window: { _localeStrings: english } });
-  vm.runInContext(source, ctx);
+  runSettings(source, ctx);
   doc.createElement = () => row;
   doc.getElementById = () => ({ appendChild() {} });
   ctx.addRuleRow(rule);
@@ -151,6 +172,10 @@ function ruleFixture(source, rule = {}) {
   }
   fields['.rule-action'] = { dataset: { value: rule.action || 'tile' } };
   fields['.rule-corner'] = { dataset: { value: 'auto' } };
+  for (const name of ['rule-border', 'rule-border-color-mode']) {
+    const value = row.innerHTML.match(new RegExp(`class="menu-item has-sub ${name}" data-value="([^"]*)"`))[1];
+    fields['.' + name] = { dataset: { value } };
+  }
   fields['.rule-workspace'] = { dataset: { value: '' } };
   fields['.rule-opts-summary'] = {};
   doc.querySelectorAll = selector => selector === '#rules-body tr' ? [row] : [];
@@ -167,7 +192,13 @@ for (const key of ruleKeys) {
     error.message.includes(`Unknown generated locale key: ${key}`));
 }
 
-const sizeRule = { match_executable: 'QQ.exe', action: 'ignore', match_max_width: 400, match_max_height: 300, width: 900, height: 700 };
+const borderFixture = ruleFixture(script, { match_class: 'App', border: false, border_color: 'A1B2C3', future_key: 'kept' });
+assert.deepEqual(JSON.parse(JSON.stringify(borderFixture.ctx.readRules())), [{ match_class: 'App', action: 'tile', border: false, border_color: 'A1B2C3', future_key: 'kept' }]);
+borderFixture.fields['.rule-border'].dataset.value = 'show';
+borderFixture.fields['.rule-border-color-mode'].dataset.value = 'default';
+assert.deepEqual(JSON.parse(JSON.stringify(borderFixture.ctx.readRules())), [{ match_class: 'App', action: 'tile', future_key: 'kept' }]);
+
+const sizeRule = { match_executable: 'QQ.exe', action: 'float', match_max_width: 400, match_max_height: 300, width: 900, height: 700, x: -25, y: 0 };
 const sizeFixture = ruleFixture(script, sizeRule);
 const savedRules = () => JSON.parse(JSON.stringify(sizeFixture.ctx.readRules()));
 assert.deepEqual(savedRules(), [sizeRule]);
@@ -186,7 +217,7 @@ for (const [width, height, expected] of [
 ]) {
   sizeFixture.fields['.rule-max-width'].value = width;
   sizeFixture.fields['.rule-max-height'].value = height;
-  assert.deepEqual(savedRules(), [{ match_executable: 'QQ.exe', action: 'ignore', width: 900, height: 700, ...expected }]);
+  assert.deepEqual(savedRules(), [{ match_executable: 'QQ.exe', action: 'float', width: 900, height: 700, x: -25, y: 0, ...expected }]);
 }
 assert.equal(sizeRule.match_max_width, 400);
 assert.equal(sizeRule.match_max_height, 300);
@@ -202,8 +233,12 @@ function eventElement() {
       add: name => classes.add(name), remove: name => classes.delete(name),
       contains: name => classes.has(name)
     },
+    setAttribute() {}, getAttribute() { return null; }, removeAttribute() {}, closest() { return null; },
     addEventListener(name, callback) { (listeners[name] ||= []).push(callback); },
-    emit(name, event = {}) { for (const callback of listeners[name] || []) callback({ stopPropagation() {}, ...event }); }
+    emit(name, event = {}) {
+      for (const callback of listeners[name] || []) callback({ target: this, stopPropagation() {}, ...event });
+      if (name === 'click' && this.parent) this.parent.emit(name, { target: this });
+    }
   };
 }
 function presetFixture(values = [0.333, 0.5, 0.667]) {
@@ -221,12 +256,13 @@ function presetFixture(values = [0.333, 0.5, 0.667]) {
     setTimeout(callback, delay) { timers.set(++nextTimer, { callback, delay }); return nextTimer; },
     clearTimeout(id) { timers.delete(id); }
   });
-  vm.runInContext(script, ctx);
-  const trigger = eventElement();
+  runSettings(script, ctx);
+  const trigger = eventElement(); trigger.id = 'preset-trigger';
   const triggerText = eventElement();
   const popup = eventElement();
   const combo = eventElement();
   let options = [];
+  popup.contains = option => options.includes(option);
   Object.defineProperty(combo, 'innerHTML', {
     set(markup) {
       triggerText.textContent = markup.match(/class="combobox-text">([^<]*)/)[1];
@@ -234,6 +270,7 @@ function presetFixture(values = [0.333, 0.5, 0.667]) {
         const option = eventElement();
         if (match[1].includes('selected')) option.classList.add('selected');
         option.dataset.value = match[2]; option.textContent = match[3];
+        option.parent = popup; option.closest = () => option;
         return option;
       });
     }
@@ -267,7 +304,11 @@ function presetFixture(values = [0.333, 0.5, 0.667]) {
   values.forEach(value => ctx.addPresetRow('width', value));
   ctx.refreshDefaultWidthPresetOptions(1);
   return { ctx, rows, combo, options: () => options, timers, saves,
-    flush() { const pending = Array.from(timers.values()); timers.clear(); pending.forEach(timer => timer.callback()); } };
+    flush() {
+      const pending = Array.from(timers.values()); timers.clear(); pending.forEach(timer => timer.callback());
+      const save = saves.at(-1);
+      if (save?.action === 'save') ctx.window.lwmSaveResult(save.id, true);
+    } };
 }
 function presetState(fixture) {
   const { ctx, combo } = fixture;
@@ -322,6 +363,22 @@ invalid.flush();
 assert.deepEqual(invalid.saves[0].config.layout.width_presets, [0.5]);
 assert.equal(invalid.saves[0].config.layout.default_width_preset, 1);
 
+const reloadedPresets = presetFixture([0.5]);
+const presetDoc = reloadedPresets.ctx.document;
+const widthBody = presetDoc.getElementById('width-presets-body');
+Object.defineProperty(widthBody, 'innerHTML', { set() { reloadedPresets.rows.length = 0; } });
+presetDoc.getElementById('height-presets-body').appendChild = () => {};
+presetDoc.getElementById('workspace-names-card').hasChildNodes = () => true;
+reloadedPresets.ctx.setCb = () => {};
+reloadedPresets.ctx.renderFailedHotkeys = () => {};
+reloadedPresets.ctx.updateScrollLabels = () => {};
+reloadedPresets.ctx.applyReloadConfig({
+  layout: { width_presets: [1.25, 1.5], height_presets: [], default_width_preset: 2 },
+  appearance: {}, behavior: {}, gestures: {}, snap_hints: {}
+});
+assert.deepEqual(Array.from(reloadedPresets.ctx.readConfig().layout.width_presets), [1.25, 1.5]);
+assert.equal(reloadedPresets.ctx.readConfig().layout.default_width_preset, 2);
+
 function commandFixture({ saving = false } = {}) {
   const rows = [];
   const combos = [];
@@ -334,18 +391,20 @@ function commandFixture({ saving = false } = {}) {
     getElementById: () => null, querySelector: () => null
   };
   const ctx = vm.createContext({
-    document: doc, window: { _localeStrings: english, _hotkeyCatalog: hotkeyCatalog,
+    document: doc, window: { _localeStrings: english, _hotkeyCatalog: hotkeyCatalog, _hotkeyCategories: hotkeyCategories,
       ipc: { postMessage(json) {
         if (!saving) throw new Error('Language refresh sent IPC');
         saves.push(JSON.parse(json));
       } } },
-    setTimeout(callback) {
+    setTimeout(callback, delay) {
       if (!saving) throw new Error('Language refresh scheduled a save');
+      if (delay === 2000) return -1;
       saveCallback = callback;
       scheduledSaves++;
-    }, clearTimeout() { saveCallback = undefined; }
+      return 1;
+    }, clearTimeout(id) { if (id !== -1) saveCallback = undefined; }
   });
-  vm.runInContext(script, ctx);
+  runSettings(script, ctx);
   const decode = text => text.replace(/&quot;/g, '"').replace(/&gt;/g, '>').replace(/&lt;/g, '<').replace(/&amp;/g, '&');
   doc.createElement = () => {
     const label = eventElement();
@@ -359,9 +418,17 @@ function commandFixture({ saving = false } = {}) {
     });
     const input = eventElement();
     const note = eventElement();
-    const row = { dataset: {}, label, input, note, querySelectorAll: () => [],
-      querySelector: selector => ({ '.hk-cmd-label': label, '.hk-key': input, '.hk-dup-note': note })[selector] };
+    const button = eventElement();
+    button.setAttribute = (name, value) => button[name] = value;
+    const row = { dataset: {}, label, input, note, button, querySelectorAll: () => [],
+      querySelector: selector => ({ '.hk-cmd-label': label, '.hk-key': input, '.hk-dup-note': note, button })[selector] };
     Object.defineProperty(row, 'innerHTML', { set(markup) {
+      if (row.className === 'hk-group') {
+        button['aria-expanded'] = markup.match(/aria-expanded="([^"]*)"/)[1];
+        const heading = markup.match(/<span data-i18n="([^"]*)">([^<]*)<\/span>/);
+        label.dataset.i18n = heading[1]; label.textContent = decode(heading[2]);
+        return;
+      }
       const match = markup.match(/<td class="hk-cmd-label"(?: title="([^"]*)")?[^>]*>([^<]*)<\/td>/);
       if (match[1] === undefined) label.removeAttribute('title');
       else label.title = decode(match[1]);
@@ -375,6 +442,7 @@ function commandFixture({ saving = false } = {}) {
     appendChild: row => rows.push(row),
     insertBefore: (row, anchor) => rows.splice(rows.indexOf(anchor), 0, row),
     querySelectorAll(selector) {
+      if (selector === 'tr[data-category]') return rows.filter(row => row.dataset.category);
       const match = /^tr\[data-cmd="([^"]+)"\]$/.exec(selector);
       assert.ok(match, `Unsupported hotkey table selector: ${selector}`);
       return rows.filter(row => row.dataset.cmd === match[1]);
@@ -382,6 +450,7 @@ function commandFixture({ saving = false } = {}) {
   };
   Object.defineProperty(tbody, 'innerHTML', { set() { rows.length = 0; } });
   fields['hotkeys-body'] = tbody;
+  fields['glazewm_compat-enabled'] = eventElement();
   const presetCombo = eventElement();
   presetCombo.querySelector = () => eventElement();
   presetCombo.querySelectorAll = () => [];
@@ -391,11 +460,12 @@ function commandFixture({ saving = false } = {}) {
   doc.querySelector = selector => selector === '#hotkeys-body tr[data-special="scroll_modifier"]'
     ? rows.find(row => row.dataset.special === 'scroll_modifier') : null;
   doc.querySelectorAll = selector => selector === '#hotkeys-body tr[data-cmd]' ? rows.filter(row => row.dataset.cmd)
+    : selector === '[data-i18n]' ? rows.filter(row => row.className === 'hk-group').map(row => row.label)
     : selector === '#hotkeys-body tr' ? rows
     : selector === '.combobox' || selector === '[id^="cb-gestures-"]' ? combos : [];
   function addCombo(id, value) {
     const cb = eventElement(); cb.dataset.value = value;
-    const trigger = eventElement();
+    const trigger = eventElement(); trigger.id = id + '-trigger';
     const text = eventElement();
     const popup = eventElement();
     let options = [];
@@ -413,10 +483,64 @@ function commandFixture({ saving = false } = {}) {
     fields[id] = cb; combos.push(cb); ctx.initGestureCombo(id);
     return { cb, text, options };
   }
-  return { ctx, rows, combos, addCombo, saves, scheduledSaves: () => scheduledSaves, flush() { saveCallback(); } };
+  return { ctx, rows, combos, fields, addCombo, saves, scheduledSaves: () => scheduledSaves, flush() {
+    saveCallback();
+    const save = saves.at(-1);
+    if (save?.action === 'save') ctx.window.lwmSaveResult(save.id, true);
+  } };
 }
 
+const scrollSettings = commandFixture({ saving: true });
+scrollSettings.fields['lbl-scroll-up'] = eventElement();
+scrollSettings.fields['lbl-scroll-down'] = eventElement();
+scrollSettings.ctx.loadHotkeysSorted({}, ' NONE ');
+let scrollRow = scrollSettings.rows.find(row => row.dataset.special === 'scroll_modifier');
+assert.equal(scrollRow.input.value, '');
+scrollSettings.ctx.updateScrollLabels();
+assert.equal(scrollSettings.fields['lbl-scroll-up'].textContent, english['settings.text.scroll_up_modifier_off']);
+assert.equal(scrollSettings.fields['lbl-scroll-down'].textContent, english['settings.text.scroll_down_modifier_off']);
+scrollSettings.ctx.refreshLocale(chinese, 'zh-CN');
+assert.equal(scrollSettings.fields['lbl-scroll-up'].textContent, chinese['settings.text.scroll_up_modifier_off']);
+scrollSettings.ctx.refreshLocale(english, 'en');
+scrollRow.input.value = 'Ctrl+Alt';
+scrollRow.input.emit('input');
+assert.equal(scrollSettings.fields['lbl-scroll-up'].textContent, 'Ctrl + Alt + Scroll up');
+scrollRow.input.value = '';
+scrollRow.input.emit('input');
+scrollSettings.flush();
+assert.equal(scrollSettings.saves.at(-1).config.hotkeys.scroll_modifier, 'none');
+scrollRow.input.value = ' NoNe ';
+scrollRow.input.emit('input');
+scrollSettings.flush();
+assert.equal(scrollSettings.saves.at(-1).config.hotkeys.scroll_modifier, 'none');
+assert.equal(scrollSettings.fields['lbl-scroll-up'].textContent, english['settings.text.scroll_up_modifier_off']);
+scrollSettings.ctx.resetHotkeys();
+scrollSettings.flush();
+scrollRow = scrollSettings.rows.find(row => row.dataset.special === 'scroll_modifier');
+assert.equal(scrollRow.input.value, 'Ctrl+Alt');
+assert.equal(scrollSettings.saves.at(-1).config.hotkeys.scroll_modifier, 'Ctrl+Alt');
+
+const dragSettings = commandFixture({ saving: true });
+dragSettings.addCombo('cb-behavior-plain_drag_action', 'merge');
+const dragDocument = dragSettings.ctx.document;
+const originalGetElement = dragDocument.getElementById;
+const initFields = {};
+dragDocument.getElementById = id => originalGetElement(id) ||
+  (id.startsWith('cb-') || id === 'workspace-names-card' || id === 'workspace-rows-body' ? null :
+    (initFields[id] ||= eventElement()));
+dragSettings.ctx.addPresetRow = () => {};
+dragSettings.ctx.refreshDefaultWidthPresetOptions = () => {};
+dragSettings.ctx.renderFailedHotkeys = () => {};
+dragSettings.ctx.updateScrollLabels = () => {};
+dragSettings.ctx.init({ layout: { width_presets: [], height_presets: [] }, appearance: {},
+  behavior: { plain_drag_action: 'reorder' }, gestures: {}, snap_hints: {} });
+dragSettings.ctx.autoSave(0);
+dragSettings.flush();
+assert.equal(dragSettings.saves.at(-1).config.behavior.plain_drag_action, 'reorder');
+
 const shortcuts = commandFixture({ saving: true });
+shortcuts.ctx.configSnapshot.glazewm_compat = { port: 17000 };
+shortcuts.ctx.document.getElementById('glazewm_compat-enabled').checked = true;
 const configuredShortcuts = {
   'Ctrl+Alt+N': 'focus_next', 'Ctrl+Alt+B': 'focus_next',
   'Ctrl+Alt+F21': 'focus_prev', 'Ctrl+Alt+F22': 'focus_prev',
@@ -430,6 +554,7 @@ function savedShortcuts() {
   return shortcuts.saves.at(-1).config.hotkeys;
 }
 let saved = savedShortcuts();
+assert.deepEqual(shortcuts.saves.at(-1).config.glazewm_compat, { enabled: true, port: 17000 });
 for (const [key, command] of Object.entries(configuredShortcuts)) {
   assert.equal(saved[key], command, `Settings save lost ${key} for ${command}`);
 }
@@ -467,11 +592,43 @@ assert.ok(nextRows[1].note.textContent.includes(leftRows[0].label.textContent));
 const previousRows = rowsFor('focus_prev');
 assert.equal(previousRows.length, 2);
 assert.equal(shortcuts.rows[shortcuts.rows.indexOf(previousRows[0]) + 1], previousRows[1]);
-assert.equal(shortcuts.rows[shortcuts.rows.indexOf(previousRows[1]) + 1].dataset.special, 'scroll_modifier');
-const catalogIds = hotkeyCatalog.map(action => action.id);
-assert.equal(shortcuts.rows[shortcuts.rows.indexOf(previousRows[1]) + 2].dataset.cmd,
-  catalogIds[catalogIds.indexOf('focus_prev') + 1]);
+const headers = shortcuts.rows.filter(row => row.className === 'hk-group');
+assert.deepEqual(headers.map(row => row.dataset.category), [...hotkeyCategories.map(category => category.id), 'other']);
+assert.equal(headers.find(row => row.dataset.category === 'focus').label.textContent, '焦点');
+assert.equal(headers.at(-1).label.textContent, '其他');
+let currentCategory;
+for (const row of shortcuts.rows) {
+  if (row.className === 'hk-group') currentCategory = row.dataset.category;
+  else assert.equal(row.dataset.category, currentCategory);
+}
+for (const category of hotkeyCategories) {
+  const header = headers.find(row => row.dataset.category === category.id);
+  const categoryRows = shortcuts.rows.filter(row => row.dataset.category === category.id && row !== header);
+  assert.ok(categoryRows.length);
+  assert.ok(categoryRows.every(row => row.hidden === category.collapsed));
+  assert.equal(header.button['aria-expanded'], String(!category.collapsed));
+}
+const leopardHeader = headers.find(row => row.dataset.category === 'leopardwm');
+assert.equal(shortcuts.rows[shortcuts.rows.indexOf(leopardHeader) + 1].dataset.special, 'scroll_modifier');
+const monitorHeader = headers.find(row => row.dataset.category === 'monitor');
+const monitorRow = rowsFor('focus_monitor_left')[0];
+assert.ok(monitorRow.hidden);
+assert.equal(savedShortcuts()['Ctrl+Alt+Win+,'], 'focus_monitor_left');
+monitorRow.input.value = 'Ctrl+Alt+H';
+shortcuts.ctx.refreshDuplicateWarnings();
+assert.ok(monitorRow.note.textContent.includes(leftRows[0].label.textContent));
+assert.ok(leftRows[0].note.textContent.includes(monitorRow.label.textContent));
+monitorRow.input.value = '';
+assert.ok(savedShortcuts().disabled.includes('focus_monitor_left'));
+monitorHeader.button.emit('click');
+assert.equal(monitorRow.hidden, false);
+assert.equal(monitorHeader.button['aria-expanded'], 'true');
 shortcuts.ctx.loadHotkeysSorted(shortcuts.ctx.DEFAULT_HOTKEYS, 'Ctrl+Alt');
+assert.equal(rowsFor('focus_monitor_left')[0].hidden, false);
+assert.ok(!shortcuts.rows.some(row => row.className === 'hk-group' && row.dataset.category === 'other'));
+const newMonitorHeader = shortcuts.rows.find(row => row.className === 'hk-group' && row.dataset.category === 'monitor');
+newMonitorHeader.button.emit('click');
+assert.equal(rowsFor('focus_monitor_left')[0].hidden, true);
 saved = savedShortcuts();
 assert.deepEqual(saved, { ...shortcuts.ctx.DEFAULT_HOTKEYS, scroll_modifier: 'Ctrl+Alt', disabled: [] });
 shortcuts.ctx.loadHotkeysSorted({}, 'Ctrl+Alt', ['focus_left']);
@@ -517,21 +674,44 @@ assert.equal(recordedBindings['Ctrl+Alt+H'], 'focus_left');
 assert.ok(!Object.hasOwn(recordedBindings, 'Ctrl+Alt+Left'));
 assertChordIgnored('Ctrl+Alt+X');
 
-for (const [code, token, symbol] of [
-  ['Semicolon', 'Semicolon', ';'], ['Quote', 'Apostrophe', "'"],
-  ['Slash', 'Slash', '/'], ['Backslash', 'Backslash', '\\'], ['Backquote', 'Backtick', '`']
+for (const [code, keyCode, token, symbol] of [
+  ['Quote', 0xBD, 'Minus', '-'], ['Minus', 0xBB, 'Equals', '='],
+  ['Equal', 0xBC, 'Comma', ','], ['Comma', 0xBE, 'Period', '.'],
+  ['Period', 0xDB, 'Bracket_Left', '['], ['BracketLeft', 0xDD, 'Bracket_Right', ']'],
+  ['BracketRight', 0xBA, 'Semicolon', ';'], ['Semicolon', 0xBF, 'Slash', '/'],
+  ['Slash', 0xC0, 'Backtick', '`'], ['Backquote', 0xDC, 'Backslash', '\\'],
+  ['Backslash', 0xDE, 'Apostrophe', "'"]
 ]) {
-  recorder.ctx.loadHotkeysSorted({ ['Ctrl+Alt+' + token]: 'focus_left' }, 'Ctrl+Alt');
+  recorder.ctx.loadHotkeysSorted({ ['Ctrl+' + token]: 'focus_left' }, 'Ctrl+Alt');
   const input = recorder.rows.find(row => row.dataset.cmd === 'focus_left').input;
-  const chord = 'Ctrl+Alt+' + symbol;
+  const chord = 'Ctrl+' + symbol;
   assert.equal(input.value, chord, token + ' display');
   input.emit('mousedown', { button: 0 });
-  input.emit('keydown', { code, key: 'non-US symbol', ctrlKey: true, altKey: true, preventDefault() {} });
+  input.emit('keydown', { code, keyCode, key: 'non-US symbol', ctrlKey: true, preventDefault() {} });
   assert.equal(input.value, chord, code + ' recording');
   assert.ok(!input.classList.contains('recording'), code);
   recorder.flush();
   assert.equal(recorder.saves.at(-1).config.hotkeys[chord], 'focus_left', code + ' save');
 }
+
+const azertyInput = recorder.rows.find(row => row.dataset.cmd === 'focus_left').input;
+azertyInput.emit('mousedown', { button: 0 });
+azertyInput.emit('keydown', { code: 'KeyM', keyCode: 0xBC, key: ',', ctrlKey: true, preventDefault() {} });
+assert.equal(azertyInput.value, 'Ctrl+,', 'AZERTY comma recording');
+assert.ok(!azertyInput.classList.contains('recording'));
+recorder.flush();
+assert.equal(recorder.saves.at(-1).config.hotkeys['Ctrl+,'], 'focus_left', 'AZERTY comma save');
+
+const unsupportedInput = recorder.rows.find(row => row.dataset.cmd === 'focus_left').input;
+unsupportedInput.emit('mousedown', { button: 0 });
+const savesBeforeUnsupported = recorder.saves.length;
+const scheduledBeforeUnsupported = recorder.scheduledSaves();
+unsupportedInput.emit('keydown', { code: 'Quote', keyCode: 0xDF, key: 'non-US symbol', ctrlKey: true, altKey: true, preventDefault() {} });
+assert.equal(unsupportedInput.value, '');
+assert.ok(unsupportedInput.classList.contains('recording'));
+assert.equal(recorder.saves.length, savesBeforeUnsupported);
+assert.equal(recorder.scheduledSaves(), scheduledBeforeUnsupported);
+unsupportedInput.emit('blur');
 
 for (const [full, short] of [
   ['Command (detail)', 'Command'], ['Command(detail)', 'Command'],

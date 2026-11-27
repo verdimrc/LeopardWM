@@ -52,23 +52,24 @@ A few deliberate **non-features**, so you know what you're getting:
 
 - **Scroll-first, not multi-layout.** No BSP, no DWindle, no Equal/Stair/UltrawideVerticalStack — and we won't add them. niri (Wayland) and PaperWM (GNOME) stay scrolling-only by choice; the horizontal strip *is* the identity. If you want 9 layout variants, [komorebi](https://github.com/LGUG2Z/komorebi) is the right tool.
 - **No Virtual Desktop bridging.** Per-monitor workspaces don't map cleanly to Windows' global Virtual Desktops, and the only library that bridges them (`winvd`) breaks every 3-6 months on Windows feature updates. Instead, `Win+Ctrl+Arrow` is intercepted and routed to LeopardWM's workspace prev/next so the native muscle memory still works.
-- **Named-pipe IPC, not WebSocket.** Lower latency, no port allocation, no firewall prompts. If browser-based bar integration becomes a real ask, we'll add a thin bridge rather than make the daemon serve sockets directly.
+- **Named-pipe IPC by default.** An optional, local-only GlazeWM-compatible endpoint supports Yasb's stock workspaces widget; it is not a general WebSocket API.
 
 ## Features
 
+- **Multi-row scrolling strips** — configure 1 to 4 independent horizontal scrolling rows per workspace with custom height splits and gaps
 - Multi-monitor workspaces with monitor-aware focus and move (9 workspaces per monitor)
 - Global hotkeys with live config reload
 - **PowerToys Shortcut Guide export** — `lwm query hotkeys` lists effective bindings; `lwm export-shortcut-guide` writes a user manifest (stdout, `--output PATH`, or `--install`)
 - Smooth scroll animations with layout transition effects (vsync-locked)
 - Touchpad gestures with configurable swipe actions
-- Drag-and-drop — drag a window onto a column to merge it in; Shift+drag to reorder columns or move a column to another monitor
+- Drag-and-drop — drag a window onto a column to merge it in; Shift+drag to reorder columns or move a column to another monitor or row. Set `plain_drag_action = "reorder"` under `[behavior]` to swap these gestures.
 - **Tabbed columns** — toggle a column between vertical-stack and tab-strip mode (`Ctrl+Alt+T`); only the active tab fills the column rect, the rest sit in a clickable strip above
 - **Scratchpad** — stash the focused window out of the layout (`Ctrl+Alt+Shift+S`) and summon it back as a floating, centered overlay on demand (`Ctrl+Alt+S`); stash it again to release it back to tiling
 - **Sticky windows** — pin a window (`Ctrl+Alt+Y`) so it follows you across workspaces, keeping its current mode: a tiled window stays tiled (a column you can cycle to), a floating window stays a floating overlay
 - **Overview mode** — `Ctrl+Alt+Space` opens a map of the monitor's non-empty workspaces; click a window card to jump to it, click a row to switch workspace, or navigate with arrows or your configured keyboard `focus_left` / `focus_right` / `focus_up` / `focus_down` bindings while keeping the overview open. Your configured keyboard `move_window_up` / `move_window_down` bindings move the selected window to the previous / next numbered workspace on that monitor, including empty workspaces, without switching workspace or closing the overview; selection follows the moved window. Moves stop at workspace 1 or 9, sticky windows stay put, and `move_window_left` / `move_window_right` do nothing while the overview is open. Enter selects, digits switch workspace, and Esc cancels without undoing moves. Other bound actions and gesture bindings keep their normal behavior.
 - **Per-app window rules** — float, ignore, or tile by class/title/executable, plus per-app open behavior: target workspace, initial column width, open maximized
 - Floating and fullscreen toggles
-- Width and height presets with column equalization, maximize-column, center-column
+- Width and height presets with column equalization, maximize-column, center-column, align-column-left/right, and optional free mouse resizing
 - Active focus border with auto-detected rounded corners
 - System tray with pause, reload, settings, and diagnostics
 - WebView-based settings GUI (Mica backdrop, live theme switching, dark mode)
@@ -165,13 +166,17 @@ Start the daemon:
 
 A default config is created automatically at `%APPDATA%\leopardwm\config\config.toml`. Customize via the tray icon → Settings, or edit the file directly.
 
+By default, resizing a tiled window with the mouse snaps to width and height presets. Set `mouse_resize = "free"` under `[layout]`, or choose Free under Settings → Layout → Mouse resize, to keep the dragged size instead.
+
+By default, partially visible tiled columns can overlap another monitor. Set `offscreen_mode = "park"` under `[layout]`, or choose Park off-screen under Settings → Layout → Off-screen columns, to move columns that would overlap another monitor outside the virtual screen. Oversized columns retain the default behavior.
+
 Set `new_window_monitor = "focused"` under `[behavior]` or choose Settings → Behavior → New window monitor → Focused monitor to open new windows on the focused monitor's active workspace, including an empty workspace. The default, `"opening"`, uses the monitor where Windows opened the window, falling back to the focused monitor when it opens outside all monitors. If no focused monitor is known, `"focused"` uses the opening behavior. A workspace rule selects the workspace index on the policy-selected monitor; sticky windows retain their opening monitor and active-workspace placement. Floating windows moved by this policy are fitted to the chosen monitor's work area before being centered. Changes apply live on config reload or Settings save only to windows that open while LeopardWM is running. Already-open windows discovered at startup or during reload/rescan keep their existing monitor and are added to its active workspace; their floating rectangles are not moved or fitted by this policy. Already-managed windows and startup persistence restores are unchanged.
 
 ## Default Hotkeys
 
 Most hotkeys use `Ctrl+Alt` as the base modifier. Layered pattern: base = focus, +Shift = move, +Win = monitor scope. Every hotkey is rebindable in `config.toml`. Combos Windows reserves (like `Win+Ctrl+Arrow`) can't be bound directly, but the opt-in **Reclaim Windows-reserved shortcuts** setting lets you use them anyway.
 
-Punctuation bindings accept `-`, `=`, `,`, `.`, `[`, `]`, `;`, `/`, `` ` ``, `\`, and `'`, or the word tokens `Minus`, `Equals`, `Comma`, `Period`, `Bracket_Left`, `Bracket_Right`, `Semicolon`, `Slash`, `Backtick`, `Backslash`, and `Apostrophe`. Each punctuation binding matches the Windows virtual key for that symbol on a US English layout. On other keyboard layouts, that key can be in a different place.
+Punctuation bindings accept `-`, `=`, `,`, `.`, `[`, `]`, `;`, `/`, `` ` ``, `\`, and `'`, or the word tokens `Minus`, `Equals`, `Comma`, `Period`, `Bracket_Left`, `Bracket_Right`, `Semicolon`, `Slash`, `Backtick`, `Backslash`, and `Apostrophe`. Each punctuation binding matches the Windows virtual key for that symbol on a US English layout. On other keyboard layouts, that key can be in a different place. The Settings shortcut recorder saves the key you press on any layout, using its US-layout symbol as the saved name.
 
 | Key | Action |
 |---|---|
@@ -180,6 +185,7 @@ Punctuation bindings accept `-`, `=`, `,`, `.`, `[`, `]`, `;`, `/`, `` ` ``, `\`
 | `Ctrl+Alt+Shift+H/L` | Move column left / right |
 | `Ctrl+Alt+Shift+Home` / `End` | Move column to start / end of strip |
 | `Ctrl+Alt+Shift+J/K` | Move window down / up in column |
+| `Ctrl+Alt+Shift+PageUp` / `PageDown` | Move window to prev / next workspace (cycles) |
 | `Ctrl+Alt+[` / `]` | Move window to left / right column |
 | `Ctrl+Alt+Shift+[` / `]` | Expel window to new column left / right |
 | `Ctrl+Alt+,` / `.` | Consume left / right column's window into the focused column |
@@ -207,19 +213,85 @@ Punctuation bindings accept `-`, `=`, `,`, `.`, `[`, `]`, `;`, `/`, `` ` ``, `\`
 | `Ctrl+Alt+Shift+R` | Reload config |
 | `Win+Ctrl+Escape` | Emergency restore + panic-revert |
 
+### Turning off a default hotkey
+
+To turn off a default hotkey in `config.toml`, delete its binding line and list its action ID in `disabled` under `[hotkeys]`. For example, after removing the `close_window` binding:
+
+```toml
+[hotkeys]
+disabled = ["close_window"]
+```
+
+Deleting the line alone is not enough: defaults are merged back on load unless the action is disabled, already bound elsewhere, or its default chord is used by another binding. Alternatively, clear the binding in Settings → Hotkeys, which does both for you.
+
 These commands have no default keyboard binding and are also available in the
 Settings gesture menus:
 
 | Command | Action |
 |---|---|
 | `focus_next` / `focus_prev` | Focus the next / previous window across columns, wrapping at strip ends |
+| `focus_floating` / `focus_tiling` | Focus the remembered floating window / return focus to the tiled layer |
+| `switch_focus_floating_tiling` | Switch focus between the floating and tiled layers |
+| `focus_row_up` / `focus_row_down` | Focus the row above / below |
+| `move_window_to_row_up` / `move_window_to_row_down` | Move the focused window to the row above / below |
 | `scroll_left` / `scroll_right` | Move the strip viewport left / right by 100 px without changing focus |
+| `nudge_left` / `nudge_right` | Move a floating window or shift tiled windows left / right by `move_step` |
+| `align_column_left` / `align_column_right` | Align the focused column to the left / right edge of the screen |
+| `float` / `tile` | Float the focused window if tiled / tile it if floating |
 
 `scroll_up` and `scroll_down` under `[gestures]` default to `focus_next` and
 `focus_prev`. Hold `[hotkeys].scroll_modifier` (Ctrl+Alt by default) while using
-the mouse wheel to run them.
+the mouse wheel to run them. Set `[hotkeys] scroll_modifier = "none"` to turn
+modifier-wheel navigation off, or clear the scroll modifier in Settings. An
+empty or unrecognized config value falls back to Ctrl+Alt. This does not disable
+other wheel gestures or swipes. For small window moves instead, set:
+
+```toml
+[gestures]
+scroll_up = "nudge_left"
+scroll_down = "nudge_right"
+```
 
 > The scratchpad and sticky pins are session-scoped: they are keyed by window handle and reset when the daemon restarts.
+
+## Multi-Row Layout
+
+Multi-row layouts are off by default. Configure 1 to 4 independent horizontal scrolling rows per workspace; each row has its own scroll offset, column widths, and tabbed columns.
+
+**Basics**
+- `focus_row_up` / `focus_row_down` moves focus to the row above / below; these commands are unbound by default and can be bound in Settings or `[hotkeys]`
+- `lwm move-to-row up` / `lwm move-to-row down` (or bind `move_window_to_row_up` / `move_window_to_row_down` in Settings) moves the focused window into a new column immediately after the destination row's focused column, or the first column if the row is empty
+- Tiled vertical focus (`Ctrl+Alt+J` / `Ctrl+Alt+K`) crosses rows at column edges regardless of `move_window_across_rows`; setting it to `true` (default `false`) also lets `Ctrl+Alt+Shift+J` / `Ctrl+Alt+Shift+K` move windows across rows at column edges
+- Window rules can open tiled windows in a specific row using `row = 1` (1-based). Values past the workspace's row count select its last row; `row = 0` and the `row` setting on rules with `action = "float"` are ignored
+
+**Configuration**
+
+```toml
+[layout.rows]
+split = ["100%"]        # fallback for workspaces without an override; one row by default
+gap = 8                 # vertical gap between rows in pixels (scaled per-monitor with DPI)
+
+# Configure rows per workspace (1 to 4 rows: fractions like "1/2", "1/3", or weights like "1", "2").
+# Workspaces without an explicit entry use [layout.rows].split.
+[[layout.rows.workspaces]]
+workspaces = [1, 2]     # 1 or more workspaces (1-9)
+split = ["1/2", "1/2"]  # 2 equal rows
+
+[[layout.rows.workspaces]]
+workspace = 3           # single workspace
+split = ["1/3", "1/3", "1/3"]  # 3 rows
+
+[behavior]
+move_window_across_rows = true  # allow move_window_up/down to cross row boundaries (default false)
+
+[hotkeys]
+"Ctrl+Alt+PageUp" = "focus_row_up"       # optional example bindings
+"Ctrl+Alt+PageDown" = "focus_row_down"
+
+[[window_rules]]
+match_executable = "slack.exe"
+row = 2                 # 1-based row index (1 = top row)
+```
 
 ## Tabbed columns
 
@@ -260,7 +332,7 @@ LeopardWM ships two interchangeable CLI binaries — both invoke the same code:
 | `leopardwm-cli` | Canonical name. Use in docs, scripts, and shared examples. |
 | `lwm` | Short alias for daily typing. |
 
-Examples below use whichever is shorter for the line.
+Examples below use whichever is shorter for the line. See the [CLI command reference](docs/cli.md) for every command and its options.
 
 ### Daemon lifecycle
 
@@ -275,9 +347,9 @@ Matching versions (Recommended): use the CLI and daemon from the same release. C
 ### Query state
 
 ```bash
-lwm query workspace    # current workspace placements as JSON
+lwm query workspace    # current workspace layout summary
 lwm query focused      # focused window info
-lwm query all-windows  # every managed window across all workspaces
+lwm query all          # every managed window across all workspaces
 lwm query hotkeys      # effective bindings plus config diagnostics
 ```
 
@@ -327,22 +399,30 @@ To edit or add a catalog, see [Translating LeopardWM](CONTRIBUTING.md#translatin
 
 ### Layout options
 
-Enable **Settings → Layout → Center single column**, or set `center_single_column = true` under `[layout]`, to center the only active tiled column when it fits within the viewport’s outer gaps. It is off by default and applies with every `centering_mode` (`center`, `just_in_view`, or `on_overflow`), independently of `center_past_edges`. Minimized-only columns and floating windows do not count; wider columns keep the normal scrolling behavior.
+**Settings → Layout → Center columns**, or `[layout] center_columns`, chooses `"off"` (default), `"single"` (center the only active column when it fits), or `"fit"` (center each row's active columns together while they fit). This applies with every `centering_mode` and `center_past_edges` setting; minimized-only columns and floating windows do not count. In fit mode, aligning left or right temporarily releases centering until the row layout changes. The legacy `center_single_column` key is still read, but `center_columns` takes precedence when both are present.
 
 **Taskbar buttons** — Settings → Behavior → Taskbar buttons, or `taskbar_buttons` under `[behavior]`, offers `"hide_offscreen"` (default, hide buttons on inactive workspaces and for tiled windows scrolled out of view), `"hide_inactive_workspaces"` (keep every button on each monitor's active workspace, even when scrolled out of view), and `"show_all"`. Floating and minimized windows keep their buttons on the active workspace; inactive workspaces hide all buttons unless `"show_all"` is selected. Sticky windows follow the active workspace. Changes apply on config reload without changing window placement. Existing `hide_offscreen_taskbar_buttons = true` / `false` maps to `"hide_offscreen"` / `"show_all"`; when both keys are present, `taskbar_buttons` wins. Settings saves only the new key.
 
 ### Layout commands
 
-Most users drive the layout via hotkeys, but every hotkey has a CLI equivalent — useful for scripting or AutoHotkey integration.
+Most users drive the layout via hotkeys, but many commands are also available through the CLI for scripting or AutoHotkey integration. With a floating window focused, move commands nudge it within the monitor work area by `[behavior] move_step` logical pixels (default 50, range 1–1000); width and height presets size it against that work area, and center centers it there. Keyboard or wheel nudge commands use the same step to move floating windows or shift tiled windows.
 
 ```bash
 lwm focus left | right | up | down
+lwm focus-floating                     # focus the remembered floating window
+lwm focus-tiling                       # return focus to the tiled layer
+lwm switch-focus-floating-tiling       # switch between floating and tiled layers
+lwm focus-row up | down | 1..4         # focus adjacent row or select a row
 lwm cycle-width                       # next width preset, wrapping at the end
 lwm cycle-height                      # next height preset, wrapping at the end
 lwm move left | right                  # move focused column
 lwm move-window up | down              # reorder within a column
+lwm nudge-left | nudge-right           # shift windows by move_step
+lwm move-to-row up | down              # move window to row above / below
 lwm workspace 3                        # switch to workspace 3
 lwm toggle-floating
+lwm float                              # float the focused window if tiled
+lwm tile                               # tile the focused window if floating
 lwm toggle-fullscreen
 lwm scratchpad-stash                   # stash focused window (or release the scratchpad)
 lwm scratchpad-toggle                  # summon / hide the scratchpad
@@ -356,9 +436,15 @@ Set `floating_above_tiled = true` under `[behavior]` or enable **Settings → Be
 
 Disabling the option simply stops re-raising. There is no daemon-owned Z-order state to restore on disable, ignore, release, or shutdown.
 
-Set `skip_empty_workspaces = true` under `[behavior]` or enable **Settings → Behavior → Skip empty workspaces** (off by default) to skip empty slots on the same monitor. This applies to `workspace_next` / `workspace_prev` and to `focus_down` / `focus_up` when `workspace_edge_wrap` switches workspaces, wrapping 1 ↔ 9. If no other occupied workspace exists, they do nothing.
+Set `focus_crosses_monitors = true` or `move_crosses_monitors = true` under `[behavior]`, or enable the corresponding Settings toggles, to focus the neighboring monitor or move the focused column there when a tiled horizontal command reaches the strip edge. Both default to false; floating focus is unchanged. `lwm move-to-monitor` and the `move_to_monitor_*` hotkeys still move one window. These horizontal options are independent of `workspace_edge_wrap`, which only affects vertical navigation and moves.
 
-Tiled, floating, and minimized managed windows count as occupancy; sticky windows do not. Explicit numbered selection, all move-to-workspace commands (including edge-wrap moves), overview, and horizontal focus are unchanged. Closing or moving away the last window does not automatically switch workspaces.
+Set `workspace_edge_wrap` under `[behavior]` or in Settings to `"off"` (default) to leave edge focus and moves on the current workspace, `"wrap"` to switch or move to the adjacent workspace and wrap between 1 and 9, or `"clamp"` to stop at workspace 1 and 9. Legacy `true` and `false` still mean `"wrap"` and `"off"` respectively.
+
+Set `skip_empty_workspaces = true` under `[behavior]` or enable **Settings → Behavior → Skip empty workspaces** (off by default) to skip empty slots on the same monitor. This applies to `workspace_next` / `workspace_prev`, which always wrap, and to `focus_down` / `focus_up` when `workspace_edge_wrap` switches workspaces. With clamp, focus stops at the first or last occupied workspace; if no other occupied workspace is reachable, it does nothing.
+
+Tiled, floating, and minimized managed windows count as occupancy; sticky windows do not. Explicit numbered selection, all move-to-workspace commands (including edge-wrap moves), overview, and horizontal focus are unchanged. Closing the last window does not automatically switch workspaces. Moving it away switches only when following moved windows is enabled.
+
+Set `follow_window_to_workspace = true` under `[behavior]` or enable **Settings → Behavior → Follow moved windows** (off by default) to switch to the destination and keep focus on a window moved to another workspace. This also applies to moves at a workspace edge, but not overview drag.
 
 `cycle_width` and `cycle_height` are unbound by default; assign each a shortcut in Settings or `[hotkeys]`. Height cycling applies only to vertically stacked multi-window columns.
 
@@ -413,21 +499,17 @@ legacy event set (`workspace_changed`, `focused_window_changed`, `layout_changed
 `config_reloaded`, `heartbeat`); complete workspace snapshots require explicit
 `--events workspace_state` opt-in and acknowledgement (IPC v4). Targeted workspace commands
 use 1-based indices and transfer focus to the named monitor; snapshot indices are
-0-based. Full schemas and sample clients are in `agent_docs/ipc-events.md`.
+0-based. See the [bar integration guide](docs/yasb.md#any-bar) and [full event schemas](agent_docs/ipc-events.md).
 
 ### Yasb workspace buttons
 
-Show all nine workspaces on a selected monitor and switch by clicking a button in
-[Yasb](https://github.com/amnweb/yasb), using its built-in Custom widget and the
-existing CLI. See the [complete Yasb configuration and styling recipe](docs/yasb.md).
-It includes active/occupied indicators and workspace-name tooltips; updates are
-polled every five seconds rather than streamed. No plugin or IPC change is required.
+Enable **GlazeWM compatibility** in Settings or set `enabled = true` under `[glazewm_compat]` in the config, then add Yasb's stock `glazewm.workspaces.GlazewmWorkspacesWidget`. It uses `ws://localhost:6123` by default and updates as workspaces change. If GlazeWM already holds that port, LeopardWM continues without the endpoint; if LeopardWM holds it, GlazeWM cannot start. See the [Yasb setup and styling guide](docs/yasb.md) for port configuration and the alternative CLI-based Custom widget.
 
 ### Troubleshooting
 
 ```bash
-lwm doctor             # diagnostic checks (config valid, daemon reachable, hotkey conflicts, etc.)
-lwm collect-logs       # bundles logs + crash reports into a zip for bug reports
+lwm doctor             # checks config, daemon reachability, integrity and log status
+lwm collect-logs       # writes a redacted snapshot under %LOCALAPPDATA%\leopardwm\diagnostics\ and prints its path
 lwm reload             # reload config from disk without restarting
 lwm refresh            # re-enumerate windows after weird state
 lwm panic-revert       # emergency: uncloak everything, drop daemon out of management
@@ -513,14 +595,17 @@ Failed physical gestures are diagnosed with an opt-in, short capture — not by 
 
 `track_focus_changes` under `[behavior]` synchronizes managed focus with Windows focus changes such as Alt-Tab. It defaults to `true`; changes to focus tracking hooks take effect the next time LeopardWM starts, not on config reload or Settings save.
 
+With `[behavior] focus_follows_mouse = true`, set `focus_lock_modifier` to `"Ctrl"`, `"Alt"`, `"Shift"`, `"Win"`, or `"F13"` through `"F24"` to hold that key while moving the mouse without changing focus. The default is `"none"`. Releasing the key does not change focus until the next mouse enter. When Alt or Win blocks a focus change, LeopardWM masks the key while it is held to avoid opening an app menu or Start. If an F-key is also a hotkey's trigger, that hotkey can prevent the lock from engaging; LeopardWM warns about this configuration.
+
 > **Note:** Crate names and on-disk paths still use `leopardwm` internally. A full crate rename is future work.
 
 | Item | Path |
 |---|---|
 | Config | `%APPDATA%\leopardwm\config\config.toml` |
 | State | `%APPDATA%\leopardwm\data\workspace-state.json` |
-| Log (stdout) | `%TEMP%\leopardwm-daemon.log` |
-| Log (stderr) | `%TEMP%\leopardwm-daemon.err.log` |
+| Daemon log | `%LOCALAPPDATA%\leopardwm\logs\leopardwm-daemon.log` (previous: `leopardwm-daemon.old.log`) |
+| Daemon error log | `%LOCALAPPDATA%\leopardwm\logs\leopardwm-daemon.err.log` |
+| Watchdog log | `%LOCALAPPDATA%\leopardwm\logs\leopardwm-watchdog.log` (previous: `leopardwm-watchdog.old.log`) |
 | Gesture capture | `%LOCALAPPDATA%\leopardwm\logs\leopardwm-gesture-capture.log` |
 
 ## Architecture
@@ -573,6 +658,32 @@ These processes are ignored via built-in window rules (action = `ignore`):
 | `CredentialUIBroker.exe` | Windows credential/login prompt |
 | `SnippingTool.exe` | Screen capture overlay |
 
+### Built-in floating rules
+
+| Executable | Title regex | Why |
+|---|---|---|
+| `Audacity.exe` | `^Importing` | Import progress popup |
+
+A user rule matching the same window overrides the built-in rule.
+
+### Fixed-size caption windows
+
+Windows with a title bar and minimize button but no resize frame or maximize button open floating at their own size and position by default. Set `[behavior] fixed_size_windows = "tile"` to tile them instead, or use `"float"` for the default. Any matching window rule overrides this setting; an `action = "tile"` rule keeps a particular window tiled. A rule without an `action`, for example one specifying only `open_on_workspace` or `column_width`, also tiles the window. Dialog-like windows without minimize or maximize buttons remain unmanaged unless a rule matches.
+
+## Floating Window Rule Position
+
+Floating window rules can specify `x` and `y` as integer offsets in 96-DPI logical pixels from the top-left of the work area on the monitor where the window opens. The monitor is chosen by normal admission, including `new_window_monitor`; no rule-specific monitor selector is needed. The offsets scale with that monitor's DPI. An unset axis keeps the window's own position before clamping.
+
+```toml
+[[window_rules]]
+match_class = "ExampleClass"
+action = "float"
+x = 100
+y = 50
+```
+
+When either offset is set, both axes are clamped inside the work area. A window larger than the area on an axis is aligned to that area's start on that axis. Rules with neither `x` nor `y` retain their existing placement behavior. These fields apply only to floating rules and are config-only; Settings preserves them when saving rules.
+
 ## Size Conditions for Window Rules
 
 Small helpers can share an app's class, title, and executable with its main window. For example, ignore QQ NT helpers with an app-specific size rule:
@@ -601,7 +712,9 @@ match_class = "MozillaDialogClass"
 corner_style = "square"  # also: "rounded" | "small_rounded"
 ```
 
-The `MozillaDialogClass` → `square` rule ships in the default config as a working example. Open **Settings → Window rules**, then use a rule’s **Options** menu to edit corners (`Auto` / `Square` / `Rounded` / `Small rounded`), placement, or its initial **Column width**. Column width is a viewport fraction from `0.05` to `1.0`; leave it blank for the default width.
+You can also set `border = false` to hide the focus border for a matching window, or `border_color = "RRGGBB"` to replace the global border color. `border = true` is the same as leaving it out and does not enable a globally disabled border; any matching rule with `border = false` hides the border. For `border_color` and `corner_style`, the first matching rule that sets the field wins. Windows high contrast overrides both global and rule colors with the system highlight color.
+
+The `MozillaDialogClass` → `square` rule ships in the default config as a working example. Open **Settings → Window rules**, then use a rule’s **Options** menu to edit corners (`Auto` / `Square` / `Rounded` / `Small rounded`), **Border** visibility, **Border color**, placement, or its initial **Column width**. Column width is a viewport fraction from `0.05` to `1.0`; leave it blank for the default width.
 
 ## Support
 

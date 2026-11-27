@@ -19,12 +19,21 @@ pub(crate) enum DragPreviewMode {
     SafeBand,
 }
 
+#[derive(Clone)]
 pub(crate) struct DragState {
     pub(crate) hwnd: u64,
     pub(crate) is_tiled: bool,
+    pub(crate) float_on_drop: bool,
+    pub(crate) start_visible_rect: Option<Rect>,
     pub(crate) source_monitor: MonitorId,
     pub(crate) source_workspace_idx: usize,
+    /// Original row index at drag start.
+    pub(crate) source_row: usize,
+    /// Original slot within the source column at drag start.
     pub(crate) source_window_slot: usize,
+    /// Current row index (initialized to source, changes as cursor crosses rows).
+    pub(crate) current_row_index: usize,
+    /// Current column index (initialized to source, changes as we live-reorder during drag).
     pub(crate) current_column_index: usize,
     pub(crate) last_drop_target: Option<DropTarget>,
     pub(crate) last_hint_update: Option<std::time::Instant>,
@@ -44,11 +53,15 @@ pub(crate) struct DragState {
     /// source column by membership instead of trusting `current_column_index`
     /// verbatim — mirrors `MoveOrigin.sibling`.
     pub(crate) source_column_peers: Vec<u64>,
+    /// Column width of the dragged window at drag start, used to preserve
+    /// column width when moving across rows or creating new columns.
+    pub(crate) source_column_width: Option<i32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DropTarget {
     pub(crate) monitor: MonitorId,
+    pub(crate) target_row: usize,
     pub(crate) insert_index: usize,
     /// For window-merge mode: insertion position within the target column.
     pub(crate) window_slot: Option<usize>,
@@ -65,6 +78,8 @@ pub(crate) struct ScratchpadState {
     pub(crate) shown: bool,
     pub(crate) saved_rect: Option<Rect>,
     pub(crate) frame_insets: Option<(i32, i32, i32, i32)>,
+    /// Row index the window occupied before being stashed.
+    pub(crate) origin_row: usize,
     /// Column index the window occupied before being stashed. Used as the
     /// fallback insert position when the original column no longer exists.
     pub(crate) origin_column: usize,
@@ -82,6 +97,8 @@ pub(crate) struct ScratchpadState {
 pub(crate) struct MoveOrigin {
     pub(crate) monitor: MonitorId,
     pub(crate) ws_idx: usize,
+    /// Row index occupied before the move.
+    pub(crate) row: usize,
     /// Column index occupied before the move; the clamped fallback position.
     pub(crate) column: usize,
     /// A window that shared the original column, if any. On return the window
@@ -159,6 +176,8 @@ pub(crate) const CROSSFADE_BARRIER_MAX_AGE: Duration = Duration::from_secs(2);
 pub(crate) const TRANSIENT_WINDOW_THRESHOLD: Duration = Duration::from_secs(30);
 /// How long transient window HWNDs stay in the suppression list before expiring.
 pub(crate) const RECENTLY_HIDDEN_TTL: Duration = Duration::from_secs(300);
+// Startup cloaks are brief; older records can be revealed by a desktop switch.
+pub(crate) const SHELL_CLOAK_RETRY_TTL: Duration = Duration::from_secs(10);
 /// Keep restore placement exemptions brief to avoid affecting unrelated follows.
 pub(crate) const RECENTLY_RESTORED_MANAGED_WINDOW_TTL: Duration = Duration::from_millis(1500);
 
@@ -429,6 +448,7 @@ impl LayoutTransition {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct StashedMonitorLayout {
     pub(crate) workspaces: Vec<Workspace>,
     pub(crate) active_workspace: usize,
@@ -468,6 +488,7 @@ pub(crate) struct AppState {
     /// WinEventHook deliveries that race past the post-animation focus re-sync.
     pub(crate) layout_last_completed_at: Option<std::time::Instant>,
     pub(crate) previous_focused_hwnd: Option<u64>,
+    pub(crate) focus_follows_mouse_generation: u64,
     /// Suppresses delayed focus notifications for the exact window left by a
     /// successful workspace switch whose destination has no visible focus.
     pub(crate) pending_workspace_switch_focus: Option<PendingWorkspaceSwitchFocus>,
@@ -501,6 +522,10 @@ pub(crate) struct AppState {
     #[cfg(test)]
     pub(crate) last_border_show_hwnd: AtomicU64,
     #[cfg(test)]
+    pub(crate) last_border_decision: std::sync::Mutex<Option<crate::ui_sync::BorderDecision>>,
+    #[cfg(test)]
+    pub(crate) injected_high_contrast: Option<bool>,
+    #[cfg(test)]
     pub(crate) resize_complete_count: AtomicUsize,
     #[cfg(test)]
     pub(crate) tab_strip_hide_count: AtomicUsize,
@@ -508,13 +533,13 @@ pub(crate) struct AppState {
     pub(crate) tab_strip_update_count: AtomicUsize,
     pub(crate) tab_icon_cache: std::collections::HashMap<u64, Option<isize>>,
     /// Tab strip overlays — one per tabbed column across all visible
-    /// workspaces. Keyed by `(monitor, workspace_idx, column_idx)`.
+    /// workspaces. Keyed by `(monitor, workspace_idx, row_idx, column_idx)`.
     /// `helpers.rs::update_tab_strip` reconciles this map against the
     /// current set of tabbed columns on every relayout / focus change:
     /// new tabbed columns get a fresh overlay, columns that became
     /// non-tabbed (or disappeared) have their overlay dropped.
     pub(crate) tab_strip_overlays: std::collections::HashMap<
-        (isize, usize, usize),
+        (isize, usize, usize, usize),
         leopardwm_platform_win32::tab_strip::TabStripOverlay,
     >,
     /// Shared action sender for lazily created tab strips, installed by
@@ -587,6 +612,7 @@ pub(crate) struct AppState {
     pub(crate) deferred_moved_or_resized: HashSet<u64>,
     pub(crate) deferred_physical_landings: HashSet<u64>,
     pub(crate) size_ignored_windows: HashSet<u64>,
+    pub(crate) shell_cloaked_at_admission: HashMap<u64, std::time::Instant>,
     pub(crate) window_move_recheck_attempts: HashMap<u64, WindowMoveRecheckAttempt>,
     /// Last-placed layout rect per managed window (in layout coordinates, the
     /// rect the layout engine asked for — not the OS-level window rect with
@@ -624,6 +650,12 @@ pub(crate) struct AppState {
     pub(crate) pending_layout_apply_timeout_report: Option<LayoutApplyTimeoutReport>,
     pub(crate) native_swipes: NativeSwipeStatus,
     pub(crate) daemon_log: Option<crate::daemon_log::LogHealth>,
+    pub(crate) config_warnings: Vec<crate::config::ConfigWarning>,
+    pub(crate) settings_failed_binds: Vec<String>,
+    pub(crate) keyboard_hook_unavailable: bool,
+    pub(crate) watchdog_restarts: usize,
+    pub(crate) available_update: Option<String>,
+    pub(crate) settings_health_dirty: bool,
     pub(crate) start_time: std::time::Instant,
     /// HWNDs hidden while managed only briefly, used to suppress re-creation of
     /// Electron popup windows that show and hide the same HWND. The stored token
@@ -792,6 +824,10 @@ pub(crate) struct AppState {
     #[cfg(test)]
     pub(crate) injected_manage_block: HashMap<u64, leopardwm_platform_win32::ManageBlock>,
     #[cfg(test)]
+    pub(crate) injected_shell_cloaked_hwnds: HashSet<u64>,
+    #[cfg(test)]
+    pub(crate) injected_off_current_desktop_hwnds: HashSet<u64>,
+    #[cfg(test)]
     pub(crate) injected_enumerated_windows: Option<Vec<leopardwm_platform_win32::WindowInfo>>,
     #[cfg(test)]
     pub(crate) injected_native_restore_error: Option<String>,
@@ -921,13 +957,13 @@ pub(crate) enum LastWindowDepartureOrigin {
 /// Evidence that the focused monitor's selected workspace lost its tracked
 /// focus because the window departed or was minimized.
 ///
-/// An exact replacement HWND is attributable auto-activation while this guard
-/// is fresh. Direct Destroyed/Hidden and EventlessPrune suppress only Focused
-/// events no later than the arm tick. A real Minimized event uses its OS event
-/// time and accepts Focused handoff events through 500 ms after that tick;
-/// reconciliation-sourced Minimized calls use handler time. If the departing
-/// window still appears live or pruning is throttled, follow-focus cannot
-/// attribute the sequence.
+/// A Focused event for the exact replacement HWND is attributable auto-activation
+/// while this guard is fresh and through 500 ms after the arm tick. Direct
+/// Destroyed/Hidden inference requires an event no later than the arm tick.
+/// A real Minimized event uses its OS event time and accepts handoff events
+/// through 500 ms after that tick; reconciliation-sourced Minimized calls use
+/// handler time. If the departing window still appears live or pruning is
+/// throttled, follow-focus cannot attribute the sequence.
 ///
 /// A prune reached from `Focused(X, t)` stamps `t`. It samples a replacement
 /// only when the tracked focus HWND was stale and was removed from the
@@ -972,6 +1008,7 @@ impl PendingLastWindowDeparture {
 pub(crate) struct PendingTabFocus {
     pub(crate) monitor: MonitorId,
     pub(crate) workspace_idx: usize,
+    pub(crate) row_idx: usize,
     pub(crate) column_idx: usize,
     pub(crate) tab_idx: usize,
     pub(crate) set_at: std::time::Instant,
@@ -1009,6 +1046,8 @@ pub(crate) struct StateSnapshot {
     /// empty so older snapshots without this field load cleanly.
     #[serde(default)]
     pub(crate) tab_title_overrides: HashMap<u64, String>,
+    #[serde(default)]
+    pub(crate) stashed_monitor_layouts: HashMap<String, StashedMonitorLayout>,
 }
 
 impl AppState {
@@ -1047,9 +1086,9 @@ impl AppState {
                 params.outer_gap_top,
                 params.outer_gap_bottom,
             );
-            workspace.set_default_column_width(params.default_column_width);
-            workspace.set_tab_strip_reserve_px(params.tab_strip_reserve_px);
+            params.apply_to(&mut workspace, 0);
             config.apply_monitor_rules(&monitor.device_name, &mut workspace);
+            workspace.set_center_columns(config.center_columns_for(&monitor.device_name).into());
             workspace.set_reduce_motion(initial_reduce_motion);
             workspace
                 .set_scroll_animation(config.animation.scroll_duration_ms, config.animation.easing);
@@ -1088,6 +1127,7 @@ impl AppState {
             pending_suppress_landing_focus_resync: false,
             layout_last_completed_at: None,
             previous_focused_hwnd: None,
+            focus_follows_mouse_generation: 0,
             pending_workspace_switch_focus: None,
             pending_last_window_departure: None,
             recently_restored_managed_windows: HashMap::new(),
@@ -1107,6 +1147,10 @@ impl AppState {
             border_show_count: AtomicUsize::new(0),
             #[cfg(test)]
             last_border_show_hwnd: AtomicU64::new(0),
+            #[cfg(test)]
+            last_border_decision: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            injected_high_contrast: None,
             #[cfg(test)]
             resize_complete_count: AtomicUsize::new(0),
             #[cfg(test)]
@@ -1146,6 +1190,7 @@ impl AppState {
             deferred_moved_or_resized: HashSet::new(),
             deferred_physical_landings: HashSet::new(),
             size_ignored_windows: HashSet::new(),
+            shell_cloaked_at_admission: HashMap::new(),
             window_move_recheck_attempts: HashMap::new(),
             last_placed_layout_rects: HashMap::new(),
             last_physical_presentations: HashMap::new(),
@@ -1169,6 +1214,12 @@ impl AppState {
             pending_layout_apply_timeout_report: None,
             native_swipes: NativeSwipeStatus::Off,
             daemon_log: None,
+            config_warnings: Vec::new(),
+            settings_failed_binds: Vec::new(),
+            keyboard_hook_unavailable: false,
+            watchdog_restarts: 0,
+            available_update: None,
+            settings_health_dirty: false,
             start_time: std::time::Instant::now(),
             recently_hidden_hwnds: HashMap::new(),
             pending_edit_config_pull: None,
@@ -1234,6 +1285,10 @@ impl AppState {
             injected_identity_read_count: AtomicUsize::new(0),
             #[cfg(test)]
             injected_manage_block: HashMap::new(),
+            #[cfg(test)]
+            injected_shell_cloaked_hwnds: HashSet::new(),
+            #[cfg(test)]
+            injected_off_current_desktop_hwnds: HashSet::new(),
             #[cfg(test)]
             injected_enumerated_windows: None,
             #[cfg(test)]
@@ -1393,30 +1448,35 @@ impl AppState {
             .get(&self.focused_monitor)
             .and_then(|list| list.get(ws_idx))
         {
-            ws.focused_column_index().hash(&mut hasher);
-            ws.columns().len().hash(&mut hasher);
-            for col in ws.columns() {
-                ws.effective_column_width(col).hash(&mut hasher);
-                col.windows().len().hash(&mut hasher);
-                for &w in col.windows() {
-                    w.hash(&mut hasher);
-                }
-                // Include height weights so vertical-split changes
-                // (cycle-height, equalize-heights, resize) emit a fresh
-                // LayoutChanged. Hash the bit pattern; weights are f64
-                // so plain Hash isn't implemented.
-                for w in col.height_weights() {
-                    w.to_bits().hash(&mut hasher);
-                }
-                // Fold the column's display mode + active tab into the
-                // signature so tab switches (Tabbed -> different active_idx)
-                // and toggling Vertical<->Tabbed produce a fresh
-                // `LayoutChanged` event for IPC subscribers.
-                match col.mode() {
-                    leopardwm_core_layout::ColumnMode::Vertical => 0u8.hash(&mut hasher),
-                    leopardwm_core_layout::ColumnMode::Tabbed { active_idx } => {
-                        1u8.hash(&mut hasher);
-                        active_idx.hash(&mut hasher);
+            ws.focused_row().hash(&mut hasher);
+            ws.rows().len().hash(&mut hasher);
+            for (row_idx, row) in ws.rows().iter().enumerate() {
+                row_idx.hash(&mut hasher);
+                row.focused_column().hash(&mut hasher);
+                row.columns().len().hash(&mut hasher);
+                for col in row.columns() {
+                    ws.effective_column_width(col).hash(&mut hasher);
+                    col.windows().len().hash(&mut hasher);
+                    for &w in col.windows() {
+                        w.hash(&mut hasher);
+                    }
+                    // Include height weights so vertical-split changes
+                    // (cycle-height, equalize-heights, resize) emit a fresh
+                    // LayoutChanged. Hash the bit pattern; weights are f64
+                    // so plain Hash isn't implemented.
+                    for w in col.height_weights() {
+                        w.to_bits().hash(&mut hasher);
+                    }
+                    // Fold the column's display mode + active tab into the
+                    // signature so tab switches (Tabbed -> different active_idx)
+                    // and toggling Vertical<->Tabbed produce a fresh
+                    // `LayoutChanged` event for IPC subscribers.
+                    match col.mode() {
+                        leopardwm_core_layout::ColumnMode::Vertical => 0u8.hash(&mut hasher),
+                        leopardwm_core_layout::ColumnMode::Tabbed { active_idx } => {
+                            1u8.hash(&mut hasher);
+                            active_idx.hash(&mut hasher);
+                        }
                     }
                 }
             }
@@ -1424,6 +1484,48 @@ impl AppState {
         hasher.finish()
     }
 
+    /// Build the row summary list for a `LayoutChanged` event or `WorkspaceState` query payload.
+    pub(crate) fn focused_layout_rows(&self) -> Vec<leopardwm_ipc::RowSummary> {
+        let ws_idx = self.active_workspace_idx(self.focused_monitor);
+        self.workspaces
+            .get(&self.focused_monitor)
+            .and_then(|list| list.get(ws_idx))
+            .map(|ws| {
+                ws.rows()
+                    .iter()
+                    .map(|row| leopardwm_ipc::RowSummary {
+                        focused_column: if row.is_empty() {
+                            None
+                        } else {
+                            Some(row.focused_column())
+                        },
+                        scroll_offset: row.scroll_offset(),
+                        columns: row
+                            .columns()
+                            .iter()
+                            .map(|col| leopardwm_ipc::ColumnSummary {
+                                window_ids: col.windows().to_vec(),
+                                width_px: ws.effective_column_width(col),
+                                height_weights: col.height_weights().to_vec(),
+                                mode: match col.mode() {
+                                    leopardwm_core_layout::ColumnMode::Vertical => {
+                                        leopardwm_ipc::ColumnSummaryMode::Vertical
+                                    }
+                                    leopardwm_core_layout::ColumnMode::Tabbed { active_idx } => {
+                                        leopardwm_ipc::ColumnSummaryMode::Tabbed {
+                                            active_idx: *active_idx,
+                                        }
+                                    }
+                                },
+                            })
+                            .collect(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Build the column summary list for a `LayoutChanged` event payload.
     pub(crate) fn focused_layout_columns(&self) -> Vec<leopardwm_ipc::ColumnSummary> {
         let ws_idx = self.active_workspace_idx(self.focused_monitor);
         self.workspaces
@@ -1472,6 +1574,7 @@ impl AppState {
         &self,
         monitor: MonitorId,
         workspace_idx: usize,
+        row_idx: usize,
         column_idx: usize,
         tab_idx: usize,
     ) -> String {
@@ -1479,7 +1582,7 @@ impl AppState {
             .workspaces
             .get(&monitor)
             .and_then(|wss| wss.get(workspace_idx))
-            .and_then(|ws| ws.column(column_idx))
+            .and_then(|ws| ws.column_for_row(row_idx, column_idx))
             .and_then(|col| col.get(tab_idx));
         match hwnd {
             Some(h) => self
@@ -1555,14 +1658,14 @@ impl AppState {
         if pending.monitor != monitor || pending.workspace_idx != workspace_idx {
             return false;
         }
-        // Verify the event's hwnd matches the expected (column, tab) in
+        // Verify the event's hwnd matches the expected (row, column, tab) in
         // the workspace state. If it doesn't, leave the flag in place so a
         // later matching event can still consume it.
         let matches = self
             .workspaces
             .get(&monitor)
             .and_then(|list| list.get(workspace_idx))
-            .and_then(|ws| ws.column(pending.column_idx))
+            .and_then(|ws| ws.column_for_row(pending.row_idx, pending.column_idx))
             .and_then(|col| col.get(pending.tab_idx))
             .is_some_and(|w| w == hwnd);
         if matches {
@@ -1601,6 +1704,7 @@ impl AppState {
         let config = &self.config;
         let ws_vec = self.workspaces.get_mut(&monitor_id)?;
         while ws_vec.len() <= idx {
+            let cur_idx = ws_vec.len();
             let mut ws = Workspace::with_directional_gaps(
                 params.gap,
                 params.outer_gap_left,
@@ -1608,9 +1712,9 @@ impl AppState {
                 params.outer_gap_top,
                 params.outer_gap_bottom,
             );
-            ws.set_default_column_width(params.default_column_width);
-            ws.set_tab_strip_reserve_px(params.tab_strip_reserve_px);
+            params.apply_to(&mut ws, cur_idx);
             config.apply_monitor_rules(device_name, &mut ws);
+            ws.set_center_columns(config.center_columns_for(device_name).into());
             ws.set_reduce_motion(self.reduce_motion);
             ws.set_scroll_animation(config.animation.scroll_duration_ms, config.animation.easing);
             ws_vec.push(ws);

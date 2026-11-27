@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender, SyncSender};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{LazyLock, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 use windows::core::BOOL;
 use windows::Win32::Foundation::{GetLastError, SetLastError, HWND, RECT, WIN32_ERROR};
@@ -70,6 +70,112 @@ fn is_border_color_unsupported_hresult(code: windows::core::HRESULT) -> bool {
     const E_INVALIDARG_HRESULT: i32 = 0x8007_0057u32 as i32;
     const E_NOTIMPL_HRESULT: i32 = 0x8000_4001u32 as i32;
     code.0 == E_INVALIDARG_HRESULT || code.0 == E_NOTIMPL_HRESULT
+}
+
+struct FrameRefresh {
+    identity: WindowIdentity,
+    generation: u64,
+}
+
+impl FrameRefresh {
+    fn matches_window(&self, window_id: WindowId) -> bool {
+        window_id_to_hwnd(window_id).is_ok_and(|hwnd| window_identity_matches(hwnd, self.identity))
+    }
+}
+
+static FRAME_REFRESHES: LazyLock<Mutex<HashMap<WindowId, FrameRefresh>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static NEXT_FRAME_REFRESH: AtomicU64 = AtomicU64::new(1);
+
+fn lock_frame_refreshes() -> MutexGuard<'static, HashMap<WindowId, FrameRefresh>> {
+    FRAME_REFRESHES
+        .lock()
+        .unwrap_or_else(crate::recover_poisoned_mutex)
+}
+
+/// Discard a departing window's refresh only if its identity is no longer live.
+/// A live unmanaged window can still need the refresh when recovery returns it on-screen.
+pub fn forget_stale_frame_refresh(window_id: WindowId) {
+    let mut refreshes = lock_frame_refreshes();
+    if refreshes
+        .get(&window_id)
+        .is_some_and(|entry| !entry.matches_window(window_id))
+    {
+        refreshes.remove(&window_id);
+    }
+}
+
+fn mark_frame_refresh(window_id: WindowId, hwnd: HWND, identity: WindowIdentity) {
+    if identity.managed_lifetime_token.is_none() {
+        return;
+    }
+    let mut refreshes = lock_frame_refreshes();
+    if !window_identity_matches(hwnd, identity) {
+        return;
+    }
+    refreshes.insert(
+        window_id,
+        FrameRefresh {
+            identity,
+            generation: NEXT_FRAME_REFRESH.fetch_add(1, Ordering::Relaxed),
+        },
+    );
+    refreshes.retain(|&id, entry| entry.matches_window(id));
+}
+
+fn frame_change_offscreen(hwnd: HWND) -> bool {
+    use windows::Win32::Graphics::Gdi::{MonitorFromWindow, MONITOR_DEFAULTTONULL};
+    unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL).0.is_null() }
+}
+
+fn begin_frame_change(
+    window_id: WindowId,
+    hwnd: HWND,
+    identity: WindowIdentity,
+) -> (bool, Option<u64>) {
+    let previous = frame_refresh(window_id, hwnd);
+    let offscreen = frame_change_offscreen(hwnd);
+    if offscreen {
+        mark_frame_refresh(window_id, hwnd, identity);
+    }
+    (offscreen, previous)
+}
+
+fn finish_frame_change(
+    window_id: WindowId,
+    hwnd: HWND,
+    identity: WindowIdentity,
+    before: (bool, Option<u64>),
+    completed_synchronously: bool,
+) {
+    if frame_change_offscreen(hwnd) {
+        mark_frame_refresh(window_id, hwnd, identity);
+    } else if !before.0 && completed_synchronously {
+        if let Some(generation) = before.1 {
+            clear_frame_refresh(window_id, generation);
+        }
+    }
+}
+
+pub(crate) fn frame_refresh(window_id: WindowId, hwnd: HWND) -> Option<u64> {
+    let mut refreshes = lock_frame_refreshes();
+    let entry = refreshes.get(&window_id)?;
+    if window_identity_matches(hwnd, entry.identity) {
+        Some(entry.generation)
+    } else {
+        refreshes.remove(&window_id);
+        None
+    }
+}
+
+pub(crate) fn clear_frame_refresh(window_id: WindowId, generation: u64) {
+    let mut refreshes = lock_frame_refreshes();
+    if refreshes
+        .get(&window_id)
+        .is_some_and(|entry| entry.generation == generation)
+    {
+        refreshes.remove(&window_id);
+    }
 }
 
 /// Tracks window identities queued for WS_MAXIMIZEBOX removal.
@@ -542,6 +648,7 @@ fn apply_window_style_inner(
         log_maximizebox_geometry(operation_name, "after_style", hwnd, correlation_id, None);
 
         // Frame recalculation remains synchronous, but runs off the daemon event loop.
+        let before = begin_frame_change(window_id, hwnd, identity);
         let frame_result = SetWindowPos(
             hwnd,
             None,
@@ -551,6 +658,7 @@ fn apply_window_style_inner(
             0,
             SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
         );
+        finish_frame_change(window_id, hwnd, identity, before, frame_result.is_ok());
         log_maximizebox_geometry(
             operation_name,
             "after_frame",
@@ -672,6 +780,7 @@ pub fn restore_maximizebox_all(window_ids: &[WindowId]) {
 fn recover_maximizebox(
     window_id: WindowId,
     hwnd: HWND,
+    identity: WindowIdentity,
     deadline: Option<std::time::Instant>,
     async_unmarked: bool,
 ) {
@@ -697,7 +806,8 @@ fn recover_maximizebox(
         } else {
             SET_WINDOW_POS_FLAGS(0)
         };
-        let _ = SetWindowPos(
+        let before = begin_frame_change(window_id, hwnd, identity);
+        let result = SetWindowPos(
             hwnd,
             None,
             0,
@@ -705,6 +815,13 @@ fn recover_maximizebox(
             0,
             0,
             SWP_FRAMECHANGED | dispatch | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+        finish_frame_change(
+            window_id,
+            hwnd,
+            identity,
+            before,
+            result.is_ok() && !dispatch.contains(SWP_ASYNCWINDOWPOS),
         );
     }
 }
@@ -750,7 +867,7 @@ pub(crate) fn emergency_restore_maximizebox(window_ids: &[WindowId], deadline: s
         if !window_identity_matches(hwnd, identity) {
             continue;
         }
-        recover_maximizebox(id, hwnd, Some(deadline), true);
+        recover_maximizebox(id, hwnd, identity, Some(deadline), true);
     }
 }
 
@@ -804,7 +921,7 @@ pub fn restore_maximizebox_panic_recovery() {
         if !unsafe { IsWindow(Some(hwnd)).as_bool() } {
             continue;
         }
-        recover_maximizebox(wid, hwnd, None, false);
+        recover_maximizebox(wid, hwnd, identity, None, false);
     }
 
     eprintln!(
@@ -1003,6 +1120,57 @@ mod tests {
                 let _ = unsafe { windows::Win32::UI::WindowsAndMessaging::DestroyWindow(hwnd) };
             }
         }
+    }
+
+    fn mark_fixture_frame_refresh(fixture: &HiddenFramedFixture) -> u64 {
+        let id = fixture.window_id();
+        let hwnd = fixture.hwnd();
+        crate::stamp_managed_lifetime_token(id).unwrap();
+        mark_frame_refresh(id, hwnd, capture_window_identity(hwnd).unwrap());
+        frame_refresh(id, hwnd).unwrap()
+    }
+
+    #[test]
+    fn destroyed_departure_discards_pending_frame_refresh() {
+        use windows::Win32::UI::WindowsAndMessaging::DestroyWindow;
+
+        let _guard = lock_snap_tracking_fixture();
+        let mut fixture = HiddenFramedFixture::create();
+        let id = fixture.window_id();
+        mark_fixture_frame_refresh(&fixture);
+        unsafe { DestroyWindow(fixture.hwnd.take().unwrap()).unwrap() };
+
+        forget_stale_frame_refresh(id);
+
+        assert!(!lock_frame_refreshes().contains_key(&id));
+    }
+
+    #[test]
+    fn marking_frame_refresh_sweeps_stale_identities() {
+        let _guard = lock_snap_tracking_fixture();
+        let stale = HiddenFramedFixture::create();
+        let id = stale.window_id();
+        mark_fixture_frame_refresh(&stale);
+        crate::stamp_managed_lifetime_token(id).unwrap();
+
+        let live = HiddenFramedFixture::create();
+        let generation = mark_fixture_frame_refresh(&live);
+
+        assert!(!lock_frame_refreshes().contains_key(&id));
+        clear_frame_refresh(live.window_id(), generation);
+    }
+
+    #[test]
+    fn live_departure_preserves_pending_frame_refresh_for_recovery() {
+        let _guard = lock_snap_tracking_fixture();
+        let fixture = HiddenFramedFixture::create();
+        let id = fixture.window_id();
+        let generation = mark_fixture_frame_refresh(&fixture);
+
+        forget_stale_frame_refresh(id);
+
+        assert_eq!(frame_refresh(id, fixture.hwnd()), Some(generation));
+        clear_frame_refresh(id, generation);
     }
 
     #[derive(Default)]

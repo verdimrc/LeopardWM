@@ -10,7 +10,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.3.5"
+version = "0.4.0"
 edition = "2021"
 license = "GPL-3.0"
 repository = "https://github.com/jcardama/LeopardWM"
@@ -19,6 +19,9 @@ authors = ["jcardama <jcardama@hey.com>"]
 [workspace.dependencies]
 # Win32 bindings
 windows = { version = "0.62", features = [
+    "Wdk_Foundation",
+    "Wdk_Storage_FileSystem",
+    "Win32_System_IO",
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Accessibility",
     "Win32_UI_Input_KeyboardAndMouse",
@@ -28,8 +31,13 @@ windows = { version = "0.62", features = [
     "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",
     "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_Networking_WinSock",
     "Win32_System_Threading",
     "Win32_System_ProcessStatus",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
     "Win32_System_LibraryLoader",
     "Win32_System_Power",
     "Win32_System_Registry",
@@ -54,7 +62,6 @@ serde_json = "1"
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tracing-appender = "0.2"
 
 # CLI
 clap = { version = "4", features = ["derive"] }

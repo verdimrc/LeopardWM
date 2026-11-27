@@ -1,7 +1,7 @@
 use crate::config;
 use crate::state::*;
 use anyhow::Result;
-use leopardwm_core_layout::{Rect, Workspace};
+use leopardwm_core_layout::{CenterColumns, Rect, Workspace};
 #[cfg(not(test))]
 use leopardwm_platform_win32::{is_excluded_tool_window_hwnd, window_presence};
 use leopardwm_platform_win32::{scale_px, MonitorId, WindowPresence};
@@ -63,6 +63,8 @@ pub(crate) struct ScaledLayoutParams {
     pub outer_gap_bottom: i32,
     pub default_column_width: i32,
     pub tab_strip_reserve_px: i32,
+    pub row_gap: i32,
+    pub row_shares_by_workspace: Vec<Vec<f64>>,
 }
 
 impl ScaledLayoutParams {
@@ -78,8 +80,15 @@ impl ScaledLayoutParams {
         let outer_gap_right = scale_px(layout.outer_gap_right, scale_factor);
         let outer_gap_top = scale_px(layout.outer_gap_top, scale_factor);
         let outer_gap_bottom = scale_px(layout.outer_gap_bottom, scale_factor);
-        // Include the gap below the strip so tab-to-window spacing matches
-        // column and vertical-stack spacing.
+        let row_gap = scale_px(layout.rows.gap, scale_factor);
+        let row_shares_by_workspace: Vec<Vec<f64>> = (0..9)
+            .map(|idx| layout.rows.parse_shares_for_workspace(idx))
+            .collect();
+        // Reserve room for the strip PLUS the inter-element gap below
+        // it, so the strip's bottom edge sits `gap` pixels above the
+        // active tab — same spacing as between adjacent columns and
+        // within a Vertical column. Reusing `layout.gap` keeps the
+        // visual rhythm consistent across the workspace.
         let strip_with_gap = appearance.tab_strip_height as i32 + layout.gap.max(0);
         let tab_strip_reserve_px = scale_px(strip_with_gap, scale_factor);
 
@@ -98,10 +107,21 @@ impl ScaledLayoutParams {
             outer_gap_bottom,
             default_column_width,
             tab_strip_reserve_px,
+            row_gap,
+            row_shares_by_workspace,
         }
     }
 
-    pub fn apply_to(&self, workspace: &mut Workspace) {
+    /// Row shares for a 0-based workspace index.
+    pub fn row_shares_for(&self, ws_idx: usize) -> &[f64] {
+        self.row_shares_by_workspace
+            .get(ws_idx)
+            .map(|s| s.as_slice())
+            .unwrap_or(&[1.0])
+    }
+
+    /// Apply scaled gap and width values to a workspace at a given 0-based index.
+    pub fn apply_to(&self, workspace: &mut Workspace, ws_idx: usize) {
         workspace.set_gap(self.gap);
         workspace.set_outer_gaps(
             self.outer_gap_left,
@@ -111,6 +131,8 @@ impl ScaledLayoutParams {
         );
         workspace.set_default_column_width(self.default_column_width);
         workspace.set_tab_strip_reserve_px(self.tab_strip_reserve_px);
+        workspace.set_row_gap(self.row_gap);
+        workspace.set_row_layout(self.row_shares_for(ws_idx));
     }
 }
 
@@ -158,11 +180,18 @@ impl AppState {
         // abort the in-flight transition before applying the new config.
         self.abort_active_ghost_transition();
         let old_border_on = self.config.appearance.active_border;
+        let previous_fixed_size_windows = self.config.behavior.fixed_size_windows;
+        if self.config.layout.offscreen_mode != config.layout.offscreen_mode {
+            self.bump_physical_invalidation();
+        }
         let previous_rules =
             std::mem::replace(&mut self.compiled_rules, config.compile_window_rules());
 
         self.config = config;
 
+        leopardwm_platform_win32::set_focus_lock_modifier(
+            &self.config.behavior.focus_lock_modifier,
+        );
         leopardwm_platform_win32::set_scroll_modifier(&self.config.hotkeys.scroll_modifier);
         leopardwm_platform_win32::set_wheel_swipes(self.config.gestures.wheel_swipes);
 
@@ -198,15 +227,26 @@ impl AppState {
                 device_name,
             );
 
-            for workspace in ws_vec.iter_mut() {
+            for (ws_idx, workspace) in ws_vec.iter_mut().enumerate() {
                 // Read the previously-applied scaled gap values from the workspace
                 // (not the raw config values) so rescale_column_widths works correctly.
                 let old_gap = workspace.gap();
                 let (old_ol, old_or, _, _) = workspace.outer_gaps();
-                let was_centering_fitting_columns = workspace.centers_fitting_columns();
-
-                params.apply_to(workspace);
+                let old_center_columns = workspace.center_columns();
+                let new_center_columns = self.config.center_columns_for(device_name).into();
+                let leaving_column_centering = old_center_columns != CenterColumns::Off
+                    && new_center_columns == CenterColumns::Off;
+                workspace.set_scroll_animation(
+                    self.config.animation.scroll_duration_ms,
+                    self.config.animation.easing,
+                );
+                let centered_rows = leaving_column_centering
+                    .then(|| workspace.begin_leaving_column_centering(viewport_width));
+                params.apply_to(workspace, ws_idx);
                 self.config.apply_monitor_rules(device_name, workspace);
+                if !leaving_column_centering {
+                    workspace.set_center_columns(new_center_columns);
+                }
 
                 workspace.rescale_column_widths(
                     old_gap,
@@ -215,12 +255,11 @@ impl AppState {
                     viewport_width,
                     viewport_width,
                 );
-                workspace.set_scroll_animation(
-                    self.config.animation.scroll_duration_ms,
-                    self.config.animation.easing,
-                );
-
-                if was_centering_fitting_columns && !workspace.centers_fitting_columns() {
+                if let Some(centered_rows) = centered_rows {
+                    workspace.finish_leaving_column_centering(viewport_width, centered_rows);
+                } else if old_center_columns == CenterColumns::Fit
+                    && new_center_columns == CenterColumns::Single
+                {
                     workspace.reconcile_scroll_bounds(viewport_width);
                 }
 
@@ -228,7 +267,7 @@ impl AppState {
             }
         }
 
-        self.reapply_window_rules(&previous_rules);
+        self.reapply_window_rules(&previous_rules, previous_fixed_size_windows);
 
         if let Ok(added) = self.enumerate_and_add_windows() {
             if added > 0 {
@@ -681,12 +720,16 @@ impl AppState {
             .retain(|hwnd, _| managed.contains(hwnd));
         // A tiled drag or stashed scratchpad leaves its workspace while still managed.
         self.managed_lifetime_tokens.retain(|hwnd, _| {
-            managed.contains(hwnd)
+            let still_managed = managed.contains(hwnd)
                 || self
                     .drag_state
                     .as_ref()
                     .is_some_and(|drag| drag.is_tiled && drag.hwnd == *hwnd)
-                || crate::managed_lifetime::is_stashed_scratchpad(self.scratchpad, *hwnd)
+                || crate::managed_lifetime::is_stashed_scratchpad(self.scratchpad, *hwnd);
+            if !still_managed {
+                leopardwm_platform_win32::forget_stale_frame_refresh(*hwnd);
+            }
+            still_managed
         });
         self.managed_lifetime_admitted_at_event_ms
             .retain(|hwnd, _| self.managed_lifetime_tokens.contains_key(hwnd));
@@ -788,11 +831,11 @@ impl AppState {
         window_id: u64,
     ) -> Option<i32> {
         let ws = self.workspaces.get(&monitor)?.get(ws_idx)?;
-        let (col, _) = ws.find_window_location(window_id)?;
-        ws.column(col).map(|c| c.width())
+        let (row, col, _) = ws.find_window_location_rc(window_id)?;
+        ws.rows().get(row)?.column(col).map(|c| c.width())
     }
 
-    /// The column index `window_id` occupies on `(monitor, ws_idx)` plus one
+    /// The (row, column) index `window_id` occupies on `(monitor, ws_idx)` plus one
     /// same-column sibling (any other window sharing it), if it is tiled there.
     /// The sibling anchors the column so a later restore survives index shifts
     /// from columns added or removed in the meantime.
@@ -801,16 +844,18 @@ impl AppState {
         monitor: MonitorId,
         ws_idx: usize,
         window_id: u64,
-    ) -> Option<(usize, Option<u64>)> {
+    ) -> Option<(usize, usize, Option<u64>)> {
         let ws = self.workspaces.get(&monitor)?.get(ws_idx)?;
-        let (col, _) = ws.find_window_location(window_id)?;
+        let (row, col, _) = ws.find_window_location_rc(window_id)?;
         let sibling = ws
+            .rows()
+            .get(row)?
             .column(col)?
             .windows()
             .iter()
             .copied()
             .find(|&w| w != window_id);
-        Some((col, sibling))
+        Some((row, col, sibling))
     }
 
     pub(crate) fn get_focused_column_rect(&self) -> Option<Rect> {
@@ -907,9 +952,11 @@ impl AppState {
         let mut tiled_ids = Vec::new();
         for ws_vec in self.workspaces.values() {
             for workspace in ws_vec {
-                for col in workspace.columns() {
-                    for &wid in col.windows() {
-                        tiled_ids.push(wid);
+                for row in workspace.rows() {
+                    for col in row.columns() {
+                        for &wid in col.windows() {
+                            tiled_ids.push(wid);
+                        }
                     }
                 }
             }
@@ -936,6 +983,7 @@ impl AppState {
             source
         );
         if self.paused {
+            leopardwm_platform_win32::disarm_drag_float();
             self.restore_taskbar_buttons();
             self.restore_snap_for_all_windows();
             self.hide_border();

@@ -2,8 +2,12 @@
 //!
 //! Shared types for daemon-CLI communication over Windows named pipes.
 
+pub mod anchored_fs;
+pub mod bounded_log;
 pub mod config_template;
+pub mod diagnostic_snapshot;
 pub mod hotkeys;
+pub mod log_text;
 pub mod workspace_state;
 
 pub use workspace_state::{WorkspaceStateRecord, WorkspaceStateSnapshot};
@@ -29,7 +33,8 @@ const MAX_PIPE_SCOPE_SEGMENT_LEN: usize = 64;
 ///   associated binding/diagnostic records.
 /// - v4: complete workspace-state snapshots and monitor-targeted
 ///   workspace switching. `ReleaseAllWindows` and `ToggleIgnore` are
-///   additive and retain v4 compatibility.
+///   additive and retain v4 compatibility. Multi-row commands and optional row
+///   fields and the recording command/response are also additive v4 extensions.
 pub const IPC_PROTOCOL_VERSION: u32 = 4;
 /// Minimum protocol version this crate supports.
 pub const IPC_MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 1;
@@ -58,6 +63,23 @@ pub fn log_dir() -> std::path::PathBuf {
     directories::BaseDirs::new()
         .map(|d| d.data_local_dir().join("leopardwm").join("logs"))
         .unwrap_or_else(|| std::env::temp_dir().join("leopardwm").join("logs"))
+}
+
+/// Diagnostic snapshot directory alongside [`log_dir`].
+pub fn diagnostics_dir() -> std::path::PathBuf {
+    leopardwm_data_dir("diagnostics")
+}
+
+/// Debug recording directory alongside [`log_dir`]. Recordings are not redacted,
+/// so they stay out of [`diagnostics_dir`], which Settings opens for attaching.
+pub fn recordings_dir() -> std::path::PathBuf {
+    leopardwm_data_dir("recordings")
+}
+
+fn leopardwm_data_dir(name: &str) -> std::path::PathBuf {
+    directories::BaseDirs::new()
+        .map(|d| d.data_local_dir().join("leopardwm").join(name))
+        .unwrap_or_else(|| std::env::temp_dir().join("leopardwm").join(name))
 }
 
 /// Dedicated opt-in gesture diagnostic capture file inside [`log_dir`].
@@ -149,6 +171,9 @@ pub struct WindowInfo {
     pub executable: String,
     /// The window's current rectangle (position and size).
     pub rect: IpcRect,
+    /// The row index (0-based) in a multi-row workspace, None if floating or single-row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row_index: Option<usize>,
     /// The column index if tiled, None if floating.
     pub column_index: Option<usize>,
     /// The window index within its column, None if floating.
@@ -269,6 +294,20 @@ pub struct ColumnSummary {
     pub mode: ColumnSummaryMode,
 }
 
+/// One row entry in a `LayoutChanged` or `WorkspaceState` payload.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RowSummary {
+    /// Columns in the row, left to right.
+    #[serde(default)]
+    pub columns: Vec<ColumnSummary>,
+    /// Index of the focused column in this row, or `None` if no column is focused.
+    #[serde(default)]
+    pub focused_column: Option<usize>,
+    /// Scroll offset of this row's strip.
+    #[serde(default)]
+    pub scroll_offset: f64,
+}
+
 /// Newline-delimited JSON events after `IpcResponse::Subscribed`; subsequent frames
 /// use `IpcEvent`'s `type` tag rather than `IpcResponse`'s `status` tag.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -310,8 +349,14 @@ pub enum IpcEvent {
         workspace_index: u8,
         /// Index of the focused column, or `None` if no column is focused.
         focused_column: Option<usize>,
-        /// Columns in left-to-right order.
+        /// Columns in left-to-right order (in the focused row).
         columns: Vec<ColumnSummary>,
+        /// Index of the focused row (0-based). An additive v4 extension.
+        #[serde(default)]
+        focused_row: usize,
+        /// All rows in the workspace. An additive v4 extension.
+        #[serde(default)]
+        rows: Vec<RowSummary>,
     },
     /// Start of an atomic workspace-state snapshot transaction.
     WorkspaceSnapshotBegin {
@@ -378,10 +423,25 @@ impl IpcEvent {
     }
 }
 
+/// Recording operation for the additive v4 recording command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordAction {
+    Start,
+    Stop,
+    Status,
+}
+
 /// Commands that can be sent from the CLI to the daemon.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum IpcCommand {
+    /// Control a temporary debug recording.
+    Record {
+        action: RecordAction,
+        #[serde(default)]
+        timeout_secs: Option<u64>,
+    },
     /// Focus the column to the left.
     FocusLeft,
     /// Focus the column to the right.
@@ -398,6 +458,18 @@ pub enum IpcCommand {
     FocusStart,
     /// Focus the last (rightmost) column of the strip.
     FocusEnd,
+    /// Focus a floating window on the current workspace.
+    FocusFloating,
+    /// Focus the tiled layer on the current workspace.
+    FocusTiling,
+    /// Switch focus between the floating and tiled layers.
+    SwitchFocusFloatingTiling,
+    /// Focus the row above. An additive v4 extension.
+    FocusRowUp,
+    /// Focus the row below. An additive v4 extension.
+    FocusRowDown,
+    /// Focus a specific row by 0-based index (0..4). An additive v4 extension.
+    FocusRow { index: usize },
 
     /// Move the focused column left.
     MoveColumnLeft,
@@ -424,6 +496,10 @@ pub enum IpcCommand {
     MoveWindowUp,
     /// Move the focused window down within the column.
     MoveWindowDown,
+    /// Move the focused window to the row above. An additive v4 extension.
+    MoveWindowToRowUp,
+    /// Move the focused window to the row below. An additive v4 extension.
+    MoveWindowToRowDown,
 
     /// Focus the monitor to the left.
     FocusMonitorLeft,
@@ -447,6 +523,11 @@ pub enum IpcCommand {
         /// Width delta in pixels (positive to grow, negative to shrink).
         delta: i32,
     },
+
+    /// Nudge the focused window left by the configured step.
+    NudgeLeft,
+    /// Nudge the focused window right by the configured step.
+    NudgeRight,
 
     /// Scroll the viewport.
     Scroll {
@@ -491,6 +572,10 @@ pub enum IpcCommand {
     CloseWindow,
     /// Toggle floating state for the focused window.
     ToggleFloating,
+    /// Float the focused window if it is tiled.
+    Float,
+    /// Tile the focused window if it is floating.
+    Tile,
     /// Toggle fullscreen for the focused window.
     ToggleFullscreen,
     /// Designate the focused window as the scratchpad and hide it.
@@ -516,6 +601,10 @@ pub enum IpcCommand {
     },
     /// Center the focused column in the viewport.
     CenterColumn,
+    /// Align the focused column with the left edge.
+    AlignColumnLeft,
+    /// Align the focused column with the right edge.
+    AlignColumnRight,
     /// Toggle the focused column to fill the viewport width.
     MaximizeColumn,
     /// Equalize all column widths.
@@ -538,6 +627,13 @@ pub enum IpcCommand {
     QueryStatus,
     /// Health check — returns uptime, window count, and error count.
     HealthCheck,
+    /// Write a diagnostic snapshot, an additive v4 command.
+    WriteDiagnosticSnapshot {
+        #[serde(default)]
+        requester_version: String,
+        #[serde(default)]
+        requester_integrity: Option<u32>,
+    },
 
     /// Switch to workspace N (1-9) on the focused monitor.
     SwitchWorkspace {
@@ -693,6 +789,13 @@ pub struct ElevationBlockedWindow {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum IpcResponse {
+    /// Current recording state and most recent recording path.
+    Recording {
+        #[serde(default)]
+        active: Option<bool>,
+        #[serde(default)]
+        path: Option<String>,
+    },
     /// Command executed successfully.
     Ok,
     /// Command failed with an error.
@@ -725,11 +828,20 @@ pub enum IpcResponse {
         /// Display name of the active workspace, or `None` if unnamed.
         #[serde(default)]
         active_workspace_name: Option<String>,
+        /// Index of the focused row (0-based). An additive v4 extension.
+        #[serde(default)]
+        focused_row: usize,
+        /// All rows in the workspace. An additive v4 extension.
+        #[serde(default)]
+        rows: Vec<RowSummary>,
     },
     /// Focused window query response.
     FocusedWindow {
         /// Window ID of the focused window, if any.
         window_id: Option<u64>,
+        /// Row index of the focused tiled window in a multi-row workspace (0-based).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        row_index: Option<usize>,
         /// Column index of the focused tiled window. When `is_floating` is
         /// true, this still refers to the tiled focus, not `window_id`.
         column_index: usize,
@@ -764,6 +876,8 @@ pub enum IpcResponse {
         issues: Vec<HotkeyIssue>,
     },
 
+    /// The diagnostic snapshot was written at this path.
+    DiagnosticSnapshotWritten { path: String },
     /// Daemon status information.
     StatusInfo {
         /// Daemon version.
@@ -838,6 +952,9 @@ pub enum IpcResponse {
         /// None means an older daemon did not report this field.
         #[serde(default)]
         daemon_log: Option<DaemonLogStatus>,
+        /// Unknown config key paths. `None` means an older daemon omitted this field.
+        #[serde(default)]
+        unknown_config_keys: Option<Vec<String>>,
     },
     /// Forward-compatibility fallback for newer daemon responses unknown to this client.
     #[serde(other)]
@@ -851,6 +968,9 @@ impl IpcResponse {
         }
     }
 }
+
+#[cfg(test)]
+mod compatibility_tests;
 
 #[cfg(test)]
 mod tests {
@@ -918,6 +1038,8 @@ mod tests {
             total_width: 2400,
             active_workspace: 1,
             active_workspace_name: None,
+            focused_row: 0,
+            rows: vec![],
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("workspace_state"));
@@ -1003,6 +1125,12 @@ mod tests {
             IpcCommand::FocusRight,
             IpcCommand::FocusUp,
             IpcCommand::FocusDown,
+            IpcCommand::FocusFloating,
+            IpcCommand::FocusTiling,
+            IpcCommand::SwitchFocusFloatingTiling,
+            IpcCommand::FocusRowUp,
+            IpcCommand::FocusRowDown,
+            IpcCommand::FocusRow { index: 2 },
             IpcCommand::MoveColumnLeft,
             IpcCommand::MoveColumnRight,
             IpcCommand::MoveWindowLeft,
@@ -1013,6 +1141,8 @@ mod tests {
             IpcCommand::ConsumeFromRight,
             IpcCommand::MoveWindowUp,
             IpcCommand::MoveWindowDown,
+            IpcCommand::MoveWindowToRowUp,
+            IpcCommand::MoveWindowToRowDown,
             IpcCommand::FocusMonitorLeft,
             IpcCommand::FocusMonitorRight,
             IpcCommand::MoveWindowToMonitorLeft,
@@ -1034,6 +1164,8 @@ mod tests {
             IpcCommand::ToggleIgnore,
             IpcCommand::CloseWindow,
             IpcCommand::ToggleFloating,
+            IpcCommand::Float,
+            IpcCommand::Tile,
             IpcCommand::ToggleFullscreen,
             IpcCommand::ScratchpadStash,
             IpcCommand::ScratchpadToggle,
@@ -1054,6 +1186,10 @@ mod tests {
             IpcCommand::EqualizeColumnHeights,
             IpcCommand::QueryStatus,
             IpcCommand::HealthCheck,
+            IpcCommand::WriteDiagnosticSnapshot {
+                requester_version: "1".into(),
+                requester_integrity: Some(0x2000),
+            },
             IpcCommand::MaximizeColumn,
             IpcCommand::SwitchWorkspace { index: 1 },
             IpcCommand::SwitchWorkspace { index: 9 },
@@ -1079,6 +1215,9 @@ mod tests {
             IpcResponse::ApplyPending {
                 message: "Recovery placement is still pending".to_string(),
             },
+            IpcResponse::DiagnosticSnapshotWritten {
+                path: "snapshot.txt".into(),
+            },
             IpcResponse::WorkspaceState {
                 columns: 5,
                 windows: 10,
@@ -1088,21 +1227,30 @@ mod tests {
                 total_width: 4000,
                 active_workspace: 1,
                 active_workspace_name: None,
+                focused_row: 1,
+                rows: vec![RowSummary {
+                    columns: vec![],
+                    focused_column: None,
+                    scroll_offset: 0.0,
+                }],
             },
             IpcResponse::FocusedWindow {
                 window_id: Some(12345),
+                row_index: Some(1),
                 column_index: 1,
                 window_index: 0,
                 is_floating: false,
             },
             IpcResponse::FocusedWindow {
                 window_id: Some(67890),
+                row_index: None,
                 column_index: 1,
                 window_index: 0,
                 is_floating: true,
             },
             IpcResponse::FocusedWindow {
                 window_id: None,
+                row_index: None,
                 column_index: 0,
                 window_index: 0,
                 is_floating: false,
@@ -1115,6 +1263,7 @@ mod tests {
                     process_id: 100,
                     executable: "test.exe".to_string(),
                     rect: IpcRect::new(0, 0, 800, 600),
+                    row_index: Some(0),
                     column_index: Some(0),
                     window_index: Some(0),
                     monitor_id: 1,
@@ -1131,6 +1280,7 @@ mod tests {
                     process_id: 200,
                     executable: "focused.exe".to_string(),
                     rect: IpcRect::new(100, 100, 1024, 768),
+                    row_index: Some(1),
                     column_index: Some(1),
                     window_index: Some(0),
                     monitor_id: 2,
@@ -1159,6 +1309,7 @@ mod tests {
                 daemon_log: Some(DaemonLogStatus::Writing {
                     path: "daemon.log".into(),
                 }),
+                unknown_config_keys: Some(vec!["layout.typo".into()]),
             },
         ];
 
@@ -1190,6 +1341,7 @@ mod tests {
                 process_id: 100,
                 executable: "app.exe".to_string(),
                 rect: IpcRect::new(0, 0, 800, 600),
+                row_index: Some(0),
                 column_index: Some(0),
                 window_index: Some(0),
                 monitor_id: 1,
@@ -1344,6 +1496,8 @@ mod tests {
                     mode: ColumnSummaryMode::default(),
                 },
             ],
+            focused_row: 0,
+            rows: vec![],
         };
         let json = serde_json::to_string(&ev).unwrap();
         assert!(json.contains("layout_changed"));
@@ -1363,10 +1517,55 @@ mod tests {
                 height_weights: Vec::new(),
                 mode: ColumnSummaryMode::Tabbed { active_idx: 1 },
             }],
+            focused_row: 0,
+            rows: vec![],
         };
         let json = serde_json::to_string(&ev).unwrap();
         assert!(json.contains("\"mode\":{\"type\":\"tabbed\""));
         assert!(json.contains("\"active_idx\":1"));
+        let ev2: IpcEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(ev, ev2);
+    }
+
+    #[test]
+    fn test_event_layout_changed_multi_row_round_trip() {
+        let ev = IpcEvent::LayoutChanged {
+            monitor: 1,
+            workspace_index: 0,
+            focused_column: Some(1),
+            columns: vec![ColumnSummary {
+                window_ids: vec![10],
+                width_px: 800,
+                height_weights: vec![],
+                mode: ColumnSummaryMode::Vertical,
+            }],
+            focused_row: 1,
+            rows: vec![
+                RowSummary {
+                    columns: vec![ColumnSummary {
+                        window_ids: vec![1, 2],
+                        width_px: 600,
+                        height_weights: vec![],
+                        mode: ColumnSummaryMode::Vertical,
+                    }],
+                    focused_column: Some(0),
+                    scroll_offset: 0.0,
+                },
+                RowSummary {
+                    columns: vec![ColumnSummary {
+                        window_ids: vec![10],
+                        width_px: 800,
+                        height_weights: vec![],
+                        mode: ColumnSummaryMode::Vertical,
+                    }],
+                    focused_column: Some(0),
+                    scroll_offset: 50.0,
+                },
+            ],
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(json.contains("\"focused_row\":1"));
+        assert!(json.contains("\"rows\":["));
         let ev2: IpcEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(ev, ev2);
     }
@@ -1384,9 +1583,17 @@ mod tests {
             ]
         }"#;
         let ev: IpcEvent = serde_json::from_str(v1).unwrap();
-        if let IpcEvent::LayoutChanged { columns, .. } = ev {
+        if let IpcEvent::LayoutChanged {
+            columns,
+            focused_row,
+            rows,
+            ..
+        } = ev
+        {
             assert_eq!(columns.len(), 1);
             assert!(matches!(columns[0].mode, ColumnSummaryMode::Vertical));
+            assert_eq!(focused_row, 0);
+            assert!(rows.is_empty());
         } else {
             panic!("expected LayoutChanged");
         }
@@ -1410,7 +1617,7 @@ mod tests {
     }
 
     #[test]
-    fn test_protocol_version_remains_v4_for_additive_release_command() {
+    fn test_protocol_version_remains_v4_for_additive_rows() {
         assert_eq!(IPC_PROTOCOL_VERSION, 4);
         assert!(is_protocol_version_supported(1));
         assert!(is_protocol_version_supported(2));
@@ -1563,8 +1770,10 @@ mod tests {
                 elevation_blocked_records,
                 native_swipes,
                 daemon_log,
+                unknown_config_keys,
                 ..
             } => {
+                assert_eq!(unknown_config_keys, None);
                 assert!(elevation_blocked_windows.is_empty());
                 assert_eq!(daemon_integrity, None);
                 assert_eq!(elevation_blocked_records, None);
@@ -1581,11 +1790,13 @@ mod tests {
         match serde_json::from_str::<IpcResponse>(json).unwrap() {
             IpcResponse::FocusedWindow {
                 window_id,
+                row_index,
                 column_index,
                 window_index,
                 is_floating,
             } => {
                 assert_eq!(window_id, Some(7));
+                assert_eq!(row_index, None);
                 assert_eq!(column_index, 2);
                 assert_eq!(window_index, 1);
                 assert!(!is_floating);
@@ -1614,6 +1825,7 @@ mod tests {
             daemon_log: Some(DaemonLogStatus::Writing {
                 path: "daemon.log".into(),
             }),
+            unknown_config_keys: Some(vec![]),
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["elevation_blocked_windows"][0][0], 16);

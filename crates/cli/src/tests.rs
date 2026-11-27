@@ -15,10 +15,77 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 #[test]
-fn test_wrap_cycle_verbs_map_to_ipc() {
+fn recording_commands_parse_to_wire_actions() {
+    for (args, action, timeout_secs) in [
+        (
+            vec!["lwm", "record", "start"],
+            leopardwm_ipc::RecordAction::Start,
+            None,
+        ),
+        (
+            vec!["lwm", "record", "start", "--timeout", "42"],
+            leopardwm_ipc::RecordAction::Start,
+            Some(42),
+        ),
+        (
+            vec!["lwm", "record", "stop"],
+            leopardwm_ipc::RecordAction::Stop,
+            None,
+        ),
+        (
+            vec!["lwm", "record", "status"],
+            leopardwm_ipc::RecordAction::Status,
+            None,
+        ),
+    ] {
+        let cli = Cli::try_parse_from(args).unwrap();
+        assert_eq!(
+            to_ipc_command(&cli.command),
+            IpcCommand::Record {
+                action,
+                timeout_secs
+            }
+        );
+    }
+}
+
+#[test]
+fn cli_reference_lists_every_command_path() {
+    fn check_paths(command: &clap::Command, prefix: &str, reference: &str) {
+        for subcommand in command
+            .get_subcommands()
+            .filter(|sub| sub.get_name() != "help")
+        {
+            let path = format!("{prefix} {}", subcommand.get_name());
+            let entry = format!("| `{path}` |");
+            assert!(
+                reference.lines().any(|line| line.starts_with(&entry)),
+                "CLI reference is missing command path: {path}"
+            );
+            check_paths(subcommand, &path, reference);
+        }
+    }
+
+    check_paths(&Cli::command(), "lwm", include_str!("../../../docs/cli.md"));
+}
+
+#[test]
+fn test_simple_verbs_map_to_ipc() {
     for (verb, expected) in [
+        ("align-column-left", IpcCommand::AlignColumnLeft),
+        ("align-column-right", IpcCommand::AlignColumnRight),
+        ("nudge-left", IpcCommand::NudgeLeft),
+        ("nudge-right", IpcCommand::NudgeRight),
         ("cycle-width", IpcCommand::CycleWidth),
         ("cycle-height", IpcCommand::CycleHeight),
+        ("float", IpcCommand::Float),
+        ("tile", IpcCommand::Tile),
+        ("focus-floating", IpcCommand::FocusFloating),
+        ("focus-tiling", IpcCommand::FocusTiling),
+        (
+            "switch-focus-floating-tiling",
+            IpcCommand::SwitchFocusFloatingTiling,
+        ),
     ] {
         let cli = Cli::try_parse_from(["lwm", verb]).unwrap();
         assert_eq!(to_ipc_command(&cli.command), expected);
@@ -41,6 +108,9 @@ fn test_cli_focus_commands_allow_daemon_foreground() {
         (&["lwm", "focus", "down"], true),
         (&["lwm", "focus", "start"], true),
         (&["lwm", "focus", "end"], true),
+        (&["lwm", "focus-floating"], true),
+        (&["lwm", "focus-tiling"], true),
+        (&["lwm", "switch-focus-floating-tiling"], true),
         (&["lwm", "focus-monitor", "left"], true),
         (&["lwm", "focus-monitor", "right"], true),
         (&["lwm", "focus-monitor", "up"], true),
@@ -1337,7 +1407,7 @@ fn test_doctor_config_path_returns_primary() {
 #[test]
 fn test_validate_toml_valid() {
     let dir = std::env::temp_dir();
-    let path = dir.join("leopardwm-test-valid.toml");
+    let path = dir.join(format!("leopardwm-test-valid-{}.toml", std::process::id()));
     fs::write(&path, "[layout]\ngap = 10\n").unwrap();
     assert!(validate_toml_file(&path).is_ok());
     let _ = fs::remove_file(&path);
@@ -1346,7 +1416,10 @@ fn test_validate_toml_valid() {
 #[test]
 fn test_validate_toml_invalid() {
     let dir = std::env::temp_dir();
-    let path = dir.join("leopardwm-test-invalid.toml");
+    let path = dir.join(format!(
+        "leopardwm-test-invalid-{}.toml",
+        std::process::id()
+    ));
     fs::write(&path, "[layout\ngap = !!!").unwrap();
     assert!(validate_toml_file(&path).is_err());
     let _ = fs::remove_file(&path);
@@ -1507,7 +1580,10 @@ fn test_config_backup_path() {
 
 #[test]
 fn test_config_backup_and_restore_roundtrip() {
-    let dir = std::env::temp_dir().join("leopardwm-test-config-roundtrip");
+    let dir = std::env::temp_dir().join(format!(
+        "leopardwm-test-config-roundtrip-{}",
+        std::process::id()
+    ));
     let _ = fs::create_dir_all(&dir);
     let config_path = dir.join("config.toml");
     let backup_path = config_backup_path(&config_path);
@@ -1540,82 +1616,6 @@ fn native_swipes_check_warns_with_reason_and_passes_when_off() {
         native_swipes_check(Some(&NativeSwipeStatus::Off)),
         CheckResult::Pass("Native three-finger swipes: off (default)".to_string())
     );
-}
-
-#[test]
-fn collect_logs_report_includes_full_gesture_capture_not_last_100() {
-    let dir = std::env::temp_dir().join(format!(
-        "leopardwm-collect-logs-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    fs::create_dir_all(&dir).unwrap();
-    let daemon = dir.join("leopardwm-daemon.log");
-    let capture = dir.join(leopardwm_ipc::GESTURE_CAPTURE_LOG_FILE);
-    let daemon_body: String = (0..150).map(|i| format!("daemon-line-{i}\n")).collect();
-    let capture_body: String = (0..150).map(|i| format!("capture-line-{i}\n")).collect();
-    fs::write(&daemon, &daemon_body).unwrap();
-    fs::write(&capture, &capture_body).unwrap();
-
-    let config_path = dir.join("config.toml");
-    let config_body = "[behavior]\nlog_level = \"debug\"\n";
-    fs::write(&config_path, config_body).unwrap();
-    let mut output = Vec::new();
-    let result = write_collect_logs_report(
-        &mut output,
-        (Some(config_path.clone()), config_path),
-        &dir,
-        CollectLogsDaemon::NotRunning,
-        None,
-    );
-    fs::remove_dir_all(&dir).unwrap();
-    result.unwrap();
-    let report = String::from_utf8(output).unwrap();
-    assert!(
-        report.contains(config_body),
-        "temporary config missing from report"
-    );
-    assert!(report.contains("status unavailable because the daemon is not running"));
-    let daemon_section = report
-        .split_once("## Daemon Log (")
-        .unwrap()
-        .1
-        .split_once("## Daemon Error Log (")
-        .unwrap()
-        .0;
-    let capture_section = report
-        .split_once("## Gesture Capture (")
-        .unwrap()
-        .1
-        .split_once("## Daemon Binary:")
-        .unwrap()
-        .0;
-
-    assert!(daemon_section.contains("daemon-line-149\n"));
-    assert!(daemon_section.contains("daemon-line-50\n"));
-    assert!(!daemon_section.contains("daemon-line-49\n"));
-    assert!(!daemon_section.contains("daemon-line-0\n"));
-    assert_eq!(
-        daemon_section
-            .lines()
-            .filter(|line| line.starts_with("daemon-line-"))
-            .count(),
-        100,
-    );
-    assert!(daemon_section.contains("50 earlier lines omitted"));
-    assert!(
-        capture_section.contains("capture-line-0\n"),
-        "report dropped the first gesture capture line"
-    );
-    assert!(capture_section.contains("capture-line-149\n"));
-    assert!(
-        capture_section.contains(&capture_body),
-        "report must preserve the entire gesture capture"
-    );
-    assert!(!capture_section.contains("earlier lines omitted"));
 }
 
 #[test]

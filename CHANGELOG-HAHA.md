@@ -1,6 +1,6 @@
 # Change log of haha branch
 
-Diff between `36574ea` .. HEAD
+Diff between `d3cae70` .. HEAD
 
 ## 1. Features
 
@@ -16,7 +16,7 @@ Diff between `36574ea` .. HEAD
   default_width_preset = 1
   centering_mode = "center"
   center_past_edges = false
-  center_single_column = false
+  center_columns = "off"
   full_screen_tolerance_px = 2
   ```
 
@@ -34,32 +34,36 @@ Diff between `36574ea` .. HEAD
     sweep. RTL clusters windows toward the right edge of the external monitor, right next to the center
     display, so your eyes barely move between the two screens.
   - `default_width_preset`: the width preset new columns open at on this monitor.
-  - `centering_mode`, `center_past_edges`, `center_single_column`, `full_screen_tolerance_px`: this
-    monitor's centering. On a monitor whose rule sets `centering_mode`, choosing a centering mode from
-    the tray has no effect.
+  - `centering_mode`, `center_past_edges`, `center_columns`, `full_screen_tolerance_px`: this
+    monitor's centering. On a monitor whose rule sets `centering_mode` or `center_columns`, choosing
+    that setting from the tray has no effect.
+  - On `"rtl"`, `"ltr_right_aligned"` and `"ltr_left_aligned"` monitors, aligning the focused column to
+    the left or right edge keeps columns that fit against their edge, unless `center_past_edges = true`.
 - Vertical monitor support:
   - Automatically detected from portrait orientation (height > width) — no configuration required; rotate
     the monitor in Windows Display Settings.
   - The layout engine's horizontal axis maps to the monitor's vertical axis. Columns become rows:
     windows stack top to bottom, and left/right navigation moves up/down. Drag-and-drop, column
-    resizing, and cross-monitor operations all respect the rotated axis.
+    resizing, and cross-monitor operations all respect the rotated axis. Rows sit side by side.
   - Overview workspace panels are arranged side by side as tall columns instead of horizontal stripes.
     Window cards are shown in their physical (portrait) orientation, stacked top to bottom. Each panel
     is as tall as its windows, centered vertically, bottom-aligned when `direction` is `"rtl"` or
-    `"ltr_right_aligned"`, or top-aligned when it is `"ltr_left_aligned"`.
+    `"ltr_right_aligned"`, or top-aligned when it is `"ltr_left_aligned"`. Floating windows are
+    stacked above the tiled ones.
 
 ### 1.2. Moving windows between monitors
 
 - `behavior.new_width_on_monitor_move` sets the width a tiled window gets when it becomes a new column
-  on another monitor, whether moved with the hotkey or dragged (Shift+drag, or a drag onto a monitor
-  with no windows):
+  on another monitor, whether moved with the hotkey, moved past the edge of the strip, or dragged into
+  a new column:
   - `"upstream"` (default): main's behavior. The window gets the target monitor's default width
     (Shift+drag keeps the column's width). It does not use the window rule's `column_width`.
   - `"same_proportion_as_source_monitor"`: the same share of the screen as on the source monitor.
   - `"window_rule_width_or_default_width"`: the width it would get if opened there: the window rule's
     `column_width`, else the default width.
 
-  A window dragged into an existing column takes that column's width, in every mode.
+  A window dragged into an existing column takes that column's width, in every mode. A maximized
+  column counts at its width from before it was maximized.
 
 ### 1.3. New windows
 
@@ -90,10 +94,11 @@ Diff between `36574ea` .. HEAD
 
 ### 1.4. Centering
 
-- `layout.centering_mode = "center_columns_when_narrower"` centers all columns together when they are
-  narrower than the screen. When they are wider, they start at the left edge (right edge with RTL) and
-  the screen scrolls like `"just_in_view"`. Columns that leave at most
-  `layout.full_screen_tolerance_px` pixels free (default 2) count as filling the screen.
+- With `layout.center_columns = "fit"`, columns that leave at most `layout.full_screen_tolerance_px`
+  pixels free (default 2) count as filling the screen.
+- The old keys still load: `centering_mode = "center_columns_when_narrower"` becomes
+  `center_columns = "fit"` with `centering_mode = "just_in_view"`, and `center_single_column` becomes
+  `center_columns = "single"` or `"off"`, in `[layout]` and in `[[monitor_rules]]`.
 
 ### 1.5. Overview
 
@@ -134,9 +139,8 @@ Diff between `36574ea` .. HEAD
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `layout.centering_mode` (extended) | `"center"` \| `"just_in_view"` \| `"on_overflow"` \| ✨`"center_columns_when_narrower"` | `"center"` | Adds `"center_columns_when_narrower"`: center all columns together when they are narrower than the screen. ⚠️ [Known issue with GUI settings](#4-known-issues-with-gui-settings) |
 | `layout.desktop_peek_min_width` | `f64` | `0.25` | Minimum ghost column width as a fraction of monitor width. ⚠️ [Known issue with GUI settings](#4-known-issues-with-gui-settings) |
-| `layout.full_screen_tolerance_px` | `i32` | `2` | With `"center_columns_when_narrower"`, columns that leave at most this many pixels free count as filling the screen. ⚠️ [Known issue with GUI settings](#4-known-issues-with-gui-settings) |
+| `layout.full_screen_tolerance_px` | `i32` | `2` | With `center_columns = "fit"`, columns that leave at most this many pixels free count as filling the screen. ⚠️ [Known issue with GUI settings](#4-known-issues-with-gui-settings) |
 | `behavior.new_window_monitor` (extended) | `"opening"` \| `"focused"` \| ✨`"cursor"` | `"opening"` | Adds `"cursor"`: open new windows on the monitor under the mouse cursor. |
 | `behavior.new_width_on_monitor_move` | `"upstream" \| "same_proportion_as_source_monitor" \| "window_rule_width_or_default_width"` | `"upstream"` | Width of a tiled window moved to another monitor. ⚠️ [Known issue with GUI settings](#4-known-issues-with-gui-settings) |
 | `behavior.notify_elevation_blocked` | `bool` | `true` | Show a toast when a privilege-elevated window is excluded from tiling. Set to `false` to silence it. ⚠️ [Known issue with GUI settings](#4-known-issues-with-gui-settings) |
@@ -145,14 +149,15 @@ Diff between `36574ea` .. HEAD
 | `hotkeys.toggle_desktop_peek_anchored` | `string` | `"Ctrl+Alt+'"` | Reveal desktop; focused window stays in place. |
 | `hotkeys.toggle_desktop_peek` | `string` | `"Ctrl+Alt+Shift+'"` | Reveal desktop; focused window moves to the minimum-width mark. |
 | `hotkeys.toggle_new_window_placement_once` | `string` | `"Ctrl+Alt+Shift+N"` | Activate a one-shot new-window-placement override for the next window only. |
-| `[[monitor_rules]]` | `display = u32`, plus optional `direction`, `default_width_preset`, `centering_mode`, `center_past_edges`, `center_single_column`, `full_screen_tolerance_px` | (none) | Per-monitor column direction, default width preset, and centering settings. ⚠️ [Known issue with GUI settings](#4-known-issues-with-gui-settings) |
+| `[[monitor_rules]]` | `display = u32`, plus optional `direction`, `default_width_preset`, `centering_mode`, `center_past_edges`, `center_columns`, `full_screen_tolerance_px` | (none) | Per-monitor column direction, default width preset, and centering settings. ⚠️ [Known issue with GUI settings](#4-known-issues-with-gui-settings) |
 | Window rule: `new_window_monitor` | `"opening" \| "focused" \| "cursor"` | (none) | Overrides `behavior.new_window_monitor` for matching windows. |
 | Window rule: `column_width` (extended) | `f64` \| ✨`u32` \| ✨`{ "N" = f64\|u32 }` | (none) | Now accepts a preset index or a per-display-number map in addition to a viewport fraction. ⚠️ [Known issue with GUI settings](#4-known-issues-with-gui-settings) |
 
 ## 3. Bug fixes
 
 - Closing the last window on a workspace no longer switches away from it.
-- Tray-menu and hotkey/IPC-triggered config changes no longer silently overwrite `config.toml`.
+- Tray-menu and hotkey/IPC-triggered config changes, including Keep Awake and center columns, no
+  longer silently overwrite `config.toml`.
 - Commands no longer act on the wrong window right after the windows slide into place (briefly
   tested; no consistent repro trigger).
 - Window resizing after opening a new window now targets the focused window.
@@ -175,7 +180,6 @@ doesn't show are reset or removed:
 
 | Field | After saving from the settings window |
 |---|---|
-| `layout.centering_mode = "center_columns_when_narrower"` | Kept, but the settings window shows "Center" and the tray menu checks no centering mode. Picking another mode in either replaces it. |
 | `layout.desktop_peek_min_width` | Reset to `0.25`. |
 | `layout.full_screen_tolerance_px` | Reset to `2`. |
 | `behavior.new_width_on_monitor_move` | Reset to `"upstream"`. |

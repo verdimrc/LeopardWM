@@ -2,6 +2,7 @@ use crate::config;
 use crate::state::*;
 use anyhow::Result;
 use leopardwm_core_layout::{Rect, Workspace};
+use leopardwm_ipc::log_text;
 #[cfg(not(test))]
 use leopardwm_platform_win32::enumerate_windows;
 use leopardwm_platform_win32::{
@@ -34,10 +35,34 @@ impl MovedColumnWidth {
     }
 }
 
+/// The share of `viewport_width` taken by the column holding `window` in
+/// `ws`. A maximized column counts at its width before it was maximized, the
+/// width it has once it leaves the workspace.
+fn unmaximized_width_fraction(ws: &Workspace, window: u64, viewport_width: i32) -> Option<f64> {
+    let (row_idx, col_idx, _) = ws.find_window_location_rc(window)?;
+    let row = ws.row(row_idx)?;
+    let restore_width = row.column_restore_width(col_idx)?;
+    if restore_width == row.column(col_idx)?.width() {
+        // Not maximized: keep the exact cached fraction.
+        return ws.column_width_fraction_for_window(window, viewport_width);
+    }
+    let gap = ws.gap().max(0);
+    let (left, right, _, _) = ws.outer_gaps();
+    let base = viewport_width
+        .saturating_sub(left.max(0))
+        .saturating_sub(right.max(0))
+        .saturating_add(gap)
+        .max(1);
+    Some(restore_width.saturating_add(gap) as f64 / base as f64)
+}
+
 impl AppState {
-    /// Apply changed rule outcomes to managed windows, preserving manual overrides
-    /// when the previous and current rules decide the same action.
-    pub(crate) fn reapply_window_rules(&mut self, previous_rules: &[config::CompiledWindowRule]) {
+    /// Apply changed effective actions, preserving manual overrides when they are unchanged.
+    pub(crate) fn reapply_window_rules(
+        &mut self,
+        previous_rules: &[config::CompiledWindowRule],
+        previous_policy: config::FixedSizeWindows,
+    ) {
         let mut transitions: Vec<(u64, MonitorId, usize, config::WindowAction, bool)> = Vec::new();
 
         for (&monitor_id, ws_vec) in &self.workspaces {
@@ -47,24 +72,32 @@ impl AppState {
                     if let Some(win_info) = self.lookup_window_info(wid) {
                         let executable =
                             get_process_executable(win_info.process_id).unwrap_or_default();
-                        let action = self.evaluate_window_rules(
+                        let matched = self.matched_rule(
                             &win_info.class_name,
                             &win_info.title,
                             &executable,
                             None,
                         );
-                        let previous_action = previous_rules
-                            .iter()
-                            .find(|rule| {
-                                rule.matches(
-                                    &win_info.class_name,
-                                    &win_info.title,
-                                    &executable,
-                                    None,
-                                )
-                            })
-                            .map(|rule| rule.action)
-                            .unwrap_or(config::WindowAction::Tile);
+                        let previous_matched = previous_rules.iter().find(|rule| {
+                            rule.matches(&win_info.class_name, &win_info.title, &executable, None)
+                        });
+                        let action = self.effective_admission_action(
+                            &win_info,
+                            self.evaluate_window_rules(
+                                &win_info.class_name,
+                                &win_info.title,
+                                &executable,
+                                None,
+                            ),
+                            matched.is_some(),
+                            self.config.behavior.fixed_size_windows,
+                        );
+                        let previous_action = self.effective_admission_action(
+                            &win_info,
+                            previous_matched.map_or(config::WindowAction::Tile, |rule| rule.action),
+                            previous_matched.is_some(),
+                            previous_policy,
+                        );
                         if action != previous_action {
                             transitions.push((wid, monitor_id, ws_idx, action, is_floating));
                         }
@@ -94,6 +127,7 @@ impl AppState {
             .collect();
 
         for (wid, monitor_id, ws_idx, action, is_floating) in transitions {
+            let viewport_width = self.viewport_width_for(monitor_id);
             match action {
                 config::WindowAction::Float if !is_floating => {
                     self.restore_snap_for_window(wid);
@@ -117,7 +151,9 @@ impl AppState {
                         .get_mut(&monitor_id)
                         .and_then(|v| v.get_mut(ws_idx))
                     {
-                        let _ = workspace.remove_window(wid);
+                        if workspace.remove_window(wid).is_ok() {
+                            workspace.reconcile_scroll_bounds(viewport_width);
+                        }
                         let _ = workspace.add_floating(wid, rect);
                         info!("Rule change: moved window {} to floating", wid);
                     }
@@ -142,8 +178,8 @@ impl AppState {
                     {
                         if is_floating {
                             workspace.remove_floating(wid);
-                        } else {
-                            let _ = workspace.remove_window(wid);
+                        } else if workspace.remove_window(wid).is_ok() {
+                            workspace.reconcile_scroll_bounds(viewport_width);
                         }
                         self.window_managed_at.remove(&wid);
                         self.window_last_maximized_at.remove(&wid);
@@ -186,7 +222,17 @@ impl AppState {
             Some(monitor_id),
             Some(self.window_rule_size(&window.rect)),
         );
-        if use_preferred_monitor {
+        let positioned_by_rule = self
+            .matched_rule(
+                &window.class_name,
+                &window.title,
+                executable,
+                Some(self.window_rule_size(&window.rect)),
+            )
+            .is_some_and(|rule| {
+                rule.action == config::WindowAction::Float && (rule.x.is_some() || rule.y.is_some())
+            });
+        if use_preferred_monitor && !positioned_by_rule {
             let monitor = &self.monitors[&monitor_id];
             if !monitor.contains_rect_center(&rect) {
                 let area = monitor.work_area;
@@ -241,7 +287,8 @@ impl AppState {
             if action == config::WindowAction::Ignore {
                 debug!(
                     "Ignoring window by rule: {} ({})",
-                    win_info.title, win_info.class_name
+                    log_text::title(&win_info.title),
+                    log_text::name(&win_info.class_name)
                 );
                 continue;
             }
@@ -249,19 +296,6 @@ impl AppState {
             let monitor_id = find_monitor_for_rect(&monitors, &win_info.rect)
                 .map(|m| m.id)
                 .unwrap_or(self.focused_monitor);
-
-            let floating_rect = if action == config::WindowAction::Float {
-                Some(self.get_floating_rect_from_rules(
-                    &win_info.class_name,
-                    &win_info.title,
-                    &executable,
-                    &win_info.rect,
-                    Some(monitor_id),
-                    Some(self.window_rule_size(&win_info.rect)),
-                ))
-            } else {
-                None
-            };
 
             // Elevated window the non-elevated daemon can't reposition (UIPI):
             // skip + notify instead of reserving a column we can't fill. Mirrors
@@ -279,10 +313,29 @@ impl AppState {
             if let Some(kind) = self.unmanaged_helper_kind(&win_info, rule_matched) {
                 debug!(
                     "Leaving {} window unmanaged: {} ({})",
-                    kind, win_info.title, win_info.class_name
+                    kind,
+                    log_text::title(&win_info.title),
+                    log_text::name(&win_info.class_name)
                 );
                 continue;
             }
+
+            let action = self.effective_admission_action(
+                &win_info,
+                action,
+                rule_matched,
+                self.config.behavior.fixed_size_windows,
+            );
+            let floating_rect = (action == config::WindowAction::Float).then(|| {
+                self.get_floating_rect_from_rules(
+                    &win_info.class_name,
+                    &win_info.title,
+                    &executable,
+                    &win_info.rect,
+                    Some(monitor_id),
+                    Some(self.window_rule_size(&win_info.rect)),
+                )
+            });
 
             let target_idx = self.active_workspace_idx(monitor_id);
             let _ = self.ensure_workspace_exists(monitor_id, target_idx);
@@ -322,8 +375,8 @@ impl AppState {
                                 self.record_managed_window_identity(&win_info);
                                 info!(
                                     "Added floating window: {} ({}) to monitor {} - {}x{}",
-                                    win_info.title,
-                                    win_info.class_name,
+                                    log_text::title(&win_info.title),
+                                    log_text::name(&win_info.class_name),
                                     monitor_id,
                                     rule_rect.width,
                                     rule_rect.height
@@ -345,8 +398,8 @@ impl AppState {
                                 self.disable_snap_for_window(win_info.hwnd);
                                 info!(
                                     "Added tiled window: {} ({}) to monitor {} - {}x{}",
-                                    win_info.title,
-                                    win_info.class_name,
+                                    log_text::title(&win_info.title),
+                                    log_text::name(&win_info.class_name),
                                     monitor_id,
                                     win_info.rect.width,
                                     win_info.rect.height
@@ -395,6 +448,28 @@ impl AppState {
             return Some("frameless fixed-size");
         }
         None
+    }
+
+    pub(crate) fn effective_admission_action(
+        &self,
+        window: &WindowInfo,
+        action: config::WindowAction,
+        rule_matched: bool,
+        policy: config::FixedSizeWindows,
+    ) -> config::WindowAction {
+        if !rule_matched
+            && policy == config::FixedSizeWindows::Float
+            && leopardwm_platform_win32::is_fixed_caption_window(window.hwnd)
+        {
+            debug!(
+                "Floating fixed-size caption window: {} ({})",
+                log_text::title(&window.title),
+                log_text::name(&window.class_name)
+            );
+            config::WindowAction::Float
+        } else {
+            action
+        }
     }
 
     fn windows_for_enumeration(&self) -> Result<Vec<WindowInfo>> {
@@ -508,7 +583,7 @@ impl AppState {
                 let viewport_width = self.viewport_width_for(source_monitor);
                 std::iter::once(&hwnd)
                     .chain(source_peers)
-                    .find_map(|&w| ws.column_width_fraction_for_window(w, viewport_width))
+                    .find_map(|&w| unmaximized_width_fraction(ws, w, viewport_width))
                     .map(MovedColumnWidth::Fraction)
             }
             config::NewWidthOnMonitorMove::WindowRuleWidthOrDefaultWidth => Some(
@@ -531,9 +606,9 @@ impl AppState {
 
     /// Get the floating rect for a window based on rules.
     ///
-    /// Rule-defined `width`/`height` are config values (logical pixels) and
-    /// are scaled by the monitor's DPI factor. The `monitor_id` parameter
-    /// is used to look up the scale factor; pass `None` to skip scaling.
+    /// Rule-defined dimensions and work-area offsets are logical pixels scaled
+    /// by the opening monitor's DPI factor. Without a monitor, dimensions use
+    /// scale 1 and offsets cannot be applied.
     pub(crate) fn get_floating_rect_from_rules(
         &self,
         class_name: &str,
@@ -543,10 +618,8 @@ impl AppState {
         monitor_id: Option<MonitorId>,
         size: Option<(i32, i32)>,
     ) -> leopardwm_core_layout::Rect {
-        let scale = monitor_id
-            .and_then(|id| self.monitors.get(&id))
-            .map(|m| m.scale_factor)
-            .unwrap_or(1.0);
+        let monitor = monitor_id.and_then(|id| self.monitors.get(&id));
+        let scale = monitor.map(|m| m.scale_factor).unwrap_or(1.0);
         for rule in &self.compiled_rules {
             if rule.matches(class_name, title, executable, size) {
                 // Only scale rule-provided dimensions (config logical pixels).
@@ -560,12 +633,31 @@ impl AppState {
                     .height
                     .map(|h| scale_px(h, scale))
                     .unwrap_or(original_rect.height);
-                return leopardwm_core_layout::Rect::new(
-                    original_rect.x,
-                    original_rect.y,
-                    width,
-                    height,
-                );
+                let mut rect = Rect::new(original_rect.x, original_rect.y, width, height);
+                if rule.action == config::WindowAction::Float
+                    && (rule.x.is_some() || rule.y.is_some())
+                {
+                    if let Some(monitor) = monitor {
+                        let area = monitor.work_area;
+                        if let Some(x) = rule.x {
+                            rect.x = area.x.saturating_add(scale_px(x, scale));
+                        }
+                        if let Some(y) = rule.y {
+                            rect.y = area.y.saturating_add(scale_px(y, scale));
+                        }
+                        rect.x = rect.x.clamp(
+                            area.x,
+                            area.x
+                                .saturating_add(area.width.saturating_sub(width).max(0)),
+                        );
+                        rect.y = rect.y.clamp(
+                            area.y,
+                            area.y
+                                .saturating_add(area.height.saturating_sub(height).max(0)),
+                        );
+                    }
+                }
+                return rect;
             }
         }
         *original_rect

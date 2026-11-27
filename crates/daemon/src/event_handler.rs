@@ -8,6 +8,7 @@ use crate::state::{
 };
 use crate::ui_sync::DepartureCause;
 use leopardwm_core_layout::{Rect, Visibility, Workspace};
+use leopardwm_ipc::log_text;
 #[cfg(not(test))]
 use leopardwm_platform_win32::enumerate_monitors;
 use leopardwm_platform_win32::{
@@ -53,17 +54,54 @@ fn is_transient_console_host(title: &str, class_name: &str, executable: &str) ->
             || (!executable.is_empty() && title_lower == executable.to_ascii_lowercase()))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn insert_admitted_tile(
     workspace: &mut Workspace,
     hwnd: u64,
     width: Option<i32>,
     rule_slot: Option<usize>,
+    rule_row: Option<usize>,
     in_column: bool,
     take_focus: bool,
     recreated_slot: Option<&crate::recreated_window_slot::RecreatedWindowSlot>,
 ) -> bool {
     if let Some(slot) = recreated_slot {
         slot.insert(workspace, hwnd, take_focus).is_ok()
+    } else if let Some(target_row) = rule_row {
+        if let Some(slot) = rule_slot {
+            if take_focus {
+                workspace
+                    .insert_window_at_row_column(hwnd, target_row, width, slot)
+                    .is_ok()
+            } else {
+                workspace
+                    .insert_window_at_row_column_no_focus(hwnd, target_row, width, slot)
+                    .is_ok()
+            }
+        } else if in_column {
+            let (col, win_slot) = workspace
+                .rows()
+                .get(target_row)
+                .map(|r| (r.focused_column(), r.focused_window_in_column() + 1))
+                .unwrap_or((0, 0));
+            let ok = workspace
+                .insert_window_in_row_column_at(hwnd, target_row, col, win_slot)
+                .is_ok();
+            if ok && take_focus {
+                if let Err(e) = workspace.focus_window(hwnd) {
+                    warn!("Focusing new in-column window {} failed: {:?}", hwnd, e);
+                }
+            }
+            ok
+        } else if take_focus {
+            workspace
+                .insert_window_in_row(hwnd, target_row, width)
+                .is_ok()
+        } else {
+            workspace
+                .insert_window_in_row_no_focus(hwnd, target_row, width)
+                .is_ok()
+        }
     } else if let Some(slot) = rule_slot {
         if take_focus {
             workspace.insert_window_at_column(hwnd, width, slot).is_ok()
@@ -379,7 +417,6 @@ pub(crate) enum AdmitOutcome {
     TransientSuppressed,
     NoWindowInfo,
     TopmostPopup,
-    #[cfg_attr(test, allow(dead_code))]
     ShellCloaked,
     ElevationBlocked,
     TransientConsoleHost,
@@ -389,16 +426,33 @@ pub(crate) enum AdmitOutcome {
 }
 
 impl AppState {
+    pub(crate) fn has_pending_uncloak_retry(&mut self, hwnd: u64) -> bool {
+        if self
+            .shell_cloaked_at_admission
+            .get(&hwnd)
+            .is_some_and(|started| started.elapsed() >= crate::state::SHELL_CLOAK_RETRY_TTL)
+        {
+            self.shell_cloaked_at_admission.remove(&hwnd);
+        }
+        self.shell_cloaked_at_admission.contains_key(&hwnd)
+    }
+
     pub(crate) fn handle_window_event(&mut self, event: WindowEvent) {
+        if let WindowEvent::Uncloaked(hwnd, _) = &event {
+            if !self.has_pending_uncloak_retry(*hwnd) {
+                return;
+            }
+        }
         if let Some(hwnd) = match &event {
             WindowEvent::Created(hwnd, _)
+            | WindowEvent::Uncloaked(hwnd, _)
             | WindowEvent::Destroyed(hwnd)
             | WindowEvent::Hidden(hwnd, _)
             | WindowEvent::Focused(hwnd, _)
             | WindowEvent::Minimized(hwnd, _)
             | WindowEvent::Restored(hwnd)
             | WindowEvent::MovedOrResized(hwnd)
-            | WindowEvent::MoveSizeStart(hwnd)
+            | WindowEvent::MoveSizeStart(hwnd, _)
             | WindowEvent::MoveSizeEnd(hwnd)
             | WindowEvent::TitleChanged(hwnd)
             | WindowEvent::MaximizedAdmissionRestored {
@@ -413,19 +467,20 @@ impl AppState {
 
         let window_id = match &event {
             WindowEvent::Created(id, _)
+            | WindowEvent::Uncloaked(id, _)
             | WindowEvent::Destroyed(id)
             | WindowEvent::Hidden(id, _)
             | WindowEvent::Focused(id, _)
             | WindowEvent::Minimized(id, _)
             | WindowEvent::Restored(id)
             | WindowEvent::MovedOrResized(id)
-            | WindowEvent::MoveSizeStart(id)
+            | WindowEvent::MoveSizeStart(id, _)
             | WindowEvent::MoveSizeEnd(id)
             | WindowEvent::TitleChanged(id)
             | WindowEvent::MaximizedAdmissionRestored { window_id: id, .. } => Some(*id),
             WindowEvent::DisplayChange
             | WindowEvent::WorkAreaChanged
-            | WindowEvent::MouseEnterWindow(_)
+            | WindowEvent::MouseEnterWindow(..)
             | WindowEvent::MouseLeftManaged => None,
         };
 
@@ -442,9 +497,21 @@ impl AppState {
 
         match event {
             WindowEvent::Created(hwnd, event_time_ms) => {
-                self.on_window_created(hwnd, event_time_ms)
+                self.on_window_created(hwnd, event_time_ms);
             }
-            WindowEvent::Destroyed(hwnd) => self.on_window_destroyed_or_hidden(hwnd, None),
+            WindowEvent::Uncloaked(hwnd, event_time_ms) => {
+                let started = self.shell_cloaked_at_admission.remove(&hwnd);
+                self.on_window_created(hwnd, event_time_ms);
+                if let (Some(started), Some(record)) =
+                    (started, self.shell_cloaked_at_admission.get_mut(&hwnd))
+                {
+                    *record = started;
+                }
+            }
+            WindowEvent::Destroyed(hwnd) => {
+                self.shell_cloaked_at_admission.remove(&hwnd);
+                self.on_window_destroyed_or_hidden(hwnd, None);
+            }
             WindowEvent::Hidden(hwnd, event_time_ms) => {
                 self.on_window_destroyed_or_hidden(hwnd, Some(event_time_ms))
             }
@@ -467,14 +534,14 @@ impl AppState {
                     still_maximized,
                 );
             }
-            WindowEvent::MoveSizeStart(hwnd) => self.on_move_size_start(hwnd),
+            WindowEvent::MoveSizeStart(hwnd, capture) => self.on_move_size_start(hwnd, capture),
             WindowEvent::MoveSizeEnd(hwnd) => self.on_move_size_end(hwnd),
             WindowEvent::MovedOrResized(hwnd) => self.on_window_moved_or_resized(hwnd, false),
             WindowEvent::DisplayChange => self.on_display_change(),
             // Work-area changes normally reconcile through the debounced
             // DisplayChangeSettled path; handle direct dispatch defensively.
             WindowEvent::WorkAreaChanged => self.on_display_change(),
-            WindowEvent::MouseEnterWindow(_) | WindowEvent::MouseLeftManaged => {
+            WindowEvent::MouseEnterWindow(..) | WindowEvent::MouseLeftManaged => {
                 // Both are handled by the main event loop's focus-follows-mouse
                 // debouncing (schedule on enter, cancel on leave).
             }
@@ -487,9 +554,11 @@ impl AppState {
                 let in_visible_tabbed_column = self
                     .focused_workspace()
                     .map(|ws| {
-                        ws.columns()
-                            .iter()
-                            .any(|c| c.is_tabbed() && c.contains(hwnd))
+                        ws.rows().iter().any(|r| {
+                            r.columns()
+                                .iter()
+                                .any(|c| c.is_tabbed() && c.contains(hwnd))
+                        })
                     })
                     .unwrap_or(false);
                 if in_visible_tabbed_column {
@@ -767,7 +836,9 @@ impl AppState {
     ) -> ElevationCheck {
         if !block.is_blocked() {
             // A recycled HWND may belong to a manageable window.
-            self.elevation_blocked.remove(&hwnd);
+            if self.elevation_blocked.remove(&hwnd).is_some() {
+                self.settings_health_dirty = true;
+            }
             return ElevationCheck::Manageable;
         }
         let record = ElevationBlockedRecord {
@@ -775,8 +846,14 @@ impl AppState {
             reason: block,
         };
         match self.elevation_blocked.insert(hwnd, record) {
-            None => ElevationCheck::BlockedNew,
-            Some(prev) if prev.title != title || prev.reason != block => ElevationCheck::BlockedNew,
+            None => {
+                self.settings_health_dirty = true;
+                ElevationCheck::BlockedNew
+            }
+            Some(prev) if prev.title != title || prev.reason != block => {
+                self.settings_health_dirty = true;
+                ElevationCheck::BlockedNew
+            }
             Some(_) => ElevationCheck::BlockedKnown,
         }
     }
@@ -803,7 +880,9 @@ impl AppState {
                 warn!(
                     "Cannot tile window '{}' ({}): {:?} — leaving it floating and ignoring it \
                      for this session.",
-                    title, class_name, block
+                    log_text::title(title),
+                    log_text::name(class_name),
+                    block
                 );
                 // Tailor remediation: elevating helps for a higher-integrity
                 // window, but not for a protected/PPL process.
@@ -878,8 +957,30 @@ impl AppState {
         }
     }
 
-    fn on_window_created(&mut self, hwnd: u64, event_time_ms: u32) {
-        let _ = self.try_admit_window_at(hwnd, AdmissionKind::Automatic, Some(event_time_ms));
+    fn window_is_shell_cloaked(&self, hwnd: u64) -> bool {
+        #[cfg(test)]
+        {
+            self.injected_shell_cloaked_hwnds.contains(&hwnd)
+        }
+        #[cfg(not(test))]
+        {
+            leopardwm_platform_win32::is_window_shell_cloaked(hwnd)
+        }
+    }
+
+    fn window_on_current_virtual_desktop(&self, hwnd: u64) -> bool {
+        #[cfg(test)]
+        {
+            !self.injected_off_current_desktop_hwnds.contains(&hwnd)
+        }
+        #[cfg(not(test))]
+        {
+            leopardwm_platform_win32::is_window_on_current_virtual_desktop(hwnd)
+        }
+    }
+
+    fn on_window_created(&mut self, hwnd: u64, event_time_ms: u32) -> AdmitOutcome {
+        self.try_admit_window_at(hwnd, AdmissionKind::Automatic, Some(event_time_ms))
     }
 
     /// Focus recovery and an unmanaged restore are not Create/Show events.
@@ -984,7 +1085,52 @@ impl AppState {
         if replaced {
             self.reconcile_replaced_lifetime_admission(hwnd);
         }
+        if outcome == AdmitOutcome::ShellCloaked && kind == AdmissionKind::Automatic {
+            let on_current_desktop = self.window_on_current_virtual_desktop(hwnd);
+            if let Some(info) = self.lookup_window_info(hwnd) {
+                debug!(
+                    "Ignoring shell-cloaked window: {} ({}) current desktop: {}",
+                    log_text::title(&info.title),
+                    log_text::name(&info.class_name),
+                    on_current_desktop
+                );
+            }
+            if on_current_desktop {
+                self.shell_cloaked_at_admission.retain(|id, started| {
+                    *id == hwnd || started.elapsed() < crate::state::SHELL_CLOAK_RETRY_TTL
+                });
+                self.shell_cloaked_at_admission
+                    .entry(hwnd)
+                    .or_insert_with(std::time::Instant::now);
+            } else {
+                self.shell_cloaked_at_admission.remove(&hwnd);
+            }
+        } else if kind == AdmissionKind::Automatic
+            || matches!(
+                outcome,
+                AdmitOutcome::Admitted | AdmitOutcome::AdmittedPlacementFailed
+            )
+        {
+            self.shell_cloaked_at_admission.remove(&hwnd);
+        }
         outcome
+    }
+
+    fn default_centered_floating_rect(
+        &self,
+        monitor_id: leopardwm_platform_win32::MonitorId,
+    ) -> Rect {
+        let viewport = self
+            .monitors
+            .get(&monitor_id)
+            .map(|m| m.work_area)
+            .unwrap_or_else(|| Rect::new(0, 0, FALLBACK_VIEWPORT_WIDTH, FALLBACK_VIEWPORT_HEIGHT));
+        Rect::new(
+            viewport.x + (viewport.width - 800) / 2,
+            viewport.y + (viewport.height - 600) / 2,
+            800,
+            600,
+        )
     }
 
     fn admit_window_after_replaced_departure(
@@ -1033,12 +1179,7 @@ impl AppState {
             // Skip shell-cloaked windows (suspended UWP frames, windows
             // on other virtual desktops). These are valid HWNDs with
             // WS_VISIBLE but no rendered content.
-            #[cfg(not(test))]
-            if leopardwm_platform_win32::is_window_shell_cloaked(hwnd) {
-                debug!(
-                    "Ignoring shell-cloaked window: {} ({})",
-                    win_info.title, win_info.class_name
-                );
+            if self.window_is_shell_cloaked(hwnd) {
                 return AdmitOutcome::ShellCloaked;
             }
 
@@ -1064,7 +1205,8 @@ impl AppState {
             if is_transient_console_host(&win_info.title, &win_info.class_name, &executable) {
                 debug!(
                     "Skipping transient console-host window with exe-path title: {} ({})",
-                    win_info.title, win_info.class_name
+                    log_text::title(&win_info.title),
+                    log_text::name(&win_info.class_name)
                 );
                 return AdmitOutcome::TransientConsoleHost;
             }
@@ -1076,24 +1218,33 @@ impl AppState {
             let action = matched
                 .map(|r| r.action)
                 .unwrap_or(config::WindowAction::Tile);
-            let (rule_workspace, rule_maximized, rule_column_width, rule_slot, rule_sticky, rule_monitor) =
-                matched
-                    .map(|r| {
-                        (
-                            r.open_on_workspace,
-                            r.open_maximized,
-                            r.column_width.clone(),
-                            r.open_in_column,
-                            r.sticky,
-                            r.new_window_monitor,
-                        )
-                    })
-                    .unwrap_or((None, false, None, None, false, None));
+            let (
+                rule_workspace,
+                rule_maximized,
+                rule_column_width,
+                rule_slot,
+                rule_row,
+                rule_sticky,
+                rule_monitor,
+            ) = matched
+                .map(|r| {
+                    (
+                        r.open_on_workspace,
+                        r.open_maximized,
+                        r.column_width.clone(),
+                        r.open_in_column,
+                        r.row,
+                        r.sticky,
+                        r.new_window_monitor,
+                    )
+                })
+                .unwrap_or((None, false, None, None, None, false, None));
 
             if action == config::WindowAction::Ignore {
                 debug!(
                     "Ignoring window by rule: {} ({})",
-                    win_info.title, win_info.class_name
+                    log_text::title(&win_info.title),
+                    log_text::name(&win_info.class_name)
                 );
                 return AdmitOutcome::PersistentIgnore;
             }
@@ -1101,11 +1252,19 @@ impl AppState {
             if let Some(kind) = self.unmanaged_helper_kind(&win_info, rule_matched) {
                 debug!(
                     "Leaving {} window unmanaged: {} ({})",
-                    kind, win_info.title, win_info.class_name
+                    kind,
+                    log_text::title(&win_info.title),
+                    log_text::name(&win_info.class_name)
                 );
                 return AdmitOutcome::DialogLike;
             }
 
+            let action = self.effective_admission_action(
+                &win_info,
+                action,
+                rule_matched,
+                self.config.behavior.fixed_size_windows,
+            );
             // A per-app rule's open_on_workspace can still redirect it below.
             let (recreated_slot, monitor_id, preferred_monitor) = self.new_window_monitor(
                 &win_info,
@@ -1123,6 +1282,7 @@ impl AppState {
                     recreated_slot.is_none() && preferred_monitor.is_some(),
                 )
             });
+            let default_float_rect = self.default_centered_floating_rect(monitor_id);
 
             let viewport_width = self.viewport_width_for(monitor_id);
 
@@ -1176,26 +1336,7 @@ impl AppState {
             {
                 let added = match action {
                     config::WindowAction::Float => {
-                        let rect = floating_rect.unwrap_or_else(|| {
-                            let viewport = self
-                                .monitors
-                                .get(&monitor_id)
-                                .map(|m| m.work_area)
-                                .unwrap_or_else(|| {
-                                    Rect::new(
-                                        0,
-                                        0,
-                                        FALLBACK_VIEWPORT_WIDTH,
-                                        FALLBACK_VIEWPORT_HEIGHT,
-                                    )
-                                });
-                            Rect::new(
-                                viewport.x + (viewport.width - 800) / 2,
-                                viewport.y + (viewport.height - 600) / 2,
-                                800,
-                                600,
-                            )
-                        });
+                        let rect = floating_rect.unwrap_or(default_float_rect);
                         workspace.add_floating(hwnd, rect).is_ok()
                     }
                     config::WindowAction::Tile => {
@@ -1208,13 +1349,18 @@ impl AppState {
                             .next_window_placement_override
                             .take()
                             .unwrap_or(self.config.behavior.new_window_placement);
+                        let rule_row = rule_row.map(|row| row.min(workspace.row_count() - 1));
                         let in_column = effective_placement == config::NewWindowPlacement::InColumn
-                            && workspace.column_count() > 0;
+                            && rule_row.map_or_else(
+                                || workspace.column_count() > 0,
+                                |r| workspace.column_count_for_row(r) > 0,
+                            );
                         let ok = insert_admitted_tile(
                             workspace,
                             hwnd,
                             rule_width_px,
                             rule_slot,
+                            rule_row,
                             in_column,
                             take_workspace_focus,
                             recreated_slot.as_ref(),
@@ -1236,8 +1382,8 @@ impl AppState {
                     self.window_managed_at.insert(hwnd, now);
                     info!(
                         "Window created: {} ({}) - added to monitor {} workspace {} as {:?}",
-                        win_info.title,
-                        win_info.class_name,
+                        log_text::title(&win_info.title),
+                        log_text::name(&win_info.class_name),
                         monitor_id,
                         target_idx + 1,
                         action
@@ -1280,7 +1426,9 @@ impl AppState {
                     }
                     if opens_in_background {
                         #[cfg(not(test))]
-                        let _ = leopardwm_platform_win32::move_window_offscreen(hwnd);
+                        if !self.paused {
+                            let _ = leopardwm_platform_win32::move_window_offscreen(hwnd);
+                        }
                         self.sync_inactive_workspace_taskbar_button(hwnd);
                     }
                     if let Some(snapshot) = snapshot {
@@ -1421,7 +1569,9 @@ impl AppState {
             leopardwm_platform_win32::taskbar::taskbar_forget(hwnd);
             // Forget an elevation-blocked window once it's truly gone, so a
             // recycled HWND for a normal window isn't wrongly skipped.
-            self.elevation_blocked.remove(&hwnd);
+            if self.elevation_blocked.remove(&hwnd).is_some() {
+                self.settings_health_dirty = true;
+            }
             // Hidden keeps a remembered width for a later show. Destroy must
             // not, or the next occupant of this HWND inherits it.
             self.hidden_column_widths.remove(&hwnd);
@@ -1591,9 +1741,12 @@ impl AppState {
                 .and_then(|v| v.get_mut(ws_idx))
             {
                 if is_hidden_event {
-                    hidden_width = workspace
-                        .find_window_location(hwnd)
-                        .and_then(|(col, _)| workspace.columns().get(col).map(|c| c.width()));
+                    hidden_width =
+                        workspace
+                            .find_window_location_rc(hwnd)
+                            .and_then(|(row, col, _)| {
+                                workspace.column_for_row(row, col).map(|c| c.width())
+                            });
                 }
                 let was_floating = workspace.remove_floating(hwnd);
 
@@ -1843,6 +1996,17 @@ impl AppState {
             }
             return false;
         }
+        if from_mid != to_mid {
+            self.forget_stashed_windows(&[hwnd]);
+        }
+        let source_width = self.viewport_width_for(from_mid);
+        if let Some(ws) = self
+            .workspaces
+            .get_mut(&from_mid)
+            .and_then(|v| v.get_mut(from_widx))
+        {
+            ws.reconcile_scroll_bounds(source_width);
+        }
         if let Some(ws) = self
             .workspaces
             .get_mut(&to_mid)
@@ -1906,33 +2070,15 @@ impl AppState {
             monitor_id
         );
 
-        // A live preview may have removed the dragged window from its source.
-        // Restore membership only if the window survived, then remove placeholders.
-        if let Some(drag) = self.drag_state.take() {
-            if drag.removed_from_source
-                && drag.is_tiled
-                && leopardwm_platform_win32::is_valid_window(drag.hwnd)
-            {
-                if let Some(ws) = self
-                    .workspaces
-                    .get_mut(&drag.source_monitor)
-                    .and_then(|v| v.get_mut(drag.source_workspace_idx))
-                {
-                    let _ = ws.insert_window(drag.hwnd, None);
-                }
-            }
-            for ws_vec in self.workspaces.values_mut() {
-                for ws in ws_vec.iter_mut() {
-                    let _ = ws.remove_window(crate::state::DRAG_PLACEHOLDER_HWND);
-                }
-            }
-        }
+        self.cancel_drag_for_workspace_switch();
         self.pending_drag_hint = Some(crate::state::DragHintAction::Hide);
         if let Some(ref transition) = self.layout_transition {
             for wid in transition.exit_rects.keys() {
                 if !self.is_application_fullscreen(*wid) {
                     #[cfg(not(test))]
-                    let _ = leopardwm_platform_win32::move_window_offscreen(*wid);
+                    if !self.paused {
+                        let _ = leopardwm_platform_win32::move_window_offscreen(*wid);
+                    }
                 }
             }
         }
@@ -2016,7 +2162,9 @@ impl AppState {
         for placement in &old_placements {
             if !animating || placement.visibility != leopardwm_core_layout::Visibility::Visible {
                 #[cfg(not(test))]
-                let _ = leopardwm_platform_win32::move_window_offscreen(placement.window_id);
+                if !self.paused {
+                    let _ = leopardwm_platform_win32::move_window_offscreen(placement.window_id);
+                }
             }
         }
         if animating {
@@ -2239,20 +2387,18 @@ impl AppState {
             .get(&monitor_id)
             .and_then(|workspaces| workspaces.get(ws_idx))
             .is_some_and(|workspace| workspace.is_minimized(hwnd));
-        // Keep Windows' departure handoff from undoing selection: suppress exact replacements and
-        // bind eligible other-workspace handoffs; Minimized allows a 500 ms OS timestamp window.
-        let event_is_eligible = match intent.origin {
-            LastWindowDepartureOrigin::Minimized => event_time_is_no_later_than(
-                event_time_ms,
-                intent
-                    .armed_at_event_time_ms
-                    .wrapping_add(MINIMIZE_HANDOFF_WINDOW_MS),
-            ),
-            LastWindowDepartureOrigin::DirectDestroyedOrHidden
-            | LastWindowDepartureOrigin::EventlessPrune => {
-                event_time_is_no_later_than(event_time_ms, intent.armed_at_event_time_ms)
-            }
+        // Exact replacements and Minimized handoffs have a 500 ms timestamp window;
+        // other direct departure events must be no later than the arm tick.
+        let has_handoff_window = intent.origin == LastWindowDepartureOrigin::Minimized
+            || intent.replacement_hwnd == Some(hwnd);
+        let cutoff = if has_handoff_window {
+            intent
+                .armed_at_event_time_ms
+                .wrapping_add(MINIMIZE_HANDOFF_WINDOW_MS)
+        } else {
+            intent.armed_at_event_time_ms
         };
+        let event_is_eligible = event_time_is_no_later_than(event_time_ms, cutoff);
         let outcome = if !intent.is_fresh() {
             self.pending_last_window_departure = None;
             "stale_ttl"
@@ -2263,7 +2409,7 @@ impl AppState {
             "monitor_or_workspace_changed"
         } else if !event_is_eligible {
             self.pending_last_window_departure = None;
-            if intent.origin == LastWindowDepartureOrigin::Minimized {
+            if has_handoff_window {
                 "later_than_handoff_window"
             } else {
                 "later_than_arm"
@@ -2469,9 +2615,9 @@ impl AppState {
                                 let same_col = self.workspaces.get(&mon_a)
                                     .and_then(|v| v.get(ws_a))
                                     .is_some_and(|ws| {
-                                        let loc_a = ws.find_window_location(prev_hwnd);
-                                        let loc_b = ws.find_window_location(hwnd);
-                                        matches!((loc_a, loc_b), (Some((ca, _)), Some((cb, _))) if ca == cb)
+                                        let loc_a = ws.find_window_location_rc(prev_hwnd);
+                                        let loc_b = ws.find_window_location_rc(hwnd);
+                                        matches!((loc_a, loc_b), (Some((ra, ca, _)), Some((rb, cb, _))) if ra == rb && ca == cb)
                                     });
                                 if same_col {
                                     let consumed =
@@ -2764,7 +2910,8 @@ impl AppState {
                 if action != config::WindowAction::Ignore {
                     info!(
                         "Recovering suppressed window: {} ({}) - user focused it",
-                        win_info.title, win_info.class_name
+                        log_text::title(&win_info.title),
+                        log_text::name(&win_info.class_name)
                     );
                     // Consume the entry now (immediately before
                     // dispatch) so the Created handler doesn't
@@ -2815,7 +2962,7 @@ impl AppState {
                     if action != config::WindowAction::Ignore {
                         info!(
                             "Recovering console-host window with real title: {} ({}) - user focused it",
-                            win_info.title, win_info.class_name
+                            log_text::title(&win_info.title), log_text::name(&win_info.class_name)
                         );
                         self.admit_created_without_event_time(hwnd);
                         let recovery_monitor =
@@ -2873,16 +3020,18 @@ impl AppState {
             self.previous_focused_hwnd = None;
         }
 
-        let col_loc = workspace.find_window_location(hwnd);
-        let col_info = col_loc.map(|(ci, _)| {
-            let col = &workspace.columns()[ci];
-            let visible = col
-                .windows()
-                .iter()
-                .filter(|w| !workspace.is_minimized(**w))
-                .count();
-            (ci, col.len(), visible)
-        });
+        let col_info = workspace
+            .find_window_location_rc(hwnd)
+            .and_then(|(r, ci, _)| {
+                workspace.columns_for_row(r).get(ci).map(|col| {
+                    let visible = col
+                        .windows()
+                        .iter()
+                        .filter(|w| !workspace.is_minimized(**w))
+                        .count();
+                    (ci, col.len(), visible)
+                })
+            });
         info!(
             "Window {} minimized (col={:?}, minimized_total={})",
             hwnd,
@@ -3177,6 +3326,7 @@ impl AppState {
             return (false, false, false, None);
         }
         let drag_hwnd = drag.hwnd;
+        leopardwm_platform_win32::disarm_drag_float();
         let removed_from_source = drag.removed_from_source;
         let drag_source = Some((drag.source_monitor, drag.source_workspace_idx));
         self.drag_state = None;
@@ -3187,7 +3337,11 @@ impl AppState {
         (true, removed_placeholder, removed_from_source, drag_source)
     }
 
-    fn on_move_size_start(&mut self, hwnd: u64) {
+    fn on_move_size_start(
+        &mut self,
+        hwnd: u64,
+        start_capture: Option<leopardwm_platform_win32::MoveStartCapture>,
+    ) {
         debug!("User started dragging/resizing window {}", hwnd);
 
         // Distinguish resize (border drag) from move (title bar drag).
@@ -3199,45 +3353,68 @@ impl AppState {
             return;
         }
 
-        let (is_tiled, source_monitor, source_ws_idx, source_window_slot, col_idx) =
-            if let Some((monitor_id, ws_idx)) = self.find_window_workspace(hwnd) {
-                let is_floating = self
-                    .workspaces
+        let (
+            is_tiled,
+            source_monitor,
+            source_ws_idx,
+            source_row,
+            source_window_slot,
+            col_idx,
+            source_column_width,
+        ) = if let Some((monitor_id, ws_idx)) = self.find_window_workspace(hwnd) {
+            let is_floating = self
+                .workspaces
+                .get(&monitor_id)
+                .and_then(|v| v.get(ws_idx))
+                .is_none_or(|ws| ws.is_floating(hwnd));
+            let (source_row, source_window_slot, col_idx, source_column_width) = if !is_floating {
+                self.workspaces
                     .get(&monitor_id)
                     .and_then(|v| v.get(ws_idx))
-                    .is_none_or(|ws| ws.is_floating(hwnd));
-                let (source_window_slot, col_idx) = if !is_floating {
-                    self.workspaces
-                        .get(&monitor_id)
-                        .and_then(|v| v.get(ws_idx))
-                        .and_then(|ws| ws.find_window_location(hwnd))
-                        .map(|(col, slot)| (slot, col))
-                        .unwrap_or((0, 0))
-                } else {
-                    (0, 0)
-                };
-                (
-                    !is_floating,
-                    monitor_id,
-                    ws_idx,
-                    source_window_slot,
-                    col_idx,
-                )
+                    .and_then(|ws| {
+                        ws.find_window_location_rc(hwnd).map(|(row, col, slot)| {
+                            let width =
+                                ws.rows().get(row).and_then(|r| r.column_restore_width(col));
+                            (row, slot, col, width)
+                        })
+                    })
+                    .unwrap_or((0, 0, 0, None))
             } else {
-                (
-                    false,
-                    self.focused_monitor,
-                    self.active_workspace_idx(self.focused_monitor),
-                    0,
-                    0,
-                )
+                (0, 0, 0, None)
             };
+            (
+                !is_floating,
+                monitor_id,
+                ws_idx,
+                source_row,
+                source_window_slot,
+                col_idx,
+                source_column_width,
+            )
+        } else {
+            (
+                false,
+                self.focused_monitor,
+                self.active_workspace_idx(self.focused_monitor),
+                0,
+                0,
+                0,
+                None,
+            )
+        };
+        leopardwm_platform_win32::take_drag_float_request(hwnd);
         self.drag_state = Some(DragState {
             hwnd,
             is_tiled,
+            float_on_drop: false,
+            start_visible_rect: start_capture
+                .filter(|_| is_tiled)
+                .map(|capture| capture.rect),
             source_monitor,
             source_workspace_idx: source_ws_idx,
+            source_row,
             source_window_slot,
+            current_row_index: source_row,
             current_column_index: col_idx,
             last_drop_target: None,
             last_hint_update: None,
@@ -3245,7 +3422,13 @@ impl AppState {
             preview_mode: crate::state::DragPreviewMode::None,
             target_column_peers: Vec::new(),
             source_column_peers: Vec::new(),
+            source_column_width,
         });
+        if is_tiled && !self.paused {
+            if let Some(capture) = start_capture {
+                leopardwm_platform_win32::arm_drag_float(hwnd, capture.generation);
+            }
+        }
         // Disable DWM-managed position interpolation on the
         // dragged window so its final SetWindowPos on drop
         // lands instantly. Without this, DWM smooths the
@@ -3271,6 +3454,9 @@ impl AppState {
         self.last_placed_layout_rects.remove(&hwnd);
 
         if self.resize_hwnd == Some(hwnd) {
+            if self.drag_state.is_none() {
+                leopardwm_platform_win32::disarm_drag_float();
+            }
             self.resize_hwnd = None;
             self.handle_resize_complete(hwnd);
             // Restore DWM transitions on this early-return path so they cannot
@@ -3293,6 +3479,7 @@ impl AppState {
             return;
         }
 
+        leopardwm_platform_win32::disarm_drag_float();
         let drag = self.drag_state.take();
         self.pending_drag_hint = Some(DragHintAction::Hide);
 
@@ -3313,8 +3500,15 @@ impl AppState {
                         .get_mut(&monitor_id)
                         .and_then(|v| v.get_mut(ws_idx))
                     {
-                        workspace.update_floating(hwnd, visible_rect);
+                        let updated = workspace.update_floating(hwnd, visible_rect);
                         debug!("Floating window {} dropped at {:?}", hwnd, visible_rect);
+                        let monitors: Vec<_> = self.monitors.values().cloned().collect();
+                        if updated
+                            && find_monitor_for_rect(&monitors, &visible_rect)
+                                .is_some_and(|monitor| monitor.id != drag.source_monitor)
+                        {
+                            self.forget_stashed_windows(&[hwnd]);
+                        }
                     }
                 }
             }
@@ -3322,18 +3516,21 @@ impl AppState {
             return;
         }
 
+        let requested = leopardwm_platform_win32::take_drag_float_request(hwnd);
+        if !self.paused
+            && (drag.float_on_drop || requested)
+            && leopardwm_platform_win32::get_window_visible_rect(hwnd).is_some_and(|rect| {
+                drag.start_visible_rect.is_some_and(|start| start != rect)
+                    && self.finalize_float_drag(&drag, rect)
+            })
+        {
+            leopardwm_platform_win32::set_dwm_transitions_disabled(hwnd, false);
+            return;
+        }
+
         let Some(win_info) = self.lookup_window_info(hwnd) else {
             self.clear_drag_placeholder();
-            if drag.removed_from_source && leopardwm_platform_win32::is_valid_window(hwnd) {
-                self.restore_drag_source(
-                    hwnd,
-                    drag.source_monitor,
-                    drag.source_workspace_idx,
-                    drag.current_column_index,
-                    drag.source_window_slot,
-                    &drag.source_column_peers,
-                );
-            }
+            self.restore_removed_drag_source(&drag);
             self.snap_back_tiled(drag.source_monitor, drag.source_workspace_idx);
             leopardwm_platform_win32::set_dwm_transitions_disabled(hwnd, false);
             return;
@@ -3343,25 +3540,65 @@ impl AppState {
             .map(|m| m.id)
             .unwrap_or(drag.source_monitor);
 
-        let shift_held = is_shift_key_pressed();
-
-        if shift_held {
-            for ws_vec in self.workspaces.values_mut() {
-                for ws in ws_vec.iter_mut() {
-                    let _ = ws.remove_window(crate::state::DRAG_PLACEHOLDER_HWND);
-                }
-            }
-            if target_monitor == drag.source_monitor {
-                self.snap_back_tiled(drag.source_monitor, drag.source_workspace_idx);
-            } else {
-                self.execute_cross_monitor_drag(hwnd, &drag, target_monitor, &win_info.rect);
-            }
-        } else {
-            self.finalize_drag_merge(hwnd, &drag, target_monitor, &win_info.rect);
-        }
+        self.finalize_tiled_drop(
+            hwnd,
+            &drag,
+            target_monitor,
+            &win_info.rect,
+            is_shift_key_pressed(),
+        );
         // Restore minimize/maximize transitions after placement; the temporary
         // DWM disable suppresses only the drop-to-layout slide.
         leopardwm_platform_win32::set_dwm_transitions_disabled(hwnd, false);
+    }
+
+    pub(crate) fn finalize_tiled_drop(
+        &mut self,
+        hwnd: u64,
+        drag: &DragState,
+        target_monitor: leopardwm_platform_win32::MonitorId,
+        rect: &Rect,
+        shift_held: bool,
+    ) {
+        if self.config.behavior.plain_drag_action.reorders(shift_held) {
+            self.finalize_shift_drag(drag, target_monitor, rect);
+        } else {
+            self.finalize_drag_merge(hwnd, drag, target_monitor, rect);
+        }
+    }
+
+    pub(crate) fn finalize_shift_drag(
+        &mut self,
+        drag: &DragState,
+        target_monitor: leopardwm_platform_win32::MonitorId,
+        rect: &Rect,
+    ) {
+        self.clear_drag_placeholder();
+        self.restore_removed_drag_source(drag);
+        let target_viewport = self.layout_viewport(target_monitor);
+        let (target_work_area, _) = self.monitor_work_area_and_orient(target_monitor);
+        let target_ws_idx = self.active_workspace_idx(target_monitor);
+        let target_row = self
+            .workspaces
+            .get(&target_monitor)
+            .and_then(|v| v.get(target_ws_idx))
+            .map(|ws| {
+                let (cursor_x, cursor_y) = leopardwm_platform_win32::get_cursor_pos()
+                    .unwrap_or((rect.x + rect.width / 2, rect.y + rect.height / 2));
+                crate::drag::target_row_for_cursor(
+                    ws,
+                    target_viewport,
+                    target_work_area,
+                    cursor_x,
+                    cursor_y,
+                )
+            })
+            .unwrap_or(0);
+        if target_monitor == drag.source_monitor && target_row == drag.source_row {
+            self.snap_back_tiled(drag.source_monitor, drag.source_workspace_idx);
+        } else {
+            self.execute_cross_monitor_drag(drag.hwnd, drag, target_monitor, target_row, rect);
+        }
     }
 
     pub(crate) fn application_fullscreen_geometry(
@@ -3473,7 +3710,9 @@ impl AppState {
             }
             ApplicationFullscreenExitRoute::InactivePark => {
                 #[cfg(not(test))]
-                let _ = leopardwm_platform_win32::move_window_offscreen(hwnd);
+                if !self.paused {
+                    let _ = leopardwm_platform_win32::move_window_offscreen(hwnd);
+                }
                 self.sync_inactive_workspace_taskbar_button(hwnd);
             }
             ApplicationFullscreenExitRoute::ActiveTiledApply => {
@@ -3825,33 +4064,8 @@ impl AppState {
             }
             return;
         }
-        if let Some(ref mut drag) = self.drag_state {
-            if drag.hwnd == hwnd {
-                if drag.is_tiled {
-                    // Throttle hint updates to ~60fps
-                    let now = std::time::Instant::now();
-                    if drag
-                        .last_hint_update
-                        .is_some_and(|t| now.duration_since(t).as_millis() < 16)
-                    {
-                        return;
-                    }
-                    drag.last_hint_update = Some(now);
-                    self.update_drag_hint(hwnd);
-                } else {
-                    // Floating window drag — throttle border updates to ~60fps
-                    let now = std::time::Instant::now();
-                    if drag
-                        .last_hint_update
-                        .is_some_and(|t| now.duration_since(t).as_millis() < 16)
-                    {
-                        return;
-                    }
-                    drag.last_hint_update = Some(now);
-                    self.show_border(hwnd);
-                }
-                return;
-            }
+        if self.update_active_drag(hwnd) {
+            return;
         }
         if let Some((monitor_id, ws_idx)) = self.find_window_workspace(hwnd) {
             if self.on_inactive_workspace_window_moved(hwnd, monitor_id, ws_idx, &mut is_maximized)
@@ -4227,7 +4441,7 @@ impl AppState {
                         m.work_area.x,
                         m.work_area.y,
                         if m.is_primary { " [PRIMARY]" } else { "" },
-                        m.device_name
+                        log_text::name(&m.device_name)
                     );
                 }
 
@@ -4329,20 +4543,25 @@ impl AppState {
         };
         let width_presets = self.config.layout.width_presets.clone();
         let height_presets = self.config.layout.height_presets.clone();
+        let free_resize = self.config.layout.mouse_resize == crate::config::MouseResize::Free;
 
         let snap_rect = self
             .workspaces
             .get_mut(&monitor_id)
             .and_then(|v| v.get_mut(ws_idx))
             .and_then(|ws| {
-                ws.preview_resize_snap(
-                    hwnd,
-                    visible_rect.width,
-                    visible_rect.height,
-                    &width_presets,
-                    &height_presets,
-                    work_area,
-                )
+                if free_resize {
+                    ws.preview_resize_free(hwnd, visible_rect.width, visible_rect.height, work_area)
+                } else {
+                    ws.preview_resize_snap(
+                        hwnd,
+                        visible_rect.width,
+                        visible_rect.height,
+                        &width_presets,
+                        &height_presets,
+                        work_area,
+                    )
+                }
             });
 
         let Some(target_rect) = snap_rect else {
@@ -4412,39 +4631,46 @@ impl AppState {
         let viewport_width = self.viewport_width_for(monitor_id);
         let width_presets = self.config.layout.width_presets.clone();
         let height_presets = self.config.layout.height_presets.clone();
-
+        let free_resize = self.config.layout.mouse_resize == crate::config::MouseResize::Free;
         let viewport_height = self.viewport_height_for(monitor_id);
         if let Some(ws) = self
             .workspaces
             .get_mut(&monitor_id)
             .and_then(|v| v.get_mut(ws_idx))
         {
-            if let Some((col_idx, win_idx)) = ws.find_window_location(hwnd) {
-                ws.snap_column_width_to_preset(
-                    col_idx,
-                    visible_rect.width,
-                    &width_presets,
-                    viewport_width,
-                );
-
-                let col_len = ws.columns().get(col_idx).map(|c| c.len()).unwrap_or(0);
-                if col_len > 1 {
-                    ws.snap_window_height_to_preset(
-                        col_idx,
-                        win_idx,
+            if let Some((row_idx, col_idx, _)) = ws.find_window_location_rc(hwnd) {
+                if free_resize {
+                    ws.resize_free(
+                        hwnd,
+                        visible_rect.width,
                         visible_rect.height,
+                        leopardwm_core_layout::Rect::new(0, 0, viewport_width, viewport_height),
+                    );
+                } else {
+                    ws.resize_snap(
+                        hwnd,
+                        visible_rect.width,
+                        visible_rect.height,
+                        &width_presets,
                         &height_presets,
-                        viewport_height,
+                        leopardwm_core_layout::Rect::new(0, 0, viewport_width, viewport_height),
                     );
                 }
 
                 ws.ensure_focused_visible_animated(viewport_width);
 
-                info!(
-                    "Resize snap: window {} → width preset, new column width = {}",
-                    hwnd,
-                    ws.columns().get(col_idx).map(|c| c.width()).unwrap_or(0)
-                );
+                let width = ws
+                    .column_for_row(row_idx, col_idx)
+                    .map(|c| c.width())
+                    .unwrap_or(0);
+                if free_resize {
+                    info!("Free resize: window {}, new column width = {}", hwnd, width);
+                } else {
+                    info!(
+                        "Resize snap: window {} → width preset, new column width = {}",
+                        hwnd, width
+                    );
+                }
             }
         }
 
@@ -4611,6 +4837,34 @@ mod edit_config_match_tests {
         assert!(!title_names_config_file("Inbox - Mail", "config.toml"));
         assert!(!title_names_config_file("config.toml", ""));
     }
+
+    #[test]
+    fn insert_admitted_tile_with_rule_row_respects_in_column() {
+        let mut ws = super::Workspace::new();
+        ws.set_row_layout(&[0.5, 0.5]);
+        assert!(super::insert_admitted_tile(
+            &mut ws,
+            100,
+            Some(800),
+            None,
+            Some(1),
+            false,
+            true,
+            None,
+        ));
+        assert!(super::insert_admitted_tile(
+            &mut ws,
+            101,
+            Some(800),
+            None,
+            Some(1),
+            true,
+            true,
+            None,
+        ));
+        assert_eq!(ws.column_count_for_row(1), 1);
+        assert_eq!(ws.column_for_row(1, 0).unwrap().windows(), &[100, 101]);
+    }
 }
 
 #[cfg(test)]
@@ -4680,8 +4934,13 @@ mod failed_drop_lookup_tests {
         state.drag_state = Some(DragState {
             hwnd,
             is_tiled: true,
+            float_on_drop: false,
+            start_visible_rect: None,
             source_monitor: 1,
             source_workspace_idx: 0,
+            source_row: 0,
+            current_row_index: 0,
+            source_column_width: Some(800),
             source_window_slot: 1,
             current_column_index: 1,
             last_drop_target: None,
@@ -4711,6 +4970,168 @@ mod failed_drop_lookup_tests {
         let ws = state.focused_workspace().unwrap();
         assert_eq!(ws.columns()[0].windows(), &[first.id(), hwnd, last.id()]);
         assert_eq!(ws.columns()[1].windows(), &[target.id()]);
+        assert!(!ws.contains_window(DRAG_PLACEHOLDER_HWND));
+    }
+
+    #[test]
+    fn drag_action_selects_drop_result() {
+        use crate::config::DragAction;
+
+        for (action, shift, reorder) in [
+            (DragAction::Merge, false, false),
+            (DragAction::Merge, true, true),
+            (DragAction::Reorder, false, true),
+            (DragAction::Reorder, true, false),
+        ] {
+            let dragged = TestWindow::new();
+            let first = TestWindow::new();
+            let last = TestWindow::new();
+            let target = TestWindow::new();
+            let mut state = state_after_preview(dragged.id(), [first.id(), last.id()], target.id());
+            state.config.behavior.plain_drag_action = action;
+            let drag = state.drag_state.take().unwrap();
+            state.finalize_tiled_drop(dragged.id(), &drag, 1, &Rect::new(0, 0, 200, 100), shift);
+            let ws = state.focused_workspace().unwrap();
+            if reorder {
+                assert_eq!(
+                    ws.columns()[0].windows(),
+                    &[first.id(), dragged.id(), last.id()]
+                );
+                assert_eq!(ws.columns()[1].windows(), &[target.id()]);
+            } else {
+                assert_eq!(ws.columns()[0].windows(), &[first.id(), last.id()]);
+                assert_eq!(ws.columns()[1].windows(), &[target.id(), dragged.id()]);
+            }
+        }
+    }
+
+    #[test]
+    fn merge_drop_missing_monitor_restores_source_slot() {
+        let dragged = TestWindow::new();
+        let first = TestWindow::new();
+        let last = TestWindow::new();
+        let target = TestWindow::new();
+        let mut state = state_after_preview(dragged.id(), [first.id(), last.id()], target.id());
+        state.clear_drag_placeholder();
+        let drag = state.drag_state.take().unwrap();
+
+        state.finalize_drag_merge(dragged.id(), &drag, 2, &Rect::new(0, 0, 200, 100));
+
+        let ws = state.focused_workspace().unwrap();
+        assert_eq!(
+            ws.columns()[0].windows(),
+            &[first.id(), dragged.id(), last.id()]
+        );
+        assert_eq!(ws.columns()[1].windows(), &[target.id()]);
+    }
+
+    #[test]
+    fn shift_drop_same_monitor_restores_source_slot() {
+        let dragged = TestWindow::new();
+        let first = TestWindow::new();
+        let last = TestWindow::new();
+        let target = TestWindow::new();
+        let mut state = state_after_preview(dragged.id(), [first.id(), last.id()], target.id());
+        let drag = state.drag_state.take().unwrap();
+
+        state.finalize_shift_drag(&drag, 1, &Rect::new(0, 0, 200, 100));
+
+        let ws = state.focused_workspace().unwrap();
+        assert_eq!(
+            ws.columns()[0].windows(),
+            &[first.id(), dragged.id(), last.id()]
+        );
+        assert_eq!(ws.columns()[1].windows(), &[target.id()]);
+    }
+
+    #[test]
+    fn workspace_switch_during_drag_restores_source_slot() {
+        let dragged = TestWindow::new();
+        let first = TestWindow::new();
+        let last = TestWindow::new();
+        let target = TestWindow::new();
+        let mut state = state_after_preview(dragged.id(), [first.id(), last.id()], target.id());
+
+        state.handle_command(leopardwm_ipc::IpcCommand::SwitchWorkspace { index: 2 });
+
+        let ws = &state.workspaces[&1][0];
+        assert_eq!(ws.column_count(), 2);
+        assert_eq!(
+            ws.columns()[0].windows(),
+            &[first.id(), dragged.id(), last.id()]
+        );
+        assert_eq!(ws.columns()[1].windows(), &[target.id()]);
+        assert!(!ws.contains_window(DRAG_PLACEHOLDER_HWND));
+    }
+
+    #[test]
+    fn workspace_switch_removes_source_placeholder_before_restoring_slot() {
+        let dragged = TestWindow::new();
+        let first = TestWindow::new();
+        let last = TestWindow::new();
+        let target = TestWindow::new();
+        let mut state = state_after_preview(dragged.id(), [first.id(), last.id()], target.id());
+        state.clear_drag_placeholder();
+        state
+            .focused_workspace_mut()
+            .unwrap()
+            .insert_window_in_column_at(DRAG_PLACEHOLDER_HWND, 0, 0)
+            .unwrap();
+
+        state.handle_command(leopardwm_ipc::IpcCommand::SwitchWorkspace { index: 2 });
+
+        let ws = &state.workspaces[&1][0];
+        assert_eq!(
+            ws.columns()[0].windows(),
+            &[first.id(), dragged.id(), last.id()]
+        );
+        assert_eq!(ws.column_count(), 2);
+        assert!(!ws.contains_window(DRAG_PLACEHOLDER_HWND));
+    }
+
+    #[test]
+    fn focus_follow_workspace_switch_restores_dragged_source_slot() {
+        let dragged = TestWindow::new();
+        let first = TestWindow::new();
+        let last = TestWindow::new();
+        let target = TestWindow::new();
+        let mut state = state_after_preview(dragged.id(), [first.id(), last.id()], target.id());
+        state.clear_drag_placeholder();
+        state
+            .focused_workspace_mut()
+            .unwrap()
+            .insert_window_in_column_at(DRAG_PLACEHOLDER_HWND, 0, 0)
+            .unwrap();
+        state.ensure_workspace_exists(1, 1);
+
+        state.follow_workspace_without_stealing_focus(1, 1, None);
+
+        let ws = &state.workspaces[&1][0];
+        assert_eq!(
+            ws.columns()[0].windows(),
+            &[first.id(), dragged.id(), last.id()]
+        );
+        assert_eq!(ws.column_count(), 2);
+        assert!(!ws.contains_window(DRAG_PLACEHOLDER_HWND));
+    }
+
+    #[test]
+    fn workspace_switch_during_drag_restores_as_column_when_source_gone() {
+        let dragged = TestWindow::new();
+        let first = TestWindow::new();
+        let last = TestWindow::new();
+        let target = TestWindow::new();
+        let mut state = state_after_preview(dragged.id(), [first.id(), last.id()], target.id());
+        let ws = state.focused_workspace_mut().unwrap();
+        ws.remove_window(first.id()).unwrap();
+        ws.remove_window(last.id()).unwrap();
+
+        state.handle_command(leopardwm_ipc::IpcCommand::SwitchWorkspace { index: 2 });
+
+        let ws = &state.workspaces[&1][0];
+        assert_eq!(ws.column_count(), 2);
+        assert_eq!(ws.columns()[0].windows(), &[target.id()]);
+        assert_eq!(ws.columns()[1].windows(), &[dragged.id()]);
         assert!(!ws.contains_window(DRAG_PLACEHOLDER_HWND));
     }
 

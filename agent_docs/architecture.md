@@ -5,6 +5,7 @@
 ```
 daemon ──> core_layout (layout engine, platform-agnostic)
        ──> platform_win32 ──> core_layout (types only)
+       │                  ──> ipc (diagnostic logging)
        ──> ipc (named-pipe protocol)
 
 cli ──> ipc (sends commands to daemon)
@@ -24,7 +25,8 @@ All source in `crates/daemon/src/`. All AppState fields are `pub(crate)` for mul
 | `state.rs` | AppState struct, constructor, constants, basic accessors, drag type enums |
 | `recreated_window_slot.rs` | Suspend/resume-gated same-process/class hidden-window column and tab restoration |
 | `event_handler.rs` | handle_window_event (Created/Destroyed/Focused/Hidden/etc.), apply_focus_follows_mouse |
-| `command_handler.rs` | handle_command — dispatches 26 IPC commands (focus, move, resize, scroll, config, etc.) |
+| `command_handler.rs` | handle_command — dispatches IPC commands (focus, move, resize, scroll, config, etc.) |
+| `diagnostic_snapshot.rs` | Gather daemon state and health for the shared diagnostic snapshot writer |
 | `helpers.rs` | Shared helpers: layout recalc, border management, config reload, persistence, window rules |
 | `drag.rs` | Drag-and-drop: update_drag_hint, execute_window_merge, finalize_drag_merge, placeholder logic |
 | `config.rs` | TOML config parsing, defaults, validation, HotkeyConfig, WindowRule, theme |
@@ -50,6 +52,9 @@ Win32 events (WinEventHook, message pump)
 ```
 
 ## Key Subsystems
+
+### Diagnostic Logging
+Use `leopardwm_ipc::log_text::{title, path, text, name}` with Display (`{}` or `%`) for foreign text in tracing messages or fields. Use `text` for arbitrary input and errors that can echo it, not Debug on a struct that holds it. The shared daemon and watchdog file layer accepts only audited crate targets and uses `RecordTime` to tag each record with `[lwm-log-v1]`. User values are encoded as `@lwm:kind"value"` spans. Snapshots redact escaped spans and omit untagged, malformed, or incomplete records. `name` is escaped but not hidden; reserve it for values safe to share. A marker is not authentication: an old log's unescaped multiline title can forge a tagged-looking line of its own text, but does not make subsequent old records eligible.
 
 ### Border Overlay (`platform_win32/src/border.rs`)
 - Custom per-pixel alpha rendering using SDF for anti-aliased rounded corners
@@ -94,3 +99,12 @@ Electron apps (Beeper, Slack) create/hide `Chrome_WidgetWin_1` popup windows eve
 - Custom combobox component replaces native `<select>` in rules table
 - Hotkeys tab: command read-only with human-readable labels, sorted by category, per-row reset icon
 - DEFAULT_HOTKEYS and CMD_ORDER constants in JS must stay in sync with Rust `HotkeyConfig::default()`
+
+### Multi-Row Layout (`core_layout/src/row.rs`, `workspace/`)
+- `Workspace` decomposes into `Vec<WorkspaceRow>` (1 to 4 rows).
+- Each `WorkspaceRow` independently owns its columns, active column index, active window index, and horizontal scroll offset.
+- `row_shares: Vec<f64>` and `row_gap: i32` control vertical partitioning of the monitor viewport rect.
+- Vertical space is partitioned proportionally: each row receives a distinct vertical sub-rect `(x, y, width, height)`.
+- Placement calculation aggregates physical window rectangles across all active rows without cross-row interference.
+- Intra-row and cross-row operations (`focus_row`, `focus_row_up`, `focus_row_down`, `move_window_to_row_up`, `move_window_to_row_down`) route through `Workspace` methods while preserving focused-state consistency.
+- `move_window_across_rows = true` (default `false`) allows `move_window_up` / `move_window_down` to move windows across row boundaries when reaching column top or bottom (vertical focus `focus_up` / `focus_down` always crosses rows when multiple rows exist).

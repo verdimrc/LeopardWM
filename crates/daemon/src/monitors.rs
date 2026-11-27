@@ -1,20 +1,21 @@
 use crate::helpers::ScaledLayoutParams;
 use crate::state::*;
 use leopardwm_core_layout::{Rect, Workspace};
+use leopardwm_ipc::log_text;
 use leopardwm_platform_win32::{MonitorId, MonitorInfo};
 use std::collections::{HashMap, HashSet};
 use tracing::{info, warn};
 
-fn apply_reconciled_geometry(
+pub(crate) fn apply_reconciled_geometry(
     workspaces: &mut [Workspace],
     params: &ScaledLayoutParams,
     source_viewport_width: i32,
     destination_viewport_width: i32,
 ) {
-    for workspace in workspaces {
+    for (ws_idx, workspace) in workspaces.iter_mut().enumerate() {
         let old_gap = workspace.gap();
         let (old_ol, old_or, _, _) = workspace.outer_gaps();
-        params.apply_to(workspace);
+        params.apply_to(workspace, ws_idx);
         if workspace.rescale_column_widths(
             old_gap,
             old_ol,
@@ -28,6 +29,73 @@ fn apply_reconciled_geometry(
 }
 
 impl AppState {
+    pub(crate) fn restore_stashed_monitor_layout(
+        &mut self,
+        monitor: &MonitorInfo,
+        mut stash: StashedMonitorLayout,
+    ) -> i32 {
+        let allowed: HashSet<u64> = self
+            .workspaces
+            .values()
+            .flatten()
+            .flat_map(|ws| ws.all_window_ids())
+            .collect();
+        let mut dropped = 0;
+        for ws in &mut stash.workspaces {
+            for wid in ws.all_window_ids() {
+                if !allowed.contains(&wid) {
+                    if ws.is_floating(wid) {
+                        ws.remove_floating(wid);
+                    } else {
+                        let _ = ws.remove_window(wid);
+                    }
+                    dropped += 1;
+                }
+            }
+            self.config.apply_monitor_rules(&monitor.device_name, ws);
+            ws.set_center_columns(self.config.center_columns_for(&monitor.device_name).into());
+            ws.ensure_focused_visible(stash.source_viewport_width);
+        }
+        let returning: HashSet<u64> = stash
+            .workspaces
+            .iter()
+            .flat_map(|w| w.all_window_ids())
+            .collect();
+        for ws_vec in self.workspaces.values_mut() {
+            for ws in ws_vec {
+                for &wid in &returning {
+                    let _ = ws.remove_window(wid);
+                    ws.remove_floating(wid);
+                }
+            }
+        }
+        let clamped = stash
+            .active_workspace
+            .min(stash.workspaces.len().saturating_sub(1));
+        info!("Restored {} stashed workspace(s) for reconnected monitor {} ({}); dropped {} window(s)",
+            stash.workspaces.len(), monitor.id, log_text::name(&monitor.device_name), dropped);
+        self.workspaces.insert(monitor.id, stash.workspaces);
+        self.active_workspace.insert(monitor.id, clamped);
+        stash.source_viewport_width
+    }
+
+    pub(crate) fn forget_stashed_windows(&mut self, windows: &[u64]) {
+        for stash in self.stashed_monitor_layouts.values_mut() {
+            for ws in &mut stash.workspaces {
+                for &wid in windows {
+                    let _ = ws.remove_window(wid);
+                    ws.remove_floating(wid);
+                }
+            }
+        }
+        self.stashed_monitor_layouts.retain(|_, stash| {
+            stash
+                .workspaces
+                .iter()
+                .any(|ws| !ws.all_window_ids().is_empty())
+        });
+    }
+
     #[allow(clippy::too_many_lines)]
     pub(crate) fn reconcile_monitors(&mut self, new_monitors: Vec<MonitorInfo>) {
         let new_ids: HashSet<MonitorId> = new_monitors.iter().map(|m| m.id).collect();
@@ -134,41 +202,9 @@ impl AppState {
         // targets exist even when all old monitors are replaced with new ones.
         for monitor in &new_monitors {
             if !old_ids.contains(&monitor.id) {
-                // A monitor whose stable device_name was stashed on disconnect is
-                // returning (e.g. it woke from sleep or was re-docked). Restore its
-                // saved layout instead of a fresh one, and pull its windows back off
-                // whatever monitor they were migrated to while it was gone.
-                if let Some(StashedMonitorLayout {
-                    workspaces: mut stashed_ws,
-                    active_workspace: active_idx,
-                    source_viewport_width,
-                }) = self.stashed_monitor_layouts.remove(&monitor.device_name)
-                {
-                    source_viewport_widths.insert(monitor.id, source_viewport_width);
-                    for workspace in &mut stashed_ws {
-                        self.config
-                            .apply_monitor_rules(&monitor.device_name, workspace);
-                        workspace.ensure_focused_visible(source_viewport_width);
-                    }
-                    let returning: HashSet<u64> =
-                        stashed_ws.iter().flat_map(|w| w.all_window_ids()).collect();
-                    for ws_vec in self.workspaces.values_mut() {
-                        for ws in ws_vec.iter_mut() {
-                            for &wid in &returning {
-                                let _ = ws.remove_window(wid);
-                                ws.remove_floating(wid);
-                            }
-                        }
-                    }
-                    let clamped = active_idx.min(stashed_ws.len().saturating_sub(1));
-                    info!(
-                        "Restored {} stashed workspace(s) for reconnected monitor {} ({})",
-                        stashed_ws.len(),
-                        monitor.id,
-                        monitor.device_name
-                    );
-                    self.workspaces.insert(monitor.id, stashed_ws);
-                    self.active_workspace.insert(monitor.id, clamped);
+                if let Some(stash) = self.stashed_monitor_layouts.remove(&monitor.device_name) {
+                    let source_width = self.restore_stashed_monitor_layout(monitor, stash);
+                    source_viewport_widths.insert(monitor.id, source_width);
                     continue;
                 }
                 // Same-pass handle change: the same physical monitor (matched by
@@ -196,7 +232,9 @@ impl AppState {
                         }
                         info!(
                             "Adopted live layout from monitor {} to {} ({}) across a handle change",
-                            old_id, monitor.id, monitor.device_name
+                            old_id,
+                            monitor.id,
+                            log_text::name(&monitor.device_name)
                         );
                         self.workspaces.insert(monitor.id, ws);
                         self.active_workspace.insert(monitor.id, clamped);
@@ -218,10 +256,12 @@ impl AppState {
                     params.outer_gap_top,
                     params.outer_gap_bottom,
                 );
-                workspace.set_default_column_width(params.default_column_width);
-                workspace.set_tab_strip_reserve_px(params.tab_strip_reserve_px);
+                params.apply_to(&mut workspace, 0);
                 self.config
                     .apply_monitor_rules(&monitor.device_name, &mut workspace);
+                workspace.set_center_columns(
+                    self.config.center_columns_for(&monitor.device_name).into(),
+                );
                 workspace.set_reduce_motion(self.reduce_motion);
                 workspace.set_scroll_animation(
                     self.config.animation.scroll_duration_ms,
@@ -244,11 +284,13 @@ impl AppState {
                 let mut floating_windows = Vec::new();
                 let mut minimized_ids = Vec::new();
                 for old_workspace in &old_ws_vec {
-                    for col in old_workspace.columns() {
-                        for &wid in col.windows() {
-                            tiled_window_ids.push(wid);
-                            if old_workspace.is_minimized(wid) {
-                                minimized_ids.push(wid);
+                    for row in old_workspace.rows() {
+                        for col in row.columns() {
+                            for &wid in col.windows() {
+                                tiled_window_ids.push(wid);
+                                if old_workspace.is_minimized(wid) {
+                                    minimized_ids.push(wid);
+                                }
                             }
                         }
                     }
@@ -308,11 +350,26 @@ impl AppState {
                 // reconnect restores it; the windows migrated above stay on
                 // primary meanwhile and are pulled back when it returns.
                 if let Some(name) = device_name {
-                    if !tiled_window_ids.is_empty() || !floating_windows.is_empty() {
+                    let owned: HashSet<u64> = self
+                        .stashed_monitor_layouts
+                        .values()
+                        .flat_map(|stash| &stash.workspaces)
+                        .flat_map(|ws| ws.all_window_ids())
+                        .collect();
+                    let mut stashed_ws = old_ws_vec;
+                    for ws in &mut stashed_ws {
+                        for wid in ws.all_window_ids() {
+                            if owned.contains(&wid) {
+                                let _ = ws.remove_window(wid);
+                                ws.remove_floating(wid);
+                            }
+                        }
+                    }
+                    if stashed_ws.iter().any(|ws| !ws.all_window_ids().is_empty()) {
                         self.stashed_monitor_layouts.insert(
                             name,
                             StashedMonitorLayout {
-                                workspaces: old_ws_vec,
+                                workspaces: stashed_ws,
                                 active_workspace: active_idx,
                                 source_viewport_width,
                             },
@@ -445,23 +502,20 @@ impl AppState {
         }
     }
 
+    pub(crate) fn monitor_move_target(&self) -> Option<u64> {
+        // Prefer the OS-foreground window so floating windows can be moved too.
+        let ws = self.focused_workspace()?;
+        self.previous_focused_hwnd
+            .filter(|&hwnd| ws.contains_window(hwnd))
+            .or_else(|| ws.focused_window())
+    }
+
     /// Move the focused window to another monitor using an all-or-nothing update.
     pub(crate) fn move_focused_window_to_monitor_transactional(
         &mut self,
         target_monitor: MonitorId,
     ) -> std::result::Result<Option<u64>, String> {
-        // Prefer the OS-foreground window so floating windows can be moved too.
-        let source_monitor = self.focused_monitor;
-        let src_idx = self.active_workspace_idx(source_monitor);
-        let os_focus = self.previous_focused_hwnd.and_then(|hwnd| {
-            self.workspaces
-                .get(&source_monitor)
-                .and_then(|v| v.get(src_idx))
-                .filter(|ws| ws.contains_window(hwnd))
-                .map(|_| hwnd)
-        });
-        let tiled_focus = self.focused_workspace().and_then(|ws| ws.focused_window());
-        let Some(window_id) = os_focus.or(tiled_focus) else {
+        let Some(window_id) = self.monitor_move_target() else {
             return Ok(None);
         };
         self.move_window_to_monitor_transactional(window_id, target_monitor)
@@ -575,6 +629,7 @@ impl AppState {
 
         self.workspaces.get_mut(&source_monitor).unwrap()[src_idx] = source_workspace;
         self.workspaces.get_mut(&target_monitor).unwrap()[tgt_idx] = target_workspace;
+        self.forget_stashed_windows(&[window_id]);
         self.focused_monitor = target_monitor;
         Ok(Some(window_id))
     }
@@ -623,6 +678,83 @@ impl AppState {
                     .map(|m| m.id)
             })
             .unwrap_or(self.focused_monitor)
+    }
+
+    pub(crate) fn move_focused_column_to_monitor_transactional(
+        &mut self,
+        target_monitor: MonitorId,
+        insert_at_start: bool,
+    ) -> std::result::Result<Option<u64>, String> {
+        let source_monitor = self.focused_monitor;
+        if source_monitor == target_monitor {
+            return Ok(None);
+        }
+        let src_idx = self.active_workspace_idx(source_monitor);
+        let tgt_idx = self.active_workspace_idx(target_monitor);
+        let mut source = self
+            .workspaces
+            .get(&source_monitor)
+            .and_then(|workspaces| workspaces.get(src_idx))
+            .cloned()
+            .ok_or_else(|| format!("Source workspace missing for monitor {}", source_monitor))?;
+        let mut target = self
+            .workspaces
+            .get(&target_monitor)
+            .and_then(|workspaces| workspaces.get(tgt_idx))
+            .cloned()
+            .ok_or_else(|| format!("Target workspace missing for monitor {}", target_monitor))?;
+
+        let Some(focused) = source.focused_window() else {
+            return Ok(None);
+        };
+        let source_row = source.focused_row();
+        let column_index = source.focused_column_index();
+        let column = &source.columns_for_row(source_row)[column_index];
+        let moved_windows = column.windows().to_vec();
+        let minimized: Vec<_> = column
+            .windows()
+            .iter()
+            .copied()
+            .filter(|&window| source.is_minimized(window))
+            .collect();
+        if column
+            .windows()
+            .iter()
+            .any(|&window| target.contains_window(window))
+        {
+            return Err("Target workspace already contains a moved window".to_string());
+        }
+        let new_width =
+            self.moved_column_width(focused, source_monitor, src_idx, &[], target_monitor);
+        let column = source
+            .remove_column_for_transfer(source_row, column_index)
+            .ok_or_else(|| "Focused column missing from source workspace".to_string())?;
+        let target_row = target.focused_row();
+        // Column indices run left to right on every monitor, including RTL
+        // ones, so this lands the column at the edge it crossed.
+        let index = if insert_at_start {
+            0
+        } else {
+            target.columns_for_row(target_row).len()
+        };
+        target.insert_column_at_row(column, target_row, index);
+        for window in minimized {
+            target.mark_minimized(window);
+        }
+        target
+            .focus_window(focused)
+            .map_err(|e| format!("Failed to focus moved window: {}", e))?;
+        if let Some(new_width) = new_width {
+            new_width.apply_to_focused_column(&mut target, self.viewport_width_for(target_monitor));
+        }
+        target.ensure_focused_visible(self.viewport_width_for(target_monitor));
+        source.reconcile_scroll_bounds(self.viewport_width_for(source_monitor));
+
+        self.workspaces.get_mut(&source_monitor).unwrap()[src_idx] = source;
+        self.workspaces.get_mut(&target_monitor).unwrap()[tgt_idx] = target;
+        self.forget_stashed_windows(&moved_windows);
+        self.focused_monitor = target_monitor;
+        Ok(Some(focused))
     }
 
     /// The layout viewport for a monitor: its full work area. Single source of

@@ -28,8 +28,10 @@ intentionally disabled or otherwise unbound catalog action remains present with
 an empty binding list. A valid non-catalog command uses a generated label and
 the `Other` group so custom bindings never disappear from the query.
 
-`focus_next`, `focus_prev`, `scroll_left`, and `scroll_right` are catalog actions
-with no default keyboard binding. They appear in Settings hotkey and gesture
+`focus_next`, `focus_prev`, `scroll_left`, `scroll_right`, `nudge_left`,
+`nudge_right`, `align_column_left`, `align_column_right`, `float`, `tile`, `focus_floating`, `focus_tiling`, and
+`switch_focus_floating_tiling` are catalog
+actions with no default keyboard binding. They appear in Settings hotkey and gesture
 menus and in the hotkeys query even when unbound; Shortcut Guide exports them
 only when an effective keyboard binding exists.
 
@@ -43,6 +45,22 @@ does not prove the hook is installed or active: safe/no-hotkey startup, Windows
 protected chords, and recorder suspension have different runtime semantics. A future runtime-status field
 should therefore use a descriptive enum rather than a misleading per-binding
 boolean.
+
+### Multi-row navigation actions
+
+The hotkey catalog includes four row actions:
+- `focus_row_up` (unbound by default, group "Focus")
+- `focus_row_down` (unbound by default, group "Focus")
+- `move_window_to_row_up` (unbound by default, group "Move window within column")
+- `move_window_to_row_down` (unbound by default, group "Move window within column")
+
+`move_to_workspace_prev` and `move_to_workspace_next` retain their `Ctrl+Alt+Shift+PageUp` / `Ctrl+Alt+Shift+PageDown` default chords. The row actions are available for custom binding in `config.toml` or Settings; for example:
+
+```toml
+[hotkeys]
+"Ctrl+Alt+PageUp" = "focus_row_up"
+"Ctrl+Alt+PageDown" = "focus_row_down"
+```
 
 ## Shared resolution and collision precedence
 

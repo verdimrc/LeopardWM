@@ -112,6 +112,7 @@ fn seed_recycled_lifetime_caches(state: &mut AppState, hwnd: u64) {
         MoveOrigin {
             monitor: 1,
             ws_idx: 0,
+            row: 0,
             column: 0,
             sibling: None,
         },
@@ -121,6 +122,7 @@ fn seed_recycled_lifetime_caches(state: &mut AppState, hwnd: u64) {
         MoveOrigin {
             monitor: 1,
             ws_idx: 0,
+            row: 0,
             column: 0,
             sibling: Some(hwnd),
         },
@@ -168,7 +170,7 @@ fn focused_column_width(state: &AppState, hwnd: u64) -> i32 {
     let workspace = state
         .focused_workspace()
         .unwrap_or_else(|| panic!("hwnd {hwnd} should be on the focused workspace"));
-    let (column, _) = workspace
+    let (column, _) = workspace.rows()[0]
         .find_window_location(hwnd)
         .unwrap_or_else(|| panic!("hwnd {hwnd} should occupy a column"));
     workspace.columns()[column].width()
@@ -185,6 +187,151 @@ fn assert_replacement_uses_default_column_width(state: &AppState, hwnd: u64) {
         "hwnd {hwnd} inherited a destroyed window's width"
     );
     assert_eq!(width, expected);
+}
+
+#[test]
+fn shell_cloaked_created_is_admitted_when_uncloaked() {
+    let mut state = state();
+    inject(&mut state, 10, "Store app", "ApplicationFrameWindow", 1010);
+    state.injected_shell_cloaked_hwnds.insert(10);
+
+    state.handle_window_event(WindowEvent::Created(10, 100));
+    assert_eq!(membership_count(&state, 10), 0);
+    state.injected_shell_cloaked_hwnds.remove(&10);
+    state.handle_window_event(WindowEvent::Uncloaked(10, 200));
+
+    assert_eq!(state.find_window_workspace(10), Some((1, 0)));
+    assert_eq!(membership_count(&state, 10), 1);
+    assert_eq!(state.focused_workspace().unwrap().columns().len(), 1);
+    state.handle_window_event(WindowEvent::Hidden(10, 150));
+    assert_eq!(state.find_window_workspace(10), Some((1, 0)));
+}
+
+#[test]
+fn still_cloaked_uncloak_retries_later() {
+    let mut state = state();
+    inject(&mut state, 10, "Store app", "ApplicationFrameWindow", 1010);
+    state.injected_shell_cloaked_hwnds.insert(10);
+    state.handle_window_event(WindowEvent::Created(10, 100));
+    let started = Instant::now() - Duration::from_secs(1);
+    state.shell_cloaked_at_admission.insert(10, started);
+    state.handle_window_event(WindowEvent::Uncloaked(10, 200));
+    assert_eq!(membership_count(&state, 10), 0);
+    assert_eq!(state.shell_cloaked_at_admission.get(&10), Some(&started));
+
+    state.injected_shell_cloaked_hwnds.remove(&10);
+    state.handle_window_event(WindowEvent::Uncloaked(10, 300));
+    assert_eq!(state.find_window_workspace(10), Some((1, 0)));
+}
+
+#[test]
+fn off_desktop_still_cloaked_uncloak_cancels_retry() {
+    let mut state = state();
+    inject(&mut state, 10, "Store app", "ApplicationFrameWindow", 1010);
+    state.injected_shell_cloaked_hwnds.insert(10);
+    state.handle_window_event(WindowEvent::Created(10, 100));
+    state.injected_off_current_desktop_hwnds.insert(10);
+    state.handle_window_event(WindowEvent::Uncloaked(10, 200));
+    assert_eq!(membership_count(&state, 10), 0);
+    state.injected_shell_cloaked_hwnds.remove(&10);
+    state.injected_off_current_desktop_hwnds.remove(&10);
+    state.handle_window_event(WindowEvent::Uncloaked(10, 300));
+    assert_eq!(membership_count(&state, 10), 0);
+}
+
+#[test]
+fn expired_cloaked_create_is_not_admitted_on_uncloak() {
+    let mut state = state();
+    inject(&mut state, 10, "Store app", "ApplicationFrameWindow", 1010);
+    state.injected_shell_cloaked_hwnds.insert(10);
+    state.handle_window_event(WindowEvent::Created(10, 100));
+    state.shell_cloaked_at_admission.insert(
+        10,
+        Instant::now() - crate::state::SHELL_CLOAK_RETRY_TTL - Duration::from_secs(1),
+    );
+    state.handle_window_event(WindowEvent::Created(10, 200));
+    state.injected_shell_cloaked_hwnds.remove(&10);
+    state.handle_window_event(WindowEvent::Uncloaked(10, 300));
+    assert_eq!(membership_count(&state, 10), 0);
+    assert!(!state.shell_cloaked_at_admission.contains_key(&10));
+}
+
+#[test]
+fn unrecorded_and_other_desktop_uncloaks_do_not_admit() {
+    let mut state = state();
+    inject(
+        &mut state,
+        10,
+        "Other desktop",
+        "ApplicationFrameWindow",
+        1010,
+    );
+    inject(&mut state, 20, "Unrecorded", "ApplicationFrameWindow", 1020);
+    state.injected_shell_cloaked_hwnds.insert(10);
+    state.injected_off_current_desktop_hwnds.insert(10);
+    state.handle_window_event(WindowEvent::Created(10, 100));
+    assert_eq!(membership_count(&state, 10), 0);
+    state.injected_shell_cloaked_hwnds.remove(&10);
+    state.injected_off_current_desktop_hwnds.remove(&10);
+
+    state.handle_window_event(WindowEvent::Uncloaked(10, 200));
+    state.handle_window_event(WindowEvent::Uncloaked(20, 200));
+    assert_eq!(membership_count(&state, 10), 0);
+    assert_eq!(membership_count(&state, 20), 0);
+    assert!(state.focused_workspace().unwrap().columns().is_empty());
+}
+
+#[test]
+fn recycled_cloaked_hwnd_on_other_desktop_is_not_admitted_on_uncloak() {
+    let mut state = state();
+    inject(&mut state, 10, "Store app", "ApplicationFrameWindow", 1010);
+    state.injected_shell_cloaked_hwnds.insert(10);
+    state.handle_window_event(WindowEvent::Created(10, 100));
+    assert_eq!(membership_count(&state, 10), 0);
+
+    state.injected_off_current_desktop_hwnds.insert(10);
+    state.handle_window_event(WindowEvent::Created(10, 200));
+    state.injected_shell_cloaked_hwnds.remove(&10);
+    state.injected_off_current_desktop_hwnds.remove(&10);
+    state.handle_window_event(WindowEvent::Uncloaked(10, 300));
+    assert_eq!(membership_count(&state, 10), 0);
+}
+
+#[test]
+fn later_automatic_rejection_cancels_uncloak_retry() {
+    let mut state = state();
+    inject(&mut state, 10, "Store app", "ApplicationFrameWindow", 1010);
+    state.injected_shell_cloaked_hwnds.insert(10);
+    state.handle_window_event(WindowEvent::Created(10, 100));
+    state.injected_shell_cloaked_hwnds.remove(&10);
+    state
+        .injected_manage_block
+        .insert(10, ManageBlock::HigherIntegrity);
+    state.handle_window_event(WindowEvent::Created(10, 200));
+    assert_eq!(membership_count(&state, 10), 0);
+
+    state.injected_manage_block.remove(&10);
+    state.handle_window_event(WindowEvent::Uncloaked(10, 300));
+    assert_eq!(membership_count(&state, 10), 0);
+}
+
+#[test]
+fn uncloak_does_not_change_managed_layout_or_admit_destroyed_window() {
+    let mut state = state();
+    admit(&mut state, 10);
+    inject(&mut state, 20, "Store app", "ApplicationFrameWindow", 1020);
+    state.injected_shell_cloaked_hwnds.insert(20);
+    state.handle_window_event(WindowEvent::Created(20, 100));
+    assert_eq!(membership_count(&state, 20), 0);
+    state.handle_window_event(WindowEvent::Destroyed(20));
+    state.injected_shell_cloaked_hwnds.remove(&20);
+
+    state.handle_window_event(WindowEvent::Uncloaked(10, 200));
+    state.handle_window_event(WindowEvent::Uncloaked(20, 200));
+    assert_eq!(state.find_window_workspace(10), Some((1, 0)));
+    assert_eq!(membership_count(&state, 10), 1);
+    assert_eq!(membership_count(&state, 20), 0);
+    assert_eq!(state.focused_workspace().unwrap().columns().len(), 1);
 }
 
 #[test]
@@ -565,9 +712,13 @@ fn removed_tiled_drag(hwnd: u64) -> DragState {
     DragState {
         hwnd,
         is_tiled: true,
+        float_on_drop: false,
+        start_visible_rect: None,
         source_monitor: 1,
         source_workspace_idx: 0,
+        source_row: 0,
         source_window_slot: 0,
+        current_row_index: 0,
         current_column_index: 0,
         last_drop_target: None,
         last_hint_update: None,
@@ -575,6 +726,7 @@ fn removed_tiled_drag(hwnd: u64) -> DragState {
         preview_mode: DragPreviewMode::None,
         target_column_peers: Vec::new(),
         source_column_peers: Vec::new(),
+        source_column_width: None,
     }
 }
 
@@ -1039,7 +1191,7 @@ fn reapply_ignore_drops_managed_lifetime_record() {
     let previous_rules = state.compiled_rules.clone();
     ignore_managed_class(&mut state);
 
-    state.reapply_window_rules(&previous_rules);
+    state.reapply_window_rules(&previous_rules, state.config.behavior.fixed_size_windows);
 
     assert_eq!(membership_count(&state, 10), 0);
     assert!(!state.managed_lifetime_tokens.contains_key(&10));

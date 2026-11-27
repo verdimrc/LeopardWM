@@ -1,0 +1,191 @@
+use serde::{Deserialize, Serialize};
+
+use crate::animation::ScrollAnimation;
+use crate::column::Column;
+use crate::types::WindowId;
+use crate::workspace::MaximizedColumnState;
+
+/// Maximum number of rows supported in a workspace.
+pub const MAX_ROWS: usize = 4;
+
+/// An independent horizontal scrolling strip of columns in a workspace.
+///
+/// In a multi-row workspace, each row is a separate strip with its own
+/// columns, focus indices, and horizontal scroll offset.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceRow {
+    /// Columns in this row, ordered left to right.
+    pub(crate) columns: Vec<Column>,
+    /// Index of the currently focused column in this row.
+    pub(crate) focused_column: usize,
+    /// Index of the focused window within the focused column.
+    pub(crate) focused_window_in_column: usize,
+    /// Current scroll offset (x position of viewport's left edge on this strip).
+    pub(crate) scroll_offset: f64,
+    /// Active scroll animation for this row, if any.
+    #[serde(skip)]
+    pub(crate) active_animation: Option<ScrollAnimation>,
+    /// One entry per maximized column in this row, each restored on its own.
+    #[serde(skip)]
+    pub(crate) maximized_columns: Vec<MaximizedColumnState>,
+    #[serde(skip)]
+    pub(crate) fit_release: std::cell::RefCell<Option<FitRelease>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FitEdge {
+    Left,
+    Right,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FitRelease {
+    pub edge: FitEdge,
+    pub columns: Vec<(Vec<WindowId>, i32)>,
+    pub gap: i32,
+    pub visible_width: i32,
+}
+
+impl Default for WorkspaceRow {
+    fn default() -> Self {
+        Self {
+            columns: Vec::new(),
+            focused_column: 0,
+            focused_window_in_column: 0,
+            scroll_offset: 0.0,
+            active_animation: None,
+            maximized_columns: Vec::new(),
+            fit_release: Default::default(),
+        }
+    }
+}
+
+impl WorkspaceRow {
+    /// Create a new empty row.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Check if the row has no columns.
+    pub fn is_empty(&self) -> bool {
+        self.columns.is_empty()
+    }
+
+    /// Get the number of columns in this row.
+    pub fn column_count(&self) -> usize {
+        self.columns.len()
+    }
+
+    /// Get a slice of all columns in this row.
+    pub fn columns(&self) -> &[Column] {
+        &self.columns
+    }
+
+    /// Get a mutable slice of all columns in this row.
+    pub fn columns_mut(&mut self) -> &mut [Column] {
+        &mut self.columns
+    }
+
+    /// Get a column by index.
+    pub fn column(&self, index: usize) -> Option<&Column> {
+        self.columns.get(index)
+    }
+
+    /// Get a column's width before maximization, or its current width otherwise.
+    pub fn column_restore_width(&self, index: usize) -> Option<i32> {
+        let column = self.columns.get(index)?;
+        Some(
+            self.maximized_entry_for_column(index)
+                .map_or(column.width(), |entry| {
+                    self.maximized_columns[entry].original_width
+                }),
+        )
+    }
+
+    /// Get a mutable reference to a column by index.
+    pub fn column_mut(&mut self, index: usize) -> Option<&mut Column> {
+        self.columns.get_mut(index)
+    }
+
+    /// Index of the currently focused column in this row.
+    pub fn focused_column(&self) -> usize {
+        self.focused_column
+    }
+
+    /// Index of the focused window within the focused column.
+    pub fn focused_window_in_column(&self) -> usize {
+        self.focused_window_in_column
+    }
+
+    /// Current scroll offset for this row.
+    pub fn scroll_offset(&self) -> f64 {
+        self.scroll_offset
+    }
+
+    /// Set the scroll offset for this row.
+    pub fn set_scroll_offset(&mut self, offset: f64) {
+        self.scroll_offset = offset;
+    }
+
+    /// Get the focused window in this row, if any.
+    pub fn focused_window(&self) -> Option<WindowId> {
+        self.columns
+            .get(self.focused_column)
+            .and_then(|col| col.windows().get(self.focused_window_in_column).copied())
+    }
+
+    /// Check if this row is currently animating scroll.
+    pub fn is_animating(&self) -> bool {
+        self.active_animation.is_some()
+    }
+
+    /// Find the `(column_index, window_index)` of a window within this row.
+    pub fn find_window_location(&self, window_id: WindowId) -> Option<(usize, usize)> {
+        for (col_idx, column) in self.columns.iter().enumerate() {
+            if let Some(win_idx) = column.windows().iter().position(|&w| w == window_id) {
+                return Some((col_idx, win_idx));
+            }
+        }
+        None
+    }
+
+    /// Index in `maximized_columns` of the entry for the column at `col_idx`,
+    /// found by its sentinel window so it survives column index shifts.
+    pub(crate) fn maximized_entry_for_column(&self, col_idx: usize) -> Option<usize> {
+        let column = self.columns.get(col_idx)?;
+        self.maximized_columns
+            .iter()
+            .position(|state| column.contains(state.sentinel_window))
+    }
+
+    /// Forget the maximized state of the column at `col_idx`, e.g. after its
+    /// width is set directly. Other maximized columns keep theirs.
+    pub(crate) fn forget_maximized(&mut self, col_idx: usize) {
+        if let Some(entry) = self.maximized_entry_for_column(col_idx) {
+            self.maximized_columns.remove(entry);
+        }
+    }
+
+    /// Remove and return the maximized state of the column at `col_idx`.
+    pub(crate) fn take_maximized(&mut self, col_idx: usize) -> Option<MaximizedColumnState> {
+        let entry = self.maximized_entry_for_column(col_idx)?;
+        Some(self.maximized_columns.remove(entry))
+    }
+
+    /// Update or drop the maximized entry whose sentinel `removed_wid` has
+    /// been removed from `col_idx`.
+    pub(crate) fn on_window_removed_from_column(&mut self, col_idx: usize, removed_wid: WindowId) {
+        let Some(entry) = self
+            .maximized_columns
+            .iter()
+            .position(|m| m.sentinel_window == removed_wid)
+        else {
+            return;
+        };
+        if let Some(&next_sentinel) = self.columns.get(col_idx).and_then(|c| c.windows().first()) {
+            self.maximized_columns[entry].sentinel_window = next_sentinel;
+        } else {
+            self.maximized_columns.remove(entry);
+        }
+    }
+}

@@ -1,5 +1,82 @@
 //! System-level queries: DPI scaling, power state, accessibility settings.
 
+pub fn current_session_logon_epoch_seconds() -> Option<u64> {
+    use windows::core::PWSTR;
+    use windows::Win32::System::RemoteDesktop::{
+        WTSFreeMemory, WTSQuerySessionInformationW, WTSSessionInfo, WTSINFOW, WTS_CURRENT_SESSION,
+    };
+
+    let mut buffer = PWSTR::null();
+    let mut length = 0;
+    unsafe {
+        WTSQuerySessionInformationW(
+            None,
+            WTS_CURRENT_SESSION,
+            WTSSessionInfo,
+            &mut buffer,
+            &mut length,
+        )
+        .ok()?;
+        let logon = if !buffer.is_null() && length as usize >= std::mem::size_of::<WTSINFOW>() {
+            Some((*buffer.0.cast::<WTSINFOW>()).LogonTime)
+        } else {
+            None
+        };
+        if !buffer.is_null() {
+            WTSFreeMemory(buffer.0.cast());
+        }
+        let ticks = u64::try_from(logon?).ok()?;
+        let seconds = ticks.checked_sub(116_444_736_000_000_000)? / 10_000_000;
+        (seconds != 0).then_some(seconds)
+    }
+}
+
+/// Return the installed Windows product name, display version, and build when available.
+pub fn get_windows_version() -> String {
+    use winreg::enums::HKEY_LOCAL_MACHINE;
+    use winreg::RegKey;
+
+    let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+    if let Ok(key) = hklm.open_subkey("SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion") {
+        let build: String = key.get_value("CurrentBuildNumber").unwrap_or_default();
+        let display: String = key.get_value("DisplayVersion").unwrap_or_default();
+        let product: String = key.get_value("ProductName").unwrap_or_default();
+        if !build.is_empty() {
+            let product = windows_product_name(&product, &build);
+            return format!("{} ({}, Build {})", product, display, build);
+        }
+    }
+    "Unknown".to_string()
+}
+
+/// Windows 11 keeps "Windows 10" in `ProductName`; only the build number tells them apart.
+fn windows_product_name(product: &str, build: &str) -> String {
+    let is_windows_11 = build
+        .trim()
+        .parse::<u32>()
+        .is_ok_and(|build| build >= 22000);
+    match product.strip_prefix("Windows 10") {
+        Some(edition) if is_windows_11 => format!("Windows 11{edition}"),
+        _ => product.to_string(),
+    }
+}
+
+/// Set the calling thread's continuous execution state.
+pub fn set_keep_awake(on: bool) {
+    use windows::Win32::System::Power::{
+        SetThreadExecutionState, ES_CONTINUOUS, ES_DISPLAY_REQUIRED, ES_SYSTEM_REQUIRED,
+    };
+
+    let flags = if on {
+        ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED
+    } else {
+        ES_CONTINUOUS
+    };
+    if unsafe { SetThreadExecutionState(flags) }.0 == 0 {
+        tracing::warn!("Failed to update keep-awake execution state");
+    }
+}
+
 /// Scale a pixel value by the given DPI scale factor.
 ///
 /// Config values are in logical pixels (96 DPI). This function converts them
@@ -115,6 +192,26 @@ static TEST_PROCESS_DPI_AWARENESS: extern "C" fn() = {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windows_11_builds_report_windows_11() {
+        assert_eq!(
+            windows_product_name("Windows 10 Pro", "26300"),
+            "Windows 11 Pro"
+        );
+        assert_eq!(
+            windows_product_name("Windows 10 Pro", "22000"),
+            "Windows 11 Pro"
+        );
+        assert_eq!(
+            windows_product_name("Windows 10 Pro", "19045"),
+            "Windows 10 Pro"
+        );
+        assert_eq!(
+            windows_product_name("Windows Server 2022", "26300"),
+            "Windows Server 2022"
+        );
+    }
 
     #[test]
     fn test_threads_inherit_per_monitor_dpi_awareness() {

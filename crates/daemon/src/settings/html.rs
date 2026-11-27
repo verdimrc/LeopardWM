@@ -101,6 +101,7 @@ pub const SETTINGS_HTML: &str = r##"<!DOCTYPE html>
     --infobar-stroke: rgba(255,255,255,0.0837); /* CardStrokeColorDefault (dark) */
     --info-bg: rgba(118, 185, 237, 0.10);
     --success-bg: rgba(109, 202, 70, 0.10);
+    --success-stroke: #6ccb5f;
     --warning-bg: #433519;          /* SystemFillColorCautionBackground (dark) */
     --warning-stroke: #FCE100;      /* SystemFillColorCaution (dark) */
     --error-bg: rgba(255, 153, 164, 0.08);
@@ -152,11 +153,19 @@ pub const SETTINGS_HTML: &str = r##"<!DOCTYPE html>
   .field-label, .field-desc {
     color: CanvasText !important;
   }
-  input, select, button, .combobox-trigger {
+  input, textarea, select, button, .combobox-trigger {
     background: ButtonFace !important;
     color: ButtonText !important;
     border-color: ButtonBorder !important;
   }
+  .btn-accent:enabled {
+    forced-color-adjust: none;
+    background: Highlight !important;
+    color: HighlightText !important;
+    border-color: Highlight !important;
+  }
+  .btn-accent:enabled:hover { border-color: HighlightText !important; }
+  .btn-accent:disabled { color: GrayText !important; border-color: GrayText !important; }
   .info-bar {
     background: Canvas !important;
     border-color: Highlight !important;
@@ -168,6 +177,7 @@ pub const SETTINGS_HTML: &str = r##"<!DOCTYPE html>
     border-color: CanvasText !important;
   }
   .combobox-option {
+    forced-color-adjust: none;
     color: CanvasText !important;
     background: transparent !important;
   }
@@ -357,6 +367,16 @@ html, body {
 .input-wrap:focus-within::after { transform: scaleX(1); }
 
 /* ── Hotkey recorder field ───────────────────────────────────────── */
+#sec-hotkeys table { table-layout: fixed; }
+#sec-hotkeys th:first-child { width: 50%; padding-left: 16px; }
+#hotkeys-body > tr:not(.hk-group) > td { background: var(--card-bg-secondary); }
+#sec-hotkeys .hk-group td { padding: 0 !important; background: var(--card-bg); }
+#sec-hotkeys .hk-group button { display: flex; align-items: center; gap: 20px; width: 100%; min-height: 37px; padding: 2px 8px 2px 16px; border: 0; background: transparent; color: var(--text-primary); font: inherit; font-size: 14px; font-weight: 600; line-height: 20px; text-align: left; cursor: pointer; }
+#sec-hotkeys .hk-group button:hover { background: var(--subtle-secondary); }
+#sec-hotkeys .hk-group button:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+#sec-hotkeys .hk-group button .combobox-chevron { order: 1; margin-left: auto; box-sizing: border-box; width: 32px; height: 32px; padding: 10px; fill: var(--text-primary); }
+#sec-hotkeys .hk-group button[aria-expanded="false"] .combobox-chevron { transform: rotate(-90deg); }
+#hotkeys-body .hk-cmd-label { padding-left: 32px !important; }
 .hk-record { cursor: pointer; }
 .hk-record.recording { box-shadow: inset 0 0 0 1px var(--accent); }
 .hk-cmd-label[title] { cursor: help; }
@@ -366,6 +386,7 @@ html, body {
 /* ── Inputs / Selects ─────────────────────────────────────────────── */
 input[type="text"],
 input[type="number"],
+textarea,
 select {
   font-family: var(--font);
   font-size: 14px;
@@ -382,11 +403,13 @@ select {
 }
 input[type="text"]:hover,
 input[type="number"]:hover,
+textarea:hover,
 select:hover {
   background: var(--ctrl-fill-secondary);
 }
 input[type="text"]:focus,
 input[type="number"]:focus,
+textarea:focus,
 select:focus {
   background: var(--ctrl-fill-input-active);
   border-color: var(--ctrl-stroke);
@@ -481,7 +504,16 @@ input[type="color"]::-webkit-color-swatch { border: none; border-radius: 2px; }
   transition: background 0.06s;
   white-space: nowrap;
 }
-.combobox-option:hover { background: var(--subtle-secondary); }
+.combobox-option:hover, .combobox-option:focus-visible { background: var(--subtle-secondary); }
+.combobox-option:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+@media (forced-colors: active) {
+  .combobox-option:focus-visible { outline-color: CanvasText; }
+  .combobox-option.selected:focus-visible, .combobox-option:hover:focus-visible {
+    outline-color: HighlightText;
+    outline-offset: -5px;
+  }
+  .combobox-option.selected::before { background: HighlightText !important; }
+}
 .combobox-option.selected {
   background: var(--subtle-secondary);
   font-weight: 600;
@@ -706,7 +738,7 @@ input[type="color"]::-webkit-color-swatch { border: none; border-radius: 2px; }
   border-bottom: 1px solid var(--accent-tertiary);
 }
 .btn-accent:hover { background: var(--accent-secondary); }
-.btn-accent:active { background: var(--accent-tertiary); border-bottom-color: transparent; }
+.btn-accent:active { background: var(--accent-tertiary); color: var(--accent-text); border-bottom-color: transparent; }
 .btn-sm { font-size: 12px; line-height: 16px; padding: 4px 12px; min-height: 24px; }
 
 /* ── Editable Tables ──────────────────────────────────────────────── */
@@ -888,6 +920,13 @@ input[type="range"]::-webkit-slider-thumb {
 .info-bar.error  { background: var(--error-bg); }
 .info-bar.error .info-bar-icon { fill: var(--error-stroke); }
 
+.field.stacked { flex-direction: column; align-items: stretch; gap: 6px; }
+.field.stacked .input-wrap { display: block; width: 100%; }
+.field.stacked input[type="text"], .field.stacked textarea { box-sizing: border-box; width: 100%; }
+.field.stacked textarea { min-height: 90px; resize: vertical; }
+.info-bar-message, #sec-troubleshooting .field-info { overflow-wrap: anywhere; }
+#sec-troubleshooting .troubleshooting-actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0; }
+#sec-troubleshooting .troubleshooting-hint { color: var(--text-primary); margin-top: 6px; }
 </style>
 </head>
 <body>
@@ -922,7 +961,17 @@ input[type="range"]::-webkit-slider-thumb {
       <svg class="nav-icon" viewBox="0 0 16 16" stroke-width="1.5"><path d="M2 5.5V3.5a1.5 1.5 0 011.5-1.5H5.5"/><path d="M10.5 2H12.5A1.5 1.5 0 0114 3.5V5.5"/><path d="M14 10.5v2a1.5 1.5 0 01-1.5 1.5H10.5"/><path d="M5.5 14H3.5A1.5 1.5 0 012 12.5V10.5"/></svg>
       <span data-i18n="settings.text.snap_hints_titlecase"></span>
     </a>
+    <!-- Troubleshooting -->
+    <a href="#" data-section="troubleshooting" class="nav-item">
+      <svg class="nav-icon" viewBox="0 0 16 16"><path d="M2 8h3l1.5-4 3 8 1.5-4h3"/></svg>
+      <span data-i18n="settings.troubleshooting.title"></span>
+    </a>
+    <!-- End Troubleshooting -->
     <div class="nav-spacer"></div>
+    <a href="#" data-section="report" class="nav-item">
+      <svg class="nav-icon" viewBox="0 0 16 16"><path d="M3 2h10v9H7l-4 3z"/><path d="M8 4v3m0 2v.1"/></svg>
+      <span data-i18n="settings.report.title"></span>
+    </a>
     <a href="#" data-section="about" class="nav-item">
       <svg class="nav-icon" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6.5" fill="none" stroke-width="1.2"/><text x="8" y="11.5" text-anchor="middle" font-size="9" font-weight="600" fill="currentColor" stroke="none">i</text></svg>
       <span data-i18n="settings.text.about"></span>
@@ -967,8 +1016,35 @@ input[type="range"]::-webkit-slider-thumb {
             </div>
           </div>
           <div class="field">
-            <div class="field-info"><div class="field-label" data-i18n="settings.layout.center_single_column.label"></div><div class="field-desc" data-i18n="settings.layout.center_single_column.description"></div></div>
-            <label class="toggle"><input type="checkbox" id="layout-center_single_column"><span class="track"></span><span class="thumb"></span></label>
+            <div class="field-info"><div class="field-label" data-i18n="settings.layout.mouse_resize.label"></div><div class="field-desc" data-i18n="settings.layout.mouse_resize.description"></div></div>
+            <div class="combobox" id="cb-layout-mouse_resize">
+              <button class="combobox-trigger" type="button"><span class="combobox-text" data-i18n="settings.text.mouse_resize_presets"></span><svg class="combobox-chevron" viewBox="0 0 12 12"><path d="M2.15 4.65a.5.5 0 01.7 0L6 7.79l3.15-3.14a.5.5 0 11.7.7l-3.5 3.5a.5.5 0 01-.7 0l-3.5-3.5a.5.5 0 010-.7z"/></svg></button>
+              <div class="combobox-popup">
+                <div class="combobox-option selected" data-value="presets" data-i18n="settings.text.mouse_resize_presets"></div>
+                <div class="combobox-option" data-value="free" data-i18n="settings.text.mouse_resize_free"></div>
+              </div>
+            </div>
+          </div>
+          <div class="field">
+            <div class="field-info"><div class="field-label" data-i18n="settings.layout.offscreen_mode.label"></div><div class="field-desc" data-i18n="settings.layout.offscreen_mode.description"></div></div>
+            <div class="combobox" id="cb-layout-offscreen_mode">
+              <button class="combobox-trigger" type="button"><span class="combobox-text" data-i18n="settings.text.offscreen_mode_bleed"></span><svg class="combobox-chevron" viewBox="0 0 12 12"><path d="M2.15 4.65a.5.5 0 01.7 0L6 7.79l3.15-3.14a.5.5 0 11.7.7l-3.5 3.5a.5.5 0 01-.7 0l-3.5-3.5a.5.5 0 010-.7z"/></svg></button>
+              <div class="combobox-popup">
+                <div class="combobox-option selected" data-value="bleed" data-i18n="settings.text.offscreen_mode_bleed"></div>
+                <div class="combobox-option" data-value="park" data-i18n="settings.text.offscreen_mode_park"></div>
+              </div>
+            </div>
+          </div>
+          <div class="field">
+            <div class="field-info"><div class="field-label" data-i18n="settings.layout.center_columns.label"></div><div class="field-desc" data-i18n="settings.layout.center_columns.description"></div></div>
+            <div class="combobox" id="cb-layout-center_columns">
+              <button class="combobox-trigger" type="button"><span class="combobox-text" data-i18n="settings.text.center_columns_off"></span><svg class="combobox-chevron" viewBox="0 0 12 12"><path d="M2.15 4.65a.5.5 0 01.7 0L6 7.79l3.15-3.14a.5.5 0 11.7.7l-3.5 3.5a.5.5 0 01-.7 0l-3.5-3.5a.5.5 0 010-.7z"/></svg></button>
+              <div class="combobox-popup">
+                <div class="combobox-option selected" data-value="off" data-i18n="settings.text.center_columns_off"></div>
+                <div class="combobox-option" data-value="single" data-i18n="settings.text.center_columns_single"></div>
+                <div class="combobox-option" data-value="fit" data-i18n="settings.text.center_columns_fit"></div>
+              </div>
+            </div>
           </div>
           <div class="field">
             <div class="field-info"><div class="field-label" data-i18n="settings.layout.center_past_edges.label"></div><div class="field-desc" data-i18n="settings.layout.center_past_edges.description"></div></div>
@@ -999,6 +1075,27 @@ input[type="range"]::-webkit-slider-thumb {
           </table>
         </div>
         <div class="table-actions"><button class="btn btn-sm" onclick="addPresetRow('height',null)" data-i18n="settings.text.add_preset"></button></div>
+        <h3 class="section-subtitle" data-i18n="settings.text.rows"></h3>
+        <p class="section-desc" data-i18n="settings.text.multi_row_scrolling_strip_layout"></p>
+        <div class="card">
+          <div class="field">
+            <div class="field-info"><div class="field-label" data-i18n="settings.layout.rows_split.label"></div><div class="field-desc" data-i18n="settings.layout.rows_split.description"></div></div>
+            <input type="text" id="layout-rows-split" placeholder="100%">
+          </div>
+          <div class="field">
+            <div class="field-info"><div class="field-label" data-i18n="settings.layout.rows_gap.label"></div><div class="field-desc" data-i18n="settings.layout.rows_gap.description"></div></div>
+            <input type="number" id="layout-rows-gap" min="0" max="100">
+          </div>
+        </div>
+        <h4 class="section-subtitle" style="margin-top:16px" data-i18n="settings.text.workspace_row_splits"></h4>
+        <p class="section-desc" data-i18n="settings.text.row_splits_for_specific_workspaces_max_4_rows"></p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th style="width:40%" data-i18n="settings.text.workspaces"></th><th data-i18n="settings.layout.rows_split.label"></th><th style="width:36px"></th></tr></thead>
+            <tbody id="workspace-rows-body"></tbody>
+          </table>
+        </div>
+        <div class="table-actions"><button class="btn btn-sm" type="button" onclick="addWorkspaceRow({})" data-i18n="settings.text.add_workspace_row"></button></div>
         <h3 class="section-subtitle" data-i18n="settings.text.workspace_names"></h3>
         <p class="section-desc" data-i18n="settings.text.optional_labels_for_workspaces_1_9_shown_in_lwm_query_workspace_and_sent_to"></p>
         <div class="card" id="workspace-names-card"></div>
@@ -1083,6 +1180,10 @@ input[type="range"]::-webkit-slider-thumb {
             <label class="toggle"><input type="checkbox" id="startup-auto_start" data-no-config><span class="track"></span><span class="thumb"></span></label>
           </div>
           <div class="field">
+            <div class="field-info"><div class="field-label" data-i18n="settings.glazewm_compat.enabled.label"></div><div class="field-desc" data-i18n="settings.glazewm_compat.enabled.description"></div></div>
+            <label class="toggle"><input type="checkbox" id="glazewm_compat-enabled"><span class="track"></span><span class="thumb"></span></label>
+          </div>
+          <div class="field">
             <div class="field-info"><div class="field-label" data-i18n="settings.behavior.focus_new_windows.label"></div><div class="field-desc" data-i18n="settings.behavior.focus_new_windows.description"></div></div>
             <label class="toggle"><input type="checkbox" id="behavior-focus_new_windows"><span class="track"></span><span class="thumb"></span></label>
           </div>
@@ -1095,8 +1196,41 @@ input[type="range"]::-webkit-slider-thumb {
             <label class="toggle"><input type="checkbox" id="behavior-focus_follows_mouse"><span class="track"></span><span class="thumb"></span></label>
           </div>
           <div class="field">
+            <div class="field-info"><div class="field-label" data-i18n="settings.behavior.keep_awake.label"></div><div class="field-desc" data-i18n="settings.behavior.keep_awake.description"></div></div>
+            <label class="toggle"><input type="checkbox" id="behavior-keep_awake"><span class="track"></span><span class="thumb"></span></label>
+          </div>
+          <div class="field">
             <div class="field-info"><div class="field-label" data-i18n="settings.behavior.focus_follows_mouse_delay_ms.label"></div><div class="field-desc" data-i18n="settings.behavior.focus_follows_mouse_delay_ms.description"></div></div>
             <input type="number" id="behavior-focus_follows_mouse_delay_ms" min="50" max="2000">
+          </div>
+          <div class="field">
+            <div class="field-info"><div class="field-label" data-i18n="settings.behavior.focus_lock_modifier.label"></div><div class="field-desc" data-i18n="settings.behavior.focus_lock_modifier.description"></div></div>
+            <div class="combobox" id="cb-behavior-focus_lock_modifier">
+              <button class="combobox-trigger" type="button"><span class="combobox-text" data-i18n="settings.text.focus_lock_none"></span><svg class="combobox-chevron" viewBox="0 0 12 12"><path d="M2.15 4.65a.5.5 0 01.7 0L6 7.79l3.15-3.14a.5.5 0 11.7.7l-3.5 3.5a.5.5 0 01-.7 0l-3.5-3.5a.5.5 0 010-.7z"/></svg></button>
+              <div class="combobox-popup">
+                <div class="combobox-option selected" data-value="none" data-i18n="settings.text.focus_lock_none"></div>
+                <div class="combobox-option" data-value="Ctrl">Ctrl</div>
+                <div class="combobox-option" data-value="Alt">Alt</div>
+                <div class="combobox-option" data-value="Shift">Shift</div>
+                <div class="combobox-option" data-value="Win">Win</div>
+                <div class="combobox-option" data-value="F13">F13</div>
+                <div class="combobox-option" data-value="F14">F14</div>
+                <div class="combobox-option" data-value="F15">F15</div>
+                <div class="combobox-option" data-value="F16">F16</div>
+                <div class="combobox-option" data-value="F17">F17</div>
+                <div class="combobox-option" data-value="F18">F18</div>
+                <div class="combobox-option" data-value="F19">F19</div>
+                <div class="combobox-option" data-value="F20">F20</div>
+                <div class="combobox-option" data-value="F21">F21</div>
+                <div class="combobox-option" data-value="F22">F22</div>
+                <div class="combobox-option" data-value="F23">F23</div>
+                <div class="combobox-option" data-value="F24">F24</div>
+              </div>
+            </div>
+          </div>
+          <div class="field">
+            <div class="field-info"><div class="field-label" data-i18n="settings.behavior.move_step.label"></div><div class="field-desc" data-i18n="settings.behavior.move_step.description"></div></div>
+            <input type="number" id="behavior-move_step" min="1" max="1000">
           </div>
           <div class="field">
             <div class="field-info"><div class="field-label" data-i18n="settings.behavior.mouse_follows_focus.label"></div><div class="field-desc" data-i18n="settings.behavior.mouse_follows_focus.description"></div></div>
@@ -1104,11 +1238,34 @@ input[type="range"]::-webkit-slider-thumb {
           </div>
           <div class="field">
             <div class="field-info"><div class="field-label" data-i18n="settings.behavior.workspace_edge_wrap.label"></div><div class="field-desc" data-i18n="settings.behavior.workspace_edge_wrap.description"></div></div>
-            <label class="toggle"><input type="checkbox" id="behavior-workspace_edge_wrap"><span class="track"></span><span class="thumb"></span></label>
+            <div class="combobox" id="cb-behavior-workspace_edge_wrap">
+              <button class="combobox-trigger" type="button"><span class="combobox-text" data-i18n="settings.text.workspace_edge_off"></span><svg class="combobox-chevron" viewBox="0 0 12 12"><path d="M2.15 4.65a.5.5 0 01.7 0L6 7.79l3.15-3.14a.5.5 0 11.7.7l-3.5 3.5a.5.5 0 01-.7 0l-3.5-3.5a.5.5 0 010-.7z"/></svg></button>
+              <div class="combobox-popup">
+                <div class="combobox-option selected" data-value="off" data-i18n="settings.text.workspace_edge_off"></div>
+                <div class="combobox-option" data-value="wrap" data-i18n="settings.text.workspace_edge_wrap"></div>
+                <div class="combobox-option" data-value="clamp" data-i18n="settings.text.workspace_edge_clamp"></div>
+              </div>
+            </div>
           </div>
           <div class="field">
             <div class="field-info"><div class="field-label" data-i18n="settings.behavior.skip_empty_workspaces.label"></div><div class="field-desc" data-i18n="settings.behavior.skip_empty_workspaces.description"></div></div>
             <label class="toggle"><input type="checkbox" id="behavior-skip_empty_workspaces"><span class="track"></span><span class="thumb"></span></label>
+          </div>
+          <div class="field">
+            <div class="field-info"><div class="field-label" data-i18n="settings.behavior.follow_window_to_workspace.label"></div><div class="field-desc" data-i18n="settings.behavior.follow_window_to_workspace.description"></div></div>
+            <label class="toggle"><input type="checkbox" id="behavior-follow_window_to_workspace"><span class="track"></span><span class="thumb"></span></label>
+          </div>
+          <div class="field">
+            <div class="field-info"><div class="field-label" data-i18n="settings.behavior.focus_crosses_monitors.label"></div><div class="field-desc" data-i18n="settings.behavior.focus_crosses_monitors.description"></div></div>
+            <label class="toggle"><input type="checkbox" id="behavior-focus_crosses_monitors"><span class="track"></span><span class="thumb"></span></label>
+          </div>
+          <div class="field">
+            <div class="field-info"><div class="field-label" data-i18n="settings.behavior.move_crosses_monitors.label"></div><div class="field-desc" data-i18n="settings.behavior.move_crosses_monitors.description"></div></div>
+            <label class="toggle"><input type="checkbox" id="behavior-move_crosses_monitors"><span class="track"></span><span class="thumb"></span></label>
+          </div>
+          <div class="field">
+            <div class="field-info"><div class="field-label" data-i18n="settings.behavior.move_window_across_rows.label"></div><div class="field-desc" data-i18n="settings.behavior.move_window_across_rows.description"></div></div>
+            <label class="toggle"><input type="checkbox" id="behavior-move_window_across_rows"><span class="track"></span><span class="thumb"></span></label>
           </div>
           <div class="field">
             <div class="field-info"><div class="field-label" data-i18n="settings.behavior.fullscreen_follows_focus.label"></div><div class="field-desc" data-i18n="settings.behavior.fullscreen_follows_focus.description"></div></div>
@@ -1148,6 +1305,16 @@ input[type="range"]::-webkit-slider-thumb {
             </div>
           </div>
           <div class="field">
+            <div class="field-info"><div class="field-label" data-i18n="settings.behavior.plain_drag_action.label"></div><div class="field-desc" data-i18n="settings.behavior.plain_drag_action.description"></div></div>
+            <div class="combobox" id="cb-behavior-plain_drag_action">
+              <button class="combobox-trigger" type="button"><span class="combobox-text" data-i18n="settings.text.drag_merge"></span><svg class="combobox-chevron" viewBox="0 0 12 12"><path d="M2.15 4.65a.5.5 0 01.7 0L6 7.79l3.15-3.14a.5.5 0 11.7.7l-3.5 3.5a.5.5 0 01-.7 0l-3.5-3.5a.5.5 0 010-.7z"/></svg></button>
+              <div class="combobox-popup">
+                <div class="combobox-option selected" data-value="merge" data-i18n="settings.text.drag_merge"></div>
+                <div class="combobox-option" data-value="reorder" data-i18n="settings.text.drag_reorder"></div>
+              </div>
+            </div>
+          </div>
+          <div class="field">
             <div class="field-info"><div class="field-label" data-i18n="settings.behavior.new_window_monitor.label"></div><div class="field-desc" data-i18n="settings.behavior.new_window_monitor.description"></div></div>
             <div class="combobox" id="cb-behavior-new_window_monitor">
               <button class="combobox-trigger" type="button"><span class="combobox-text" data-i18n="settings.text.opening_monitor"></span><svg class="combobox-chevron" viewBox="0 0 12 12"><path d="M2.15 4.65a.5.5 0 01.7 0L6 7.79l3.15-3.14a.5.5 0 11.7.7l-3.5 3.5a.5.5 0 01-.7 0l-3.5-3.5a.5.5 0 010-.7z"/></svg></button>
@@ -1155,6 +1322,16 @@ input[type="range"]::-webkit-slider-thumb {
                 <div class="combobox-option selected" data-value="opening" data-i18n="settings.text.opening_monitor"></div>
                 <div class="combobox-option" data-value="focused" data-i18n="settings.text.focused_monitor"></div>
                 <div class="combobox-option" data-value="cursor" data-i18n="settings.text.cursor_monitor"></div>
+              </div>
+            </div>
+          </div>
+          <div class="field">
+            <div class="field-info"><div class="field-label" data-i18n="settings.behavior.fixed_size_windows.label"></div><div class="field-desc" data-i18n="settings.behavior.fixed_size_windows.description"></div></div>
+            <div class="combobox" id="cb-behavior-fixed_size_windows">
+              <button class="combobox-trigger" type="button"><span class="combobox-text" data-i18n="settings.text.fixed_size_float"></span><svg class="combobox-chevron" viewBox="0 0 12 12"><path d="M2.15 4.65a.5.5 0 01.7 0L6 7.79l3.15-3.14a.5.5 0 11.7.7l-3.5 3.5a.5.5 0 01-.7 0l-3.5-3.5a.5.5 0 010-.7z"/></svg></button>
+              <div class="combobox-popup">
+                <div class="combobox-option selected" data-value="float" data-i18n="settings.text.fixed_size_float"></div>
+                <div class="combobox-option" data-value="tile" data-i18n="settings.text.fixed_size_tile"></div>
               </div>
             </div>
           </div>
@@ -1329,6 +1506,68 @@ input[type="range"]::-webkit-slider-thumb {
         </div>
       </div>
 
+      <!-- Report an Issue -->
+      <div id="sec-report" class="section">
+        <h2 class="section-title" data-i18n="settings.report.title"></h2>
+        <p class="section-desc" data-i18n="settings.report.guide"></p>
+        <p class="section-desc" data-i18n="settings.report.long"></p>
+        <div class="info-bar"><svg class="info-bar-icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 1a7 7 0 100 14A7 7 0 008 1zm-.75 3.5a.75.75 0 011.5 0v4a.75.75 0 01-1.5 0v-4zm.75 7a.75.75 0 110-1.5.75.75 0 010 1.5z"/></svg><div class="info-bar-content"><span class="info-bar-message" data-i18n="settings.report.privacy"></span></div></div>
+        <div class="card">
+          <div class="field stacked"><div class="field-info"><label class="field-label" for="report-title" data-i18n="settings.report.subject"></label></div><input type="text" id="report-title" data-no-config autocomplete="off"></div>
+          <div class="field"><div class="field-info"><div class="field-label" id="report-category-label" data-i18n="settings.report.category"></div></div>
+            <div class="combobox" id="report-category" data-no-config data-value="">
+              <button class="combobox-trigger" type="button" aria-labelledby="report-category-label report-category-text"><span class="combobox-text" id="report-category-text" data-i18n="settings.report.unsure"></span><svg class="combobox-chevron" viewBox="0 0 12 12"><path d="M2.15 4.65a.5.5 0 01.7 0L6 7.79l3.15-3.14a.5.5 0 11.7.7l-3.5 3.5a.5.5 0 01-.7 0l-3.5-3.5a.5.5 0 010-.7z"/></svg></button>
+              <div class="combobox-popup">
+                <div class="combobox-option selected" data-value="" data-i18n="settings.report.unsure"></div>
+                <div class="combobox-option" data-value="Layout and scrolling" data-i18n="settings.report.layout"></div>
+                <div class="combobox-option" data-value="Focus" data-i18n="settings.report.focus"></div>
+                <div class="combobox-option" data-value="Hotkeys and gestures" data-i18n="settings.report.hotkeys"></div>
+                <div class="combobox-option" data-value="Window rules" data-i18n="settings.report.rules"></div>
+                <div class="combobox-option" data-value="Multiple monitors" data-i18n="settings.report.monitors"></div>
+                <div class="combobox-option" data-value="Settings" data-i18n="settings.report.settings"></div>
+                <div class="combobox-option" data-value="Performance" data-i18n="settings.report.performance"></div>
+                <div class="combobox-option" data-value="Crash or freeze" data-i18n="settings.report.crash"></div>
+                <div class="combobox-option" data-value="Other" data-i18n="settings.report.other"></div>
+              </div>
+            </div>
+          </div>
+          <div class="field stacked"><div class="field-info"><label class="field-label" for="report-actual" data-i18n="settings.report.actual"></label></div><textarea id="report-actual" data-no-config autocomplete="off"></textarea></div>
+          <div class="field stacked"><div class="field-info"><label class="field-label" for="report-expected" data-i18n="settings.report.expected"></label></div><textarea id="report-expected" data-no-config autocomplete="off"></textarea></div>
+          <div class="field stacked"><div class="field-info"><label class="field-label" for="report-repro" data-i18n="settings.report.repro"></label></div><textarea id="report-repro" data-no-config autocomplete="off"></textarea></div>
+          <div class="field stacked"><div class="field-info"><label class="field-label" for="report-affected_apps" data-i18n="settings.report.apps"></label></div><input type="text" id="report-affected_apps" data-no-config autocomplete="off"></div>
+          <div class="field"><div class="field-info"><div class="field-label" id="report-regression-label" data-i18n="settings.report.regression"></div></div>
+            <div class="combobox" id="report-regression" data-no-config data-value="Not sure">
+              <button class="combobox-trigger" type="button" aria-labelledby="report-regression-label report-regression-text"><span class="combobox-text" id="report-regression-text" data-i18n="settings.report.unsure"></span><svg class="combobox-chevron" viewBox="0 0 12 12"><path d="M2.15 4.65a.5.5 0 01.7 0L6 7.79l3.15-3.14a.5.5 0 11.7.7l-3.5 3.5a.5.5 0 01-.7 0l-3.5-3.5a.5.5 0 010-.7z"/></svg></button>
+              <div class="combobox-popup"><div class="combobox-option selected" data-value="Not sure" data-i18n="settings.report.unsure"></div><div class="combobox-option" data-value="Yes" data-i18n="settings.report.yes"></div><div class="combobox-option" data-value="No" data-i18n="settings.report.no"></div></div>
+            </div>
+          </div>
+          <div class="field"><div class="field-info"><div class="field-label" data-i18n="settings.report.version"></div></div><span id="report-version"></span></div>
+          <div class="field"><div class="field-info"><div class="field-label" data-i18n="settings.report.windows"></div></div><span id="report-windows"></span></div>
+          <div class="field"><div class="field-info"></div><div><button class="btn btn-sm btn-accent" type="button" id="report-submit" data-i18n="settings.report.submit" disabled></button> <button class="btn btn-sm" type="button" id="report-clear" data-i18n="settings.report.clear"></button></div></div>
+          <div id="report-status" role="status"><div class="info-bar" id="report-status-bar" hidden><svg class="info-bar-icon" viewBox="0 0 16 16" aria-hidden="true"><path fill-rule="evenodd"/></svg><div class="info-bar-content"><span class="info-bar-message" id="report-status-text"></span></div></div></div>
+        </div>
+      </div>
+
+      <!-- Troubleshooting -->
+      <div id="sec-troubleshooting" class="section">
+        <h2 class="section-title" data-i18n="settings.troubleshooting.title"></h2>
+        <h3 class="section-subtitle" data-i18n="settings.troubleshooting.health"></h3>
+        <div class="card" id="troubleshooting-health" aria-live="polite"></div>
+        <h3 class="section-subtitle" data-i18n="settings.troubleshooting.saved_diagnostics"></h3>
+        <div class="card">
+          <div id="troubleshooting-files" aria-live="polite"></div>
+          <div class="card-divider"></div>
+          <div class="troubleshooting-actions">
+            <button class="btn btn-sm" id="troubleshooting-refresh" data-i18n="settings.troubleshooting.refresh"></button>
+            <button class="btn btn-sm" id="troubleshooting-reveal" data-i18n="settings.troubleshooting.reveal_folder"></button>
+            <button class="btn btn-sm btn-accent" id="troubleshooting-create" data-i18n="settings.troubleshooting.create_snapshot"></button>
+            <button class="btn btn-sm" id="troubleshooting-report" hidden data-i18n="settings.troubleshooting.report_issue"></button>
+          </div>
+          <div id="troubleshooting-status" role="status"><div class="info-bar" id="troubleshooting-status-bar" hidden><svg class="info-bar-icon" viewBox="0 0 16 16" aria-hidden="true"><path fill-rule="evenodd"/></svg><div class="info-bar-content"><span class="info-bar-message" id="troubleshooting-status-text"></span></div></div></div>
+        </div>
+      </div>
+      <!-- End Troubleshooting -->
+
       <!-- About -->
       <div id="sec-about" class="section">
         <h2 class="section-title" data-i18n="settings.text.about"></h2>
@@ -1384,6 +1623,12 @@ function applyLocale(strings, language) {
       el.setAttribute(attribute, t(el.getAttribute('data-i18n-' + attribute)));
     });
   });
+  var windows = document.getElementById('report-windows');
+  if (windows) {
+    var version = window._windowsVersion || '';
+    windows.textContent = version === 'Unknown' ? t('settings.report.unknown') :
+      version.replace(/, Build ([^)]*)\)$/, function(_, build) { return ', ' + t('settings.report.build', {build: build}) + ')'; });
+  }
 }
 function languageOptionsMarkup(languages) {
   return languages.map(function(language) {
@@ -1432,13 +1677,57 @@ document.querySelectorAll('.nav-item[data-section]').forEach(function(link) {
 });
 
 /* ── ComboBox ───────────────────────────────────────────────────────── */
+function closeCombobox(cb) {
+  cb.classList.remove('open');
+  cb.querySelector('.combobox-trigger').setAttribute('aria-expanded', 'false');
+}
+function syncComboboxOptions(cb) {
+  cb.querySelectorAll('.combobox-option').forEach(function(opt) {
+    opt.setAttribute('role', 'option');
+    opt.setAttribute('aria-selected', String(opt.classList.contains('selected')));
+    opt.tabIndex = -1;
+  });
+}
 function initCombobox(cb) {
   var trigger = cb.querySelector('.combobox-trigger');
   var popup = cb.querySelector('.combobox-popup');
+  trigger.setAttribute('aria-haspopup', 'listbox');
+  trigger.setAttribute('aria-expanded', 'false');
+  popup.setAttribute('role', 'listbox');
+  function namePopup() {
+    var labelledBy = trigger.getAttribute('aria-labelledby');
+    var field = cb.closest('.field');
+    var fieldLabel = field && field.querySelector('.field-label');
+    var label = cb.getAttribute('aria-label') || (fieldLabel && fieldLabel.textContent.trim());
+    if (labelledBy) {
+      popup.removeAttribute('aria-label');
+      popup.setAttribute('aria-labelledby', labelledBy);
+    } else if (label) {
+      popup.removeAttribute('aria-labelledby');
+      popup.setAttribute('aria-label', label);
+    } else {
+      if (!trigger.id) {
+        var id;
+        do { id = 'combobox-trigger-' + (initCombobox.nextId = (initCombobox.nextId || 0) + 1); }
+        while (document.getElementById(id));
+        trigger.id = id;
+      }
+      popup.removeAttribute('aria-label');
+      popup.setAttribute('aria-labelledby', trigger.id);
+    }
+  }
+  namePopup();
+  syncComboboxOptions(cb);
   trigger.addEventListener('click', function(e) {
     e.stopPropagation();
+    if (trigger.disabled || cb.classList.contains('disabled')) return;
     document.querySelectorAll('.combobox.open').forEach(function(other) {
-      if (other !== cb) other.classList.remove('open');
+      if (other !== cb) closeCombobox(other);
+    });
+    document.querySelectorAll('.rule-opts.open').forEach(function(o) {
+      o.classList.remove('open');
+      o.querySelectorAll('.menu-item.subopen').forEach(function(m) { m.classList.remove('subopen'); });
+      var tr = o.closest('tr'); if (tr && typeof updateRuleSummary === 'function') updateRuleSummary(tr);
     });
     if (!cb.classList.contains('open')) {
       /* Position popup using fixed coords from trigger rect. Anchor to the
@@ -1469,24 +1758,64 @@ function initCombobox(cb) {
       }
     }
     cb.classList.toggle('open');
+    if (cb.classList.contains('open')) namePopup();
+    trigger.setAttribute('aria-expanded', String(cb.classList.contains('open')));
+    syncComboboxOptions(cb);
   });
-  cb.querySelectorAll('.combobox-option').forEach(function(opt) {
-    opt.addEventListener('click', function(e) {
-      e.stopPropagation();
-      cb.querySelector('.combobox-text').textContent = opt.textContent;
-      cb.dataset.value = opt.dataset.value;
-      cb.classList.remove('open');
-      cb.querySelectorAll('.combobox-option').forEach(function(o) { o.classList.remove('selected'); });
-      opt.classList.add('selected');
-      autoSave(0);
-    });
+  trigger.addEventListener('keydown', function(e) {
+    if (trigger.disabled || cb.classList.contains('disabled')) return;
+    if ((e.key === 'Enter' || e.key === ' ') && e.repeat) { e.preventDefault(); return; }
+    if (cb.classList.contains('open') && (e.key === 'Escape' || e.key === 'Tab')) {
+      if (e.key === 'Escape') e.preventDefault();
+      closeCombobox(cb);
+      return;
+    }
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp' || e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      if (!cb.classList.contains('open')) trigger.click();
+      var options = cb.querySelectorAll('.combobox-option');
+      var selected = Array.from(options).find(function(o) { return o.classList.contains('selected'); });
+      if (selected || options[0]) (selected || options[0]).focus();
+    }
+  });
+  popup.addEventListener('click', function(e) {
+    var opt = e.target.closest('.combobox-option');
+    if (!opt || !popup.contains(opt) || trigger.disabled || cb.classList.contains('disabled')) return;
+    e.stopPropagation();
+    cb.querySelector('.combobox-text').textContent = opt.textContent;
+    cb.dataset.value = opt.dataset.value;
+    closeCombobox(cb);
+    cb.querySelectorAll('.combobox-option').forEach(function(o) { o.classList.remove('selected'); });
+    opt.classList.add('selected');
+    syncComboboxOptions(cb);
+    if (cb.dataset.noConfig !== undefined) cb.dispatchEvent(new Event('change'));
+    else autoSave(0);
+  });
+  popup.addEventListener('keydown', function(e) {
+    if (trigger.disabled || cb.classList.contains('disabled')) return;
+    var options = Array.from(cb.querySelectorAll('.combobox-option'));
+    var index = options.indexOf(document.activeElement);
+    if (e.key === 'Escape') { e.preventDefault(); closeCombobox(cb); trigger.focus(); }
+    else if (e.key === 'Tab') closeCombobox(cb);
+    else if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      if (e.repeat) return;
+      if (index >= 0) { options[index].click(); trigger.focus(); }
+    } else if (e.key === 'ArrowDown' || e.key === 'ArrowUp' || e.key === 'Home' || e.key === 'End') {
+      e.preventDefault();
+      if (!options.length) return;
+      if (e.key === 'Home') index = 0;
+      else if (e.key === 'End') index = options.length - 1;
+      else index = Math.max(0, Math.min(options.length - 1, index + (e.key === 'ArrowDown' ? 1 : -1)));
+      options[index].focus();
+    }
   });
 }
 document.querySelectorAll('.combobox').forEach(function(cb) {
   if (cb.querySelector('.combobox-trigger')) initCombobox(cb);
 });
 document.addEventListener('click', function() {
-  document.querySelectorAll('.combobox.open').forEach(function(cb) { cb.classList.remove('open'); });
+  document.querySelectorAll('.combobox.open').forEach(closeCombobox);
   document.querySelectorAll('.rule-opts.open').forEach(function(o) {
     o.classList.remove('open');
     o.querySelectorAll('.menu-item.subopen').forEach(function(m) { m.classList.remove('subopen'); });
@@ -1618,26 +1947,63 @@ function setCb(id, value, showUnknown) {
       o.classList.add('selected');
       cb.querySelector('.combobox-text').textContent = o.textContent;
     }
+    o.setAttribute('aria-selected', String(o.classList.contains('selected')));
   });
   if (!matched && showUnknown) cb.querySelector('.combobox-text').textContent = value;
 }
 function hexToInput(hex) { return '#' + (hex || '000000').toLowerCase(); }
 function inputToHex(v) { return v.replace('#', '').toUpperCase(); }
 
+var configSnapshot = window._initConfig || {};
+var configGeneration = 0;
+function applyTrayConfig(cfg) {
+  configSnapshot = cfg;
+  setCb('cb-layout-centering_mode', cfg.layout.centering_mode);
+  setCb('cb-layout-center_columns', cfg.layout.center_columns || 'off');
+  setChecked('appearance-active_border', cfg.appearance.active_border);
+  setChecked('behavior-focus_new_windows', cfg.behavior.focus_new_windows);
+  setChecked('behavior-focus_follows_mouse', cfg.behavior.focus_follows_mouse);
+  setChecked('behavior-keep_awake', cfg.behavior.keep_awake);
+  setCb('cb-behavior-focus_lock_modifier', cfg.behavior.focus_lock_modifier || 'none');
+  setCb('cb-behavior-taskbar_buttons', cfg.behavior.taskbar_buttons || 'hide_offscreen');
+  setCb('cb-behavior-new_window_placement', cfg.behavior.new_window_placement || 'new_column');
+}
+
 /* ── Init ────────────────────────────────────────────────────────────── */
 function init(cfg) {
+  configGeneration++;
+  configSnapshot = cfg;
+  setChecked('glazewm_compat-enabled', cfg.glazewm_compat && cfg.glazewm_compat.enabled);
   setVal('layout-gap', cfg.layout.gap);
   setVal('layout-outer_gap_left', cfg.layout.outer_gap_left);
   setVal('layout-outer_gap_right', cfg.layout.outer_gap_right);
   setVal('layout-outer_gap_top', cfg.layout.outer_gap_top);
   setVal('layout-outer_gap_bottom', cfg.layout.outer_gap_bottom);
+  var loadedSplit = (cfg.layout.rows && cfg.layout.rows.split) || ['100%'];
+  var rowsSplit = loadedSplit.join(', ');
+  setVal('layout-rows-split', rowsSplit);
+  var globalSplit = document.getElementById('layout-rows-split');
+  globalSplit._lastValidSplit = loadedSplit.slice();
+  globalSplit._lastSplitText = globalSplit.value;
+  delete globalSplit._rejectedSplitText;
+  setVal('layout-rows-gap', (cfg.layout.rows && cfg.layout.rows.gap != null) ? cfg.layout.rows.gap : 8);
+  var wsRowsBody = document.getElementById('workspace-rows-body');
+  if (wsRowsBody) {
+    wsRowsBody.innerHTML = '';
+    var wsRows = (cfg.layout && cfg.layout.rows && cfg.layout.rows.workspaces) || [];
+    wsRows.forEach(function(item) { addWorkspaceRow(item); });
+  }
   document.getElementById('width-presets-body').innerHTML = '';
-  (cfg.layout.width_presets || [0.333,0.5,0.667]).forEach(function(v) { addPresetRow('width', v); });
+  lastValidWidthPresets = (cfg.layout.width_presets || [0.333,0.5,0.667]).slice();
+  lastValidDefaultWidthPreset = cfg.layout.default_width_preset || 1;
+  lastValidWidthPresets.forEach(function(v) { addPresetRow('width', v); });
   refreshDefaultWidthPresetOptions(cfg.layout.default_width_preset || 1);
   document.getElementById('height-presets-body').innerHTML = '';
   (cfg.layout.height_presets || [0.333,0.5,0.667]).forEach(function(v) { addPresetRow('height', v); });
   setCb('cb-layout-centering_mode', cfg.layout.centering_mode);
-  setChecked('layout-center_single_column', cfg.layout.center_single_column);
+  setCb('cb-layout-mouse_resize', cfg.layout.mouse_resize || 'presets');
+  setCb('cb-layout-offscreen_mode', cfg.layout.offscreen_mode || 'bleed');
+  setCb('cb-layout-center_columns', cfg.layout.center_columns || 'off');
   setChecked('layout-center_past_edges', cfg.layout.center_past_edges);
 
   setCb('cb-appearance-language', cfg.appearance.language || 'en');
@@ -1661,10 +2027,17 @@ function init(cfg) {
   setChecked('behavior-focus_new_windows', cfg.behavior.focus_new_windows);
   setChecked('behavior-track_focus_changes', cfg.behavior.track_focus_changes);
   setChecked('behavior-focus_follows_mouse', cfg.behavior.focus_follows_mouse);
+  setChecked('behavior-keep_awake', cfg.behavior.keep_awake);
+  setCb('cb-behavior-focus_lock_modifier', cfg.behavior.focus_lock_modifier || 'none');
   setVal('behavior-focus_follows_mouse_delay_ms', cfg.behavior.focus_follows_mouse_delay_ms);
+  setVal('behavior-move_step', cfg.behavior.move_step);
   setChecked('behavior-mouse_follows_focus', cfg.behavior.mouse_follows_focus === true);
-  setChecked('behavior-workspace_edge_wrap', cfg.behavior.workspace_edge_wrap === true);
+  setCb('cb-behavior-workspace_edge_wrap', cfg.behavior.workspace_edge_wrap || 'off');
   setChecked('behavior-skip_empty_workspaces', cfg.behavior.skip_empty_workspaces === true);
+  setChecked('behavior-follow_window_to_workspace', cfg.behavior.follow_window_to_workspace === true);
+  setChecked('behavior-focus_crosses_monitors', cfg.behavior.focus_crosses_monitors === true);
+  setChecked('behavior-move_crosses_monitors', cfg.behavior.move_crosses_monitors === true);
+  setChecked('behavior-move_window_across_rows', cfg.behavior.move_window_across_rows === true);
   setChecked('behavior-fullscreen_follows_focus', cfg.behavior.fullscreen_follows_focus !== false);
   setChecked('behavior-disable_snap_layouts', cfg.behavior.disable_snap_layouts !== false);
   setChecked('behavior-swap_chain_ghost_animation', cfg.behavior.swap_chain_ghost_animation === true);
@@ -1673,7 +2046,9 @@ function init(cfg) {
   setCb('cb-behavior-log_level', cfg.behavior.log_level);
   setCb('cb-behavior-tab_close_action', cfg.behavior.tab_close_action || 'close_window');
   setCb('cb-behavior-new_window_placement', cfg.behavior.new_window_placement || 'new_column');
+  setCb('cb-behavior-plain_drag_action', cfg.behavior.plain_drag_action || 'merge');
   setCb('cb-behavior-new_window_monitor', cfg.behavior.new_window_monitor || 'opening');
+  setCb('cb-behavior-fixed_size_windows', cfg.behavior.fixed_size_windows || 'float');
   setCb('cb-overview-render', (cfg.overview && cfg.overview.render) || 'live');
 
   if (cfg.hotkeys) {
@@ -1740,12 +2115,24 @@ function init(cfg) {
   }
 }
 
+function applyReloadConfig(cfg) {
+  cfg = Object.assign({}, cfg, {
+    high_contrast: !document.getElementById('hc-info-bar').hidden,
+    auto_start: checked('startup-auto_start')
+  });
+  init(cfg);
+}
+
 /* ── Delete icon (X) ─────────────────────────────────────────────────── */
 var deleteIcon = '<svg viewBox="0 0 12 12"><line x1="2" y1="2" x2="10" y2="10"/><line x1="10" y1="2" x2="2" y2="10"/></svg>';
 
 /* The host catalog supplies display order, defaults, and fallback labels.
    Locales supply translated names; a test keeps English names in sync. */
 var HOTKEY_CATALOG = window._hotkeyCatalog || [];
+var HOTKEY_CATEGORIES = window._hotkeyCategories || [];
+var hotkeyCollapsed = Object.create(null);
+HOTKEY_CATEGORIES.forEach(function(category) { hotkeyCollapsed[category.id] = category.collapsed; });
+hotkeyCollapsed.other = false;
 var CMD_ORDER = HOTKEY_CATALOG.map(function(a) { return a.id; });
 var CMD_LABELS = {};
 var DEFAULT_HOTKEYS = {};
@@ -1788,8 +2175,8 @@ function updateScrollLabels() {
   var modDisplay = mod.split('+').map(function(s) { return s.trim(); }).join(' + ');
   var up = document.getElementById('lbl-scroll-up');
   var dn = document.getElementById('lbl-scroll-down');
-  if (up) up.textContent = t('settings.text.modifier_scroll_up', {modifier:modDisplay});
-  if (dn) dn.textContent = t('settings.text.modifier_scroll_down', {modifier:modDisplay});
+  if (up) up.textContent = mod === 'none' ? t('settings.text.scroll_up_modifier_off') : t('settings.text.modifier_scroll_up', {modifier:modDisplay});
+  if (dn) dn.textContent = mod === 'none' ? t('settings.text.scroll_down_modifier_off') : t('settings.text.modifier_scroll_down', {modifier:modDisplay});
 }
 
 /* Build gesture comboboxes from CMD_ORDER/CMD_LABELS */
@@ -1832,12 +2219,17 @@ var CODE_TO_KEY = {
   ArrowLeft: 'Left', ArrowRight: 'Right', ArrowUp: 'Up', ArrowDown: 'Down',
   Home: 'Home', End: 'End', PageUp: 'PageUp', PageDown: 'PageDown',
   Space: 'Space', Enter: 'Enter', Tab: 'Tab', Escape: 'Escape',
-  Minus: '-', Equal: '=', Comma: ',', Period: '.', BracketLeft: '[', BracketRight: ']',
-  Semicolon: ';', Quote: "'", Slash: '/', Backslash: '\\', Backquote: '`',
   NumpadAdd: 'NumpadAdd', NumpadSubtract: 'NumpadSubtract', NumpadMultiply: 'NumpadMultiply',
   NumpadDivide: 'NumpadDivide', NumpadDecimal: 'NumpadDecimal'
 };
-function codeToKey(code, key) {
+// Match punctuation to the virtual key the daemon's hook sees.
+var PUNCTUATION_VK_TO_KEY = {
+  0xBD: '-', 0xBB: '=', 0xBC: ',', 0xBE: '.', 0xDB: '[', 0xDD: ']',
+  0xBA: ';', 0xBF: '/', 0xC0: '`', 0xDC: '\\', 0xDE: "'"
+};
+function codeToKey(code, key, keyCode) {
+  var punctuation = PUNCTUATION_VK_TO_KEY[keyCode];
+  if (punctuation !== undefined) return punctuation;
   if (/^Key[A-Z]$/.test(code)) {
     // Record the letter the layout produces (e.key), not the physical US
     // position, so the bind matches the VK the daemon's hook sees on Dvorak.
@@ -1967,7 +2359,7 @@ function attachRecorder(input) {
       autoSave(0);
       return;
     }
-    var token = codeToKey(e.code, e.key);
+    var token = codeToKey(e.code, e.key, e.keyCode);
     if (!token) return; /* unmapped key: keep waiting */
     e.preventDefault();
     e.stopPropagation();
@@ -1981,10 +2373,12 @@ function attachRecorder(input) {
   });
 }
 
-function addHotkeyRow(key, cmd, extra) {
+function addHotkeyRow(key, cmd, extra, category) {
   var tbody = document.getElementById('hotkeys-body');
   var tr = document.createElement('tr');
   tr.dataset.cmd = cmd;
+  tr.dataset.category = category;
+  tr.hidden = hotkeyCollapsed[category];
   if (extra) tr.dataset.extra = '1';
   /* Long labels carry a "(detail)" suffix; show the short name and move the
      parenthetical into a hover tooltip so the row stays one line. */
@@ -2069,35 +2463,58 @@ function renderFailedHotkeys() {
   bar.hidden = false;
 }
 
+function addHotkeyGroup(category, labelKey, fallback) {
+  var tbody = document.getElementById('hotkeys-body');
+  var tr = document.createElement('tr');
+  tr.className = 'hk-group';
+  tr.dataset.category = category;
+  tr.innerHTML = '<td colspan="3"><button type="button" aria-expanded="' + !hotkeyCollapsed[category] + '">' +
+    '<svg class="combobox-chevron" viewBox="0 0 12 12" aria-hidden="true"><path d="M2.15 4.65a.5.5 0 01.7 0L6 7.79l3.15-3.14a.5.5 0 11.7.7l-3.5 3.5a.5.5 0 01-.7 0l-3.5-3.5a.5.5 0 010-.7z"/></svg>' +
+    '<span data-i18n="' + labelKey + '">' + escHtml(t(labelKey) === labelKey ? fallback : t(labelKey)) + '</span></button></td>';
+  var button = tr.querySelector('button');
+  button.addEventListener('click', function() {
+    hotkeyCollapsed[category] = !hotkeyCollapsed[category];
+    button.setAttribute('aria-expanded', String(!hotkeyCollapsed[category]));
+    tbody.querySelectorAll('tr[data-category]').forEach(function(row) {
+      if (row !== tr && row.dataset.category === category) row.hidden = hotkeyCollapsed[category];
+    });
+  });
+  tbody.appendChild(tr);
+}
+
 function loadHotkeysSorted(bindings, scrollModifier, disabled) {
   var tbody = document.getElementById('hotkeys-body');
   tbody.innerHTML = '';
   var disabledSet = disabled || [];
   var cmdToKeys = Object.create(null);
   Object.entries(bindings).forEach(function(e) { (cmdToKeys[e[1]] = cmdToKeys[e[1]] || []).push(e[0]); });
-  /* Render in defined order. A command the user disabled stays empty rather
-     than falling back to its default. */
-  CMD_ORDER.forEach(function(cmd) {
-    var keys = cmdToKeys[cmd] || [disabledSet.indexOf(cmd) !== -1 ? '' : defaultKeyForCmd(cmd)];
-    keys.forEach(function(key, index) { addHotkeyRow(key, cmd, index > 0); });
+  HOTKEY_CATEGORIES.forEach(function(category) {
+    addHotkeyGroup(category.id, 'hotkeys.category.' + category.id, category.label);
+    if (category.id === 'leopardwm') {
+      var tr = document.createElement('tr');
+      tr.dataset.special = 'scroll_modifier';
+      tr.dataset.category = category.id;
+      tr.hidden = hotkeyCollapsed[category.id];
+      var scrollValue = scrollModifier || 'Ctrl+Alt';
+      if (scrollValue.trim().toLowerCase() === 'none') scrollValue = '';
+      tr.innerHTML =
+        '<td class="hk-cmd-label" data-i18n="settings.text.scroll_modifier">' + escHtml(t('settings.text.scroll_modifier')) + '</td>' +
+        '<td><input type="text" class="hk-key" value="' + escAttr(scrollValue) + '" data-i18n-placeholder="settings.text.scroll_modifier_placeholder" placeholder="' + escAttr(t('settings.text.scroll_modifier_placeholder')) + '"></td>' +
+        '<td><button class="row-delete" data-i18n-title="settings.text.reset_to_default" title="' + escAttr(t('settings.text.reset_to_default')) + '" onclick="this.closest(\'tr\').querySelector(\'.hk-key\').value=\'Ctrl+Alt\';updateScrollLabels();autoSave(0);">' + resetIcon + '</button></td>';
+      tbody.appendChild(tr);
+      wrapAllInputs(tr);
+      tr.querySelector('.hk-key').addEventListener('input', function() { updateScrollLabels(); autoSave(500); });
+    }
+    HOTKEY_CATALOG.filter(function(action) { return action.category === category.id; }).forEach(function(action) {
+      var keys = cmdToKeys[action.id] || [disabledSet.indexOf(action.id) !== -1 ? '' : defaultKeyForCmd(action.id)];
+      keys.forEach(function(key, index) { addHotkeyRow(key, action.id, index > 0, category.id); });
+    });
   });
-  /* Append any custom commands not in CMD_ORDER */
-  Object.entries(bindings).forEach(function(e) {
-    if (CMD_ORDER.indexOf(e[1]) === -1) addHotkeyRow(e[0], e[1]);
-  });
-  /* Scroll modifier row — insert after focus navigation group */
-  var tr = document.createElement('tr');
-  tr.dataset.special = 'scroll_modifier';
-  tr.innerHTML =
-    '<td class="hk-cmd-label" data-i18n="settings.text.scroll_modifier">' + escHtml(t('settings.text.scroll_modifier')) + '</td>' +
-    '<td><input type="text" class="hk-key" value="' + escAttr(scrollModifier || 'Ctrl+Alt') + '" data-i18n-placeholder="settings.text.e_g_ctrl_alt" placeholder="' + escAttr(t('settings.text.e_g_ctrl_alt')) + '"></td>' +
-    '<td><button class="row-delete" data-i18n-title="settings.text.reset_to_default" title="' + escAttr(t('settings.text.reset_to_default')) + '" onclick="this.closest(\'tr\').querySelector(\'.hk-key\').value=\'Ctrl+Alt\';updateScrollLabels();autoSave(0);">' + resetIcon + '</button></td>';
-  var focusRows = tbody.querySelectorAll('tr[data-cmd="focus_prev"]');
-  var anchor = focusRows.length ? focusRows[focusRows.length - 1] : null;
-  if (anchor && anchor.nextSibling) { tbody.insertBefore(tr, anchor.nextSibling); }
-  else { tbody.appendChild(tr); }
-  wrapAllInputs(tr);
-  tr.querySelector('.hk-key').addEventListener('input', function() { updateScrollLabels(); autoSave(500); });
+  var custom = Object.entries(bindings).filter(function(e) { return CMD_ORDER.indexOf(e[1]) === -1; });
+  if (custom.length) {
+    addHotkeyGroup('other', 'settings.hotkeys.group_other', 'Other');
+    custom.forEach(function(e) { addHotkeyRow(e[0], e[1], false, 'other'); });
+  }
   refreshDuplicateWarnings();
 }
 
@@ -2117,6 +2534,10 @@ function addRuleRow(r) {
   var action = r.action || 'tile';
   var actionLabel = actionLabels[action] || action;
   var corner = r.corner_style || 'auto';
+  var border = r.border === false ? 'hide' : 'show';
+  var borderColorMode = r.border_color ? 'custom' : 'default';
+  var borderKeys = { show: 'settings.text.rule_border_show', hide: 'settings.text.rule_border_hide' };
+  var borderColorKeys = { default: 'settings.text.rule_border_color_default', custom: 'settings.text.rule_border_color_custom' };
   var cornerLabels = { auto: t('settings.text.auto'), square: t('settings.text.square'), rounded: t('settings.text.rounded'), small_rounded: t('settings.text.small_rounded') };
   var chevron = '<svg class="combobox-chevron" viewBox="0 0 12 12"><path d="M2.15 4.65a.5.5 0 01.7 0L6 7.79l3.15-3.14a.5.5 0 11.7.7l-3.5 3.5a.5.5 0 01-.7 0l-3.5-3.5a.5.5 0 010-.7z"/></svg>';
   var actionOpts = ['tile','float','ignore'].map(function(a) {
@@ -2132,6 +2553,7 @@ function addRuleRow(r) {
     return '<div class="menu-radio' + (w === ws ? ' selected' : '') + '" data-value="' + w + '"' + (w === '' ? ' data-i18n="settings.text.none"' : '') + '>' + escHtml(w === '' ? t('settings.text.none') : w) + '</div>';
   }).join('');
   var slot = (r.open_in_column >= 1) ? String(r.open_in_column) : '';
+  var row = (r.row >= 1 && r.row <= 4) ? String(r.row) : '';
   var maxWidth = r.match_max_width != null ? String(r.match_max_width) : '';
   var maxHeight = r.match_max_height != null ? String(r.match_max_height) : '';
   var columnWidth = r.column_width != null ? String(r.column_width) : '';
@@ -2155,6 +2577,8 @@ function addRuleRow(r) {
           '<input type="number" min="1" step="1" class="rule-max-height opt-num" placeholder="-" value="' + escAttr(maxHeight) + '"></div>' +
         '<div class="menu-item input-row"><span class="menu-label" data-i18n="settings.text.open_in_column">' + escHtml(t('settings.text.open_in_column')) + '</span>' +
           '<input type="number" min="1" class="rule-slot opt-num" placeholder="-" value="' + slot + '"></div>' +
+        '<div class="menu-item input-row"><span class="menu-label" data-i18n="settings.text.open_on_row">' + escHtml(t('settings.text.open_on_row')) + '</span>' +
+          '<input type="number" min="1" max="4" class="rule-row opt-num" placeholder="-" value="' + row + '"></div>' +
         '<div class="menu-item input-row"><span class="menu-label" data-i18n="settings.text.column_width">' + escHtml(t('settings.text.column_width')) + '</span>' +
           '<input type="number" min="0.05" max="1" step="any" class="rule-column-width opt-num" data-i18n-placeholder="settings.text.auto" placeholder="' + escAttr(t('settings.text.auto')) + '" value="' + escAttr(columnWidth) + '"></div>' +
         '<div class="rule-column-width-error" role="alert" aria-live="polite" hidden></div>' +
@@ -2165,6 +2589,13 @@ function addRuleRow(r) {
         '<div class="menu-item has-sub rule-corner" data-value="' + corner + '">' +
           '<span class="menu-label" data-i18n="settings.text.corners">' + escHtml(t('settings.text.corners')) + '</span><span class="menu-value">' + escHtml(cornerLabels[corner]) + '</span>' + menuArrow +
           '<div class="menu-sub">' + cornerRadios + '</div></div>' +
+        '<div class="menu-item has-sub rule-border" data-value="' + border + '">' +
+          '<span class="menu-label" data-i18n="settings.text.rule_border">' + escHtml(t('settings.text.rule_border')) + '</span><span class="menu-value">' + escHtml(t(borderKeys[border])) + '</span>' + menuArrow +
+          '<div class="menu-sub">' + ['show','hide'].map(function(v) { return '<div class="menu-radio' + (v === border ? ' selected' : '') + '" data-value="' + v + '" data-i18n="' + borderKeys[v] + '">' + escHtml(t(borderKeys[v])) + '</div>'; }).join('') + '</div></div>' +
+        '<div class="menu-item has-sub rule-border-color-mode" data-value="' + borderColorMode + '">' +
+          '<span class="menu-label" data-i18n="settings.text.rule_border_color">' + escHtml(t('settings.text.rule_border_color')) + '</span><span class="menu-value">' + escHtml(t(borderColorKeys[borderColorMode])) + '</span>' + menuArrow +
+          '<div class="menu-sub">' + ['default','custom'].map(function(v) { return '<div class="menu-radio' + (v === borderColorMode ? ' selected' : '') + '" data-value="' + v + '" data-i18n="' + borderColorKeys[v] + '">' + escHtml(t(borderColorKeys[v])) + '</div>'; }).join('') + '</div></div>' +
+        '<div class="menu-item input-row"><span class="menu-label" data-i18n="settings.text.rule_border_color_custom">' + escHtml(t('settings.text.rule_border_color_custom')) + '</span><input type="color" class="rule-border-color" value="' + escAttr(hexToInput(r.border_color || '4285F4')) + '"></div>' +
       '</div>' +
     '</div></td>' +
     '<td><button class="row-delete" onclick="this.closest(\'tr\').remove();autoSave(0)">' + deleteIcon + '</button></td>';
@@ -2174,6 +2605,17 @@ function addRuleRow(r) {
     el.addEventListener('input', function() {
       validateRuleColumnWidth(tr);
       autoSave(500);
+    });
+  });
+  tr.querySelectorAll('.rule-border-color').forEach(function(input) {
+    input.addEventListener('input', function() {
+      var mode = tr.querySelector('.rule-border-color-mode');
+      mode.dataset.value = 'custom';
+      mode.querySelector('.menu-value').textContent = t('settings.text.rule_border_color_custom');
+      mode.querySelectorAll('.menu-radio').forEach(function(option) {
+        option.classList.toggle('selected', option.dataset.value === 'custom');
+      });
+      autoSave(0);
     });
   });
   tr.querySelectorAll('.combobox').forEach(function(cb) { initCombobox(cb); });
@@ -2211,6 +2653,8 @@ function updateRuleSummary(tr) {
   if (wsEl && wsEl.dataset.value) parts.push(t('settings.text.ws_index', {index:wsEl.dataset.value}));
   var slotEl = tr.querySelector('.rule-slot');
   if (slotEl && slotEl.value.trim()) parts.push(t('settings.text.col_index', {index:slotEl.value.trim()}));
+  var rowEl = tr.querySelector('.rule-row');
+  if (rowEl && rowEl.value.trim()) parts.push(t('settings.text.row_index', {index:rowEl.value.trim()}));
   var maxWidthEl = tr.querySelector('.rule-max-width');
   var maxHeightEl = tr.querySelector('.rule-max-height');
   if (maxWidthEl && maxWidthEl.value.trim()) parts.push(t('settings.text.max_width') + ' ' + maxWidthEl.value.trim());
@@ -2234,7 +2678,7 @@ function initRuleOptions(tr) {
         var t = o.closest('tr'); if (t) updateRuleSummary(t);
       }
     });
-    document.querySelectorAll('.combobox.open').forEach(function(c) { c.classList.remove('open'); });
+    document.querySelectorAll('.combobox.open').forEach(closeCombobox);
     if (cell.classList.contains('open')) {
       pop.querySelectorAll('.menu-item.subopen').forEach(function(m) { m.classList.remove('subopen'); });
     }
@@ -2244,11 +2688,11 @@ function initRuleOptions(tr) {
       var rect = btn.getBoundingClientRect();
       pop.style.right = Math.max(8, window.innerWidth - rect.right) + 'px';
       pop.style.left = 'auto';
-      if (window.innerHeight - rect.bottom - 8 >= 310) {
-        pop.style.top = (rect.bottom + 4) + 'px'; pop.style.bottom = 'auto';
-      } else {
-        pop.style.bottom = (window.innerHeight - rect.top + 4) + 'px'; pop.style.top = 'auto';
-      }
+      pop.style.display = 'block';
+      var popHeight = pop.offsetHeight;
+      pop.style.display = '';
+      var top = Math.min(rect.bottom + 4, window.innerHeight - popHeight - 8);
+      pop.style.top = Math.max(8, top) + 'px'; pop.style.bottom = 'auto';
     } else {
       updateRuleSummary(tr);
     }
@@ -2307,16 +2751,113 @@ function initRuleOptions(tr) {
   });
 }
 
+function parseWorkspaceInput(val) {
+  if (Array.isArray(val)) return val.slice();
+  var list = [];
+  String(val || '').split(',').forEach(function(part) {
+    part = part.trim();
+    if (!part) return;
+    if (part.indexOf('-') !== -1) {
+      var bounds = part.split('-');
+      var start = parseInt(bounds[0], 10);
+      var end = parseInt(bounds[1], 10);
+      if (!isNaN(start) && !isNaN(end) && start <= end) {
+        for (var i = Math.max(1, start); i <= Math.min(9, end); i++) {
+          if (i >= 1 && i <= 9 && list.indexOf(i) === -1) list.push(i);
+        }
+      }
+    } else {
+      var n = parseInt(part, 10);
+      if (!isNaN(n) && n >= 1 && n <= 9 && list.indexOf(n) === -1) list.push(n);
+    }
+  });
+  return list;
+}
+
+function addWorkspaceRow(item) {
+  var tbody = document.getElementById('workspace-rows-body');
+  if (!tbody) return;
+  var tr = document.createElement('tr');
+  item = item || {};
+  var wsVal = '';
+  if (Array.isArray(item.workspaces)) {
+    wsVal = item.workspaces.join(', ');
+  } else if (item.workspaces != null) {
+    wsVal = String(item.workspaces);
+  }
+  var splitVal = '';
+  if (Array.isArray(item.split)) {
+    splitVal = item.split.join(', ');
+  } else if (item.split != null) {
+    splitVal = String(item.split);
+  }
+  tr.innerHTML =
+    '<td><input type="text" class="ws-row-workspaces" value="' + escAttr(wsVal) + '" placeholder="1, 2"></td>' +
+    '<td><input type="text" class="ws-row-split" value="' + escAttr(splitVal) + '" placeholder="50%, 50%"></td>' +
+    '<td><button class="row-delete" type="button" onclick="removeWorkspaceRow(this)">' + deleteIcon + '</button></td>';
+  tbody.appendChild(tr);
+  wrapAllInputs(tr);
+  var splitInput = tr.querySelector('.ws-row-split');
+  splitInput._lastValidSplit = Array.isArray(item.split) ? item.split.slice() : ['50%', '50%'];
+  splitInput._lastSplitText = splitInput.value;
+  tr.querySelectorAll('input').forEach(function(input) {
+    input.addEventListener('input', function() {
+      delete input._rejectedSplitText;
+      input._splitRevision = (input._splitRevision || 0) + 1;
+      autoSave(500);
+    });
+  });
+}
+
+function removeWorkspaceRow(button) {
+  var tr = button.closest('tr');
+  if (tr) tr.remove();
+  autoSave(0);
+}
+
+function readRowSplit(input, fallback, splitReads) {
+  function result(split, kind) {
+    var value = split.slice();
+    if (splitReads) splitReads.push({input: input, text: input.value, revision: input._splitRevision || 0, split: value, kind: kind});
+    return value;
+  }
+  if (input._lastValidSplit && input.value === input._lastSplitText) return result(input._lastValidSplit, 'accepted');
+  if (input._lastValidSplit && input.value === input._rejectedSplitText) return result(input._lastValidSplit, 'fallback');
+  var parts = input.value.split(',').map(function(s) { return s.trim(); });
+  var number = /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$/i;
+  var valid = parts.every(function(part) {
+    var terms = part.replace(/%+$/, '').trim().split('/').map(function(s) { return s.trim(); });
+    if (terms.length > 2 || !terms.every(function(s) { return number.test(s) && Number(s) > 0; })) return false;
+    return Number.isFinite(terms.length === 2 ? Number(terms[0]) / Number(terms[1]) : Number(terms[0]));
+  });
+  return valid ? result(parts, 'candidate') : result(input._lastValidSplit || fallback, 'fallback');
+}
+
+function readWorkspaceRows(splitReads) {
+  var rows = [];
+  var list = document.querySelectorAll ? document.querySelectorAll('#workspace-rows-body tr') : [];
+  list.forEach(function(tr) {
+    var wsInput = tr.querySelector('.ws-row-workspaces');
+    var splitInput = tr.querySelector('.ws-row-split');
+    if (!wsInput || !splitInput) return;
+    var wsList = parseWorkspaceInput(wsInput.value);
+    if (wsList.length > 0) {
+      rows.push({ workspaces: wsList, split: readRowSplit(splitInput, ['50%', '50%'], splitReads) });
+    }
+  });
+  return rows;
+}
+
 function escAttr(s) { return escHtml(s || ''); }
 
-function readConfig() {
+function readConfig(splitReads) {
   var widthPresets = readPresets('width');
   var defaultWidthPreset = parseInt(cbVal('cb-layout-default_width_preset'), 10) || lastValidDefaultWidthPreset;
   if (!widthPresets.length) {
     widthPresets = lastValidWidthPresets.slice();
     defaultWidthPreset = lastValidDefaultWidthPreset;
   }
-  return {
+  var controlled = {
     layout: {
       gap: num('layout-gap'),
       outer_gap_left: num('layout-outer_gap_left'),
@@ -2327,8 +2868,15 @@ function readConfig() {
       height_presets: readPresets('height'),
       default_width_preset: defaultWidthPreset,
       centering_mode: cbVal('cb-layout-centering_mode'),
-      center_single_column: checked('layout-center_single_column'),
-      center_past_edges: checked('layout-center_past_edges')
+      mouse_resize: cbVal('cb-layout-mouse_resize'),
+      offscreen_mode: cbVal('cb-layout-offscreen_mode'),
+      center_columns: cbVal('cb-layout-center_columns'),
+      center_past_edges: checked('layout-center_past_edges'),
+      rows: {
+        workspaces: readWorkspaceRows(splitReads),
+        split: readRowSplit(document.getElementById('layout-rows-split'), ['100%'], splitReads),
+        gap: num('layout-rows-gap')
+      }
     },
     appearance: {
       language: cbVal('cb-appearance-language'),
@@ -2346,12 +2894,20 @@ function readConfig() {
     behavior: {
       focus_new_windows: checked('behavior-focus_new_windows'),
       new_window_monitor: cbVal('cb-behavior-new_window_monitor'),
+      fixed_size_windows: cbVal('cb-behavior-fixed_size_windows'),
       track_focus_changes: checked('behavior-track_focus_changes'),
       focus_follows_mouse: checked('behavior-focus_follows_mouse'),
+      keep_awake: checked('behavior-keep_awake'),
       focus_follows_mouse_delay_ms: num('behavior-focus_follows_mouse_delay_ms'),
+      focus_lock_modifier: cbVal('cb-behavior-focus_lock_modifier'),
+      move_step: num('behavior-move_step'),
       mouse_follows_focus: checked('behavior-mouse_follows_focus'),
-      workspace_edge_wrap: checked('behavior-workspace_edge_wrap'),
+      workspace_edge_wrap: cbVal('cb-behavior-workspace_edge_wrap'),
       skip_empty_workspaces: checked('behavior-skip_empty_workspaces'),
+      follow_window_to_workspace: checked('behavior-follow_window_to_workspace'),
+      focus_crosses_monitors: checked('behavior-focus_crosses_monitors'),
+      move_crosses_monitors: checked('behavior-move_crosses_monitors'),
+      move_window_across_rows: checked('behavior-move_window_across_rows'),
       fullscreen_follows_focus: checked('behavior-fullscreen_follows_focus'),
       disable_snap_layouts: checked('behavior-disable_snap_layouts'),
       swap_chain_ghost_animation: checked('behavior-swap_chain_ghost_animation'),
@@ -2359,7 +2915,8 @@ function readConfig() {
       taskbar_buttons: cbVal('cb-behavior-taskbar_buttons'),
       log_level: cbVal('cb-behavior-log_level'),
       tab_close_action: cbVal('cb-behavior-tab_close_action'),
-      new_window_placement: cbVal('cb-behavior-new_window_placement')
+      new_window_placement: cbVal('cb-behavior-new_window_placement'),
+      plain_drag_action: cbVal('cb-behavior-plain_drag_action')
     },
     hotkeys: Object.assign(readHotkeys(), {
       scroll_modifier: readScrollModifier(),
@@ -2393,8 +2950,21 @@ function readConfig() {
     },
     overview: {
       render: cbVal('cb-overview-render')
+    },
+    glazewm_compat: {
+      enabled: checked('glazewm_compat-enabled'),
+      port: configSnapshot.glazewm_compat ? configSnapshot.glazewm_compat.port : 6123
     }
   };
+  var result = JSON.parse(JSON.stringify(configSnapshot));
+  delete result.high_contrast;
+  delete result.auto_start;
+  Object.keys(controlled).forEach(function(key) {
+    if (key === 'hotkeys' || key === 'window_rules') result[key] = controlled[key];
+    else result[key] = Object.assign({}, result[key], controlled[key]);
+  });
+  result.layout.rows = Object.assign({}, (configSnapshot.layout || {}).rows, controlled.layout.rows);
+  return result;
 }
 
 function readWorkspaceNames() {
@@ -2412,8 +2982,7 @@ function readWorkspaceNames() {
 
 function readHotkeys() {
   var b = {};
-  document.querySelectorAll('#hotkeys-body tr').forEach(function(tr) {
-    if (tr.dataset.special) return;
+  document.querySelectorAll('#hotkeys-body tr[data-cmd]').forEach(function(tr) {
     var k = tr.querySelector('.hk-key').value.trim();
     var c = tr.dataset.cmd;
     if (k && c) b[k] = c;
@@ -2435,7 +3004,9 @@ function readDisabledHotkeys() {
 
 function readScrollModifier() {
   var tr = document.querySelector('#hotkeys-body tr[data-special="scroll_modifier"]');
-  return tr ? tr.querySelector('.hk-key').value.trim() || 'Ctrl+Alt' : 'Ctrl+Alt';
+  if (!tr) return 'Ctrl+Alt';
+  var value = tr.querySelector('.hk-key').value.trim();
+  return !value || value.toLowerCase() === 'none' ? 'none' : value;
 }
 
 function readRules() {
@@ -2446,8 +3017,8 @@ function readRules() {
        are then re-read from the inputs. */
     var r = Object.assign({}, tr._rule || {});
     delete r.match_class; delete r.match_title; delete r.match_executable;
-    delete r.corner_style; delete r.open_on_workspace; delete r.open_maximized;
-    delete r.column_width; delete r.open_in_column; delete r.sticky;
+    delete r.corner_style; delete r.border; delete r.border_color; delete r.open_on_workspace; delete r.open_maximized;
+    delete r.column_width; delete r.open_in_column; delete r.row; delete r.sticky;
     delete r.match_max_width; delete r.match_max_height;
     var cls = tr.querySelector('.rule-class').value.trim();
     var title = tr.querySelector('.rule-title').value.trim();
@@ -2460,6 +3031,11 @@ function readRules() {
     if (title) r.match_title = title;
     if (exe) r.match_executable = exe;
     if (corner !== 'auto') r.corner_style = corner;
+    var borderEl = tr.querySelector('.rule-border');
+    if (borderEl && borderEl.dataset.value === 'hide') r.border = false;
+    var borderColorMode = tr.querySelector('.rule-border-color-mode');
+    var borderColor = tr.querySelector('.rule-border-color');
+    if (borderColorMode && borderColorMode.dataset.value === 'custom' && borderColor) r.border_color = inputToHex(borderColor.value);
     var wsEl = tr.querySelector('.rule-workspace');
     var wsv = wsEl ? parseInt(wsEl.dataset.value, 10) : NaN;
     if (wsv >= 1 && wsv <= 9) r.open_on_workspace = wsv;
@@ -2467,6 +3043,9 @@ function readRules() {
     var slotEl = tr.querySelector('.rule-slot');
     var slotv = slotEl ? parseInt(slotEl.value, 10) : NaN;
     if (slotv >= 1) r.open_in_column = slotv;
+    var rowEl = tr.querySelector('.rule-row');
+    var rowv = rowEl ? parseInt(rowEl.value, 10) : NaN;
+    if (rowv >= 1 && rowv <= 4) r.row = rowv;
     var maxWidthEl = tr.querySelector('.rule-max-width');
     var maxWidth = maxWidthEl ? Number(maxWidthEl.value.trim()) : NaN;
     if (Number.isInteger(maxWidth) && maxWidth >= 1) r.match_max_width = maxWidth;
@@ -2492,16 +3071,153 @@ function wrapInput(input) {
   wrap.appendChild(input);
 }
 function wrapAllInputs(root) {
-  (root || document).querySelectorAll('input[type="text"], input[type="number"]').forEach(wrapInput);
+  (root || document).querySelectorAll('input[type="text"], input[type="number"], textarea').forEach(wrapInput);
 }
 wrapAllInputs();
 
+function showInfoBar(bar, severity, text) {
+  var icon = bar.querySelector('.info-bar-icon');
+  var source = document.querySelector(severity === 'warning' || severity === 'error' ? '#hotkey-warn-bar .info-bar-icon' : '#hc-info-bar .info-bar-icon');
+  icon.setAttribute('viewBox', severity === 'success' ? '0 0 16 16' : source.getAttribute('viewBox'));
+  icon.querySelector('path').setAttribute('d', severity === 'success'
+    ? 'M8 1a7 7 0 100 14A7 7 0 008 1zm-1 9.5L3.75 7.25l1.06-1.06L7 8.38l4.19-4.19 1.06 1.06z'
+    : source.querySelector('path').getAttribute('d'));
+  bar.classList.remove('success', 'warning', 'error');
+  if (severity) bar.classList.add(severity);
+  bar.querySelector('.info-bar-message').textContent = text;
+  bar.hidden = false;
+}
+
+/* ── Report an Issue ── */
+(function() {
+  var names = ['title', 'category', 'actual', 'expected', 'repro', 'affected_apps', 'regression'];
+  var fields = {};
+  names.forEach(function(name) { fields[name] = document.getElementById('report-' + name); });
+  var submit = document.getElementById('report-submit');
+  function isCombo(name) { return name === 'category' || name === 'regression'; }
+  function setField(name, value) {
+    if (isCombo(name)) setCb('report-' + name, value);
+    else fields[name].value = value;
+  }
+  function draft() {
+    var result = {};
+    names.forEach(function(name) { result[name] = isCombo(name) ? cbVal('report-' + name) : fields[name].value; });
+    return result;
+  }
+  function persist() {
+    window.ipc.postMessage(JSON.stringify({action: 'report_draft', draft: draft()}));
+  }
+  function update() {
+    submit.disabled = !fields.title.value.trim() || !fields.actual.value.trim();
+  }
+  var saved = window._reportDraft || {};
+  names.forEach(function(name) {
+    if (typeof saved[name] === 'string') setField(name, saved[name]);
+    function onChange() {
+      update();
+      persist();
+    }
+    fields[name].addEventListener('input', onChange);
+    fields[name].addEventListener('change', onChange);
+  });
+  document.getElementById('report-version').textContent = window._version || '';
+  document.getElementById('report-clear').addEventListener('click', function() {
+    names.forEach(function(name) { setField(name, name === 'regression' ? 'Not sure' : ''); });
+    document.getElementById('report-status-bar').hidden = true;
+    update();
+    persist();
+  });
+  submit.addEventListener('click', function() {
+    update();
+    if (submit.disabled) return;
+    persist();
+    window.ipc.postMessage(JSON.stringify({action: 'report_issue', report: draft()}));
+  });
+  window.reportStatus = function(status) {
+    var message = status.file ? (status.error ? t('settings.report.reveal_error', status) : t('settings.report.snapshot_ok', status)) : t('settings.report.snapshot_error', status);
+    if (status.truncated) message += ' ' + t(status.copied ? 'settings.report.copied' : 'settings.report.copy_failed');
+    var severity = !status.file ? 'error' : (status.error || (status.truncated && !status.copied)) ? 'warning' : 'success';
+    var bar = document.getElementById('report-status-bar');
+    showInfoBar(bar, severity, message);
+    // The result sits below Submit, which can be at the bottom edge of the pane.
+    bar.scrollIntoView({block: 'nearest'});
+  };
+  update();
+})();
+
 /* ── Auto-save ────────────────────────────────────────────────────── */
 var _saveTimer = null;
+var _pendingSave = null;
+var _nextSaveId = 0;
+var _saveQueued = false;
+var _saveRetryTimer = null;
+var _closingSettings = false;
+var _closeSent = false;
+function finishSettingsClose() {
+  if (_closeSent) return;
+  _closeSent = true;
+  window.ipc.postMessage(JSON.stringify({ action: 'finish_close' }));
+}
+function flushSaveTimer() {
+  if (_saveTimer === null) return;
+  clearTimeout(_saveTimer);
+  _saveTimer = null;
+  _saveQueued = true;
+}
+window.lwmRequestClose = function() {
+  if (_closingSettings) return;
+  _closingSettings = true;
+  flushSaveTimer();
+  if (_saveQueued) {
+    if (!_pendingSave) sendSave();
+  } else {
+    finishSettingsClose();
+  }
+};
+function requestSaveResult(id) {
+  _saveRetryTimer = setTimeout(function() {
+    if (!_pendingSave || _pendingSave.id !== id) return;
+    window.ipc.postMessage(JSON.stringify({ action: 'save_result', id: id }));
+    requestSaveResult(id);
+  }, 2000);
+}
+function sendSave() {
+  if (_pendingSave) { _saveQueued = true; return; }
+  _saveQueued = false;
+  var splitReads = [];
+  var config = readConfig(splitReads);
+  var id = ++_nextSaveId;
+  _pendingSave = { id: id, inputs: splitReads, generation: configGeneration };
+  window.ipc.postMessage(JSON.stringify({ action: 'save', id: id, config: config }));
+  requestSaveResult(id);
+}
+window.lwmSaveResult = function(id, success) {
+  if (!_pendingSave || _pendingSave.id !== id || typeof success !== 'boolean') return;
+  clearTimeout(_saveRetryTimer);
+  var inputs = _pendingSave.generation === configGeneration ? _pendingSave.inputs : [];
+  _pendingSave = null;
+  inputs.forEach(function(item) {
+    if (success) {
+      // A serialized fallback is already the accepted split; keep its text association.
+      item.input._lastValidSplit = item.split;
+      if (item.kind !== 'fallback') {
+        item.input._lastSplitText = item.text;
+        if (item.input._rejectedSplitText === item.text) delete item.input._rejectedSplitText;
+      }
+    } else if (item.kind === 'candidate' && item.input.value === item.text && (item.input._splitRevision || 0) === item.revision) {
+      item.input._rejectedSplitText = item.text;
+    }
+  });
+  if (_closingSettings) flushSaveTimer();
+  if (_saveQueued) sendSave();
+  else if (_closingSettings) finishSettingsClose();
+};
 function autoSave(delay) {
   clearTimeout(_saveTimer);
+  _saveQueued = false;
   _saveTimer = setTimeout(function() {
-    window.ipc.postMessage(JSON.stringify({ action: 'save', config: readConfig() }));
+    _saveTimer = null;
+    sendSave();
   }, delay || 0);
 }
 
@@ -2522,12 +3238,127 @@ document.querySelectorAll('input[type="checkbox"], input[type="color"], input[ty
 
 /* Debounced: text and number inputs */
 document.querySelectorAll('input[type="text"], input[type="number"]').forEach(function(el) {
-  el.addEventListener('input', function() { autoSave(500); });
+  if (el.hasAttribute('data-no-config')) return;
+  el.addEventListener('input', function() {
+    delete el._rejectedSplitText;
+    el._splitRevision = (el._splitRevision || 0) + 1;
+    autoSave(500);
+  });
 });
+/* Troubleshooting */
+(function() {
+  if (!document.getElementById('troubleshooting-health')) return;
+  var health = null;
+  var files = null;
+  var pending = {};
+  var nextId = Date.now() * 1000;
+  var prefix = 'settings.troubleshooting.';
+  function send(action, extra) { window.ipc.postMessage(JSON.stringify(Object.assign({action: action}, extra || {}))); }
+  function field(label, description, button, hint) {
+    var descriptions = Array.isArray(description) ? description : [description];
+    return '<div class="field"><div class="field-info"><div class="field-label">' + escHtml(label) + '</div>' +
+      descriptions.filter(Boolean).map(function(text) { return '<div class="field-desc">' + escHtml(text) + '</div>'; }).join('') +
+      (hint ? '<div class="field-desc troubleshooting-hint">' + escHtml(hint) + '</div>' : '') + '</div>' + (button || '') + '</div>';
+  }
+  function renderHealth() {
+    if (!health) { document.getElementById('troubleshooting-health').innerHTML = field(t(prefix + 'loading'), '', ''); return; }
+    var output = (health.rows || []).map(function(row) {
+      var label = '', details = [], hint = '', button = '';
+      switch (row.kind) {
+        case 'config':
+          label = t(prefix + 'config');
+          details = [t(prefix + 'path', {path: row.path}), row.reason, row.line != null ? t(prefix + 'location', {line: row.line, column: row.column}) : '',
+            row.recovered.length ? t(prefix + 'recovered', {fields: row.recovered.join(', ')}) : ''];
+          hint = t(prefix + 'config_hint');
+          button = '<button class="btn btn-sm" data-troubleshooting-action="reveal_config">' + escHtml(t(prefix + 'reveal_config')) + '</button>'; break;
+        case 'warning': label = t(prefix + 'warning', {field: row.field}); details = [row.message]; hint = t(prefix + 'config_hint'); break;
+        case 'unknown_keys': label = t(prefix + 'unknown_keys', {keys: row.keys.join(', ')}); hint = t(prefix + 'config_hint'); break;
+        case 'reserved_hotkeys': label = t(prefix + 'reserved', {binds: row.binds.join(', ')}); hint = t(prefix + 'reserved_hint'); break;
+        case 'keyboard_hook': label = t(prefix + 'hook'); hint = t(prefix + 'hook_hint'); break;
+        case 'elevated_window': label = t(prefix + 'elevated', {executable: row.executable || t(prefix + 'unknown_executable')}); hint = t(prefix + 'elevated_hint'); break;
+        case 'integrity': label = t(prefix + 'integrity'); hint = t(prefix + 'integrity_hint'); break;
+        case 'watchdog_restart': label = t(prefix + 'watchdog'); hint = t(prefix + 'watchdog_hint'); break;
+        case 'log_failure': label = t(prefix + 'log_failure'); details = [t(prefix + 'path', {path: row.path}), row.error]; hint = t(prefix + 'log_hint'); break;
+        case 'update': label = t(prefix + 'update', {tag: row.tag}); hint = t(prefix + 'update_hint');
+          button = '<button class="btn btn-sm" data-troubleshooting-action="releases">' + escHtml(t(prefix + 'releases')) + '</button>'; break;
+      }
+      return label ? field(label, details, button, hint) : '';
+    }).join('');
+    document.getElementById('troubleshooting-health').innerHTML = output || field(t(prefix + 'no_problems'), '', '');
+  }
+  function formatSize(size) {
+    var units = ['bytes', 'kb', 'mb', 'gb', 'tb'], unit = 0;
+    while (size >= 1024 && unit < units.length - 1) { size /= 1024; unit++; }
+    return t(prefix + 'size_' + units[unit], {value: size.toLocaleString(document.documentElement.lang, {maximumFractionDigits: 1})});
+  }
+  function renderFiles() {
+    if (!files) { document.getElementById('troubleshooting-files').innerHTML = field(t(prefix + 'loading'), '', ''); return; }
+    var output = files.ok ? files.files.map(function(file) {
+      var date = file.modified == null ? t(prefix + 'unknown_time') : new Date(file.modified * 1000).toLocaleString(document.documentElement.lang);
+      return field(file.name, t(prefix + 'file_details', {size: formatSize(file.size), modified: date}), '');
+    }).join('') : field(t(prefix + 'list_failed'), files.error, '');
+    document.getElementById('troubleshooting-files').innerHTML = output || field(t(prefix + 'no_files'), '', '');
+  }
+  window.lwmReceiveHealth = function(value) { health = value; renderHealth(); };
+  window.lwmReceiveDiagnostics = function(value) { files = value; renderFiles(); };
+  window.lwmReceiveSnapshot = function(result) {
+    var resolve = pending[result.id];
+    if (resolve) { delete pending[result.id]; resolve(result.ok ? {ok: true, path: result.path} : {ok: false, error: result.error}); }
+    send('list_diagnostics');
+  };
+  window.lwmCreateSnapshot = function() {
+    return new Promise(function(resolve) {
+      var id = ++nextId;
+      pending[id] = resolve;
+      try { send('create_snapshot', {id: id}); }
+      catch (error) { delete pending[id]; resolve({ok: false, error: String(error)}); }
+    });
+  };
+  document.getElementById('troubleshooting-health').addEventListener('click', function(event) {
+    var action = event.target.dataset.troubleshootingAction;
+    if (action === 'reveal_config') send('reveal_config');
+    if (action === 'releases') send('open_url', {url: 'https://github.com/jcardama/LeopardWM/releases'});
+  });
+  document.getElementById('troubleshooting-refresh').addEventListener('click', function() { send('list_diagnostics'); });
+  document.getElementById('troubleshooting-reveal').addEventListener('click', function() { send('reveal_diagnostics'); });
+  document.getElementById('troubleshooting-create').addEventListener('click', function() {
+    var button = this, bar = document.getElementById('troubleshooting-status-bar');
+    button.disabled = true;
+    showInfoBar(bar, '', t(prefix + 'creating'));
+    window.lwmCreateSnapshot().then(function(result) {
+      button.disabled = false;
+      showInfoBar(bar, result.ok ? 'success' : 'error', result.ok ? t(prefix + 'created', {path: result.path}) : t(prefix + 'create_failed', {error: result.error}));
+    });
+  });
+  var report = document.querySelector('.nav-item[data-section="report"]');
+  var reportButton = document.getElementById('troubleshooting-report');
+  if (report) { reportButton.hidden = false; reportButton.addEventListener('click', function() { report.click(); }); }
+  new MutationObserver(function() { renderHealth(); renderFiles(); }).observe(document.documentElement, {attributes: true, attributeFilter: ['lang']});
+  renderHealth(); renderFiles(); send('request_health'); send('list_diagnostics');
+})();
+/* End Troubleshooting */
 </script>
 </body>
 </html>
 "##;
+
+pub(super) fn tray_config_script(
+    config: &crate::config::Config,
+) -> Result<String, serde_json::Error> {
+    Ok(format!(
+        "applyTrayConfig({});",
+        serde_json::to_string(config)?
+    ))
+}
+
+pub(super) fn reload_config_script(
+    config: &crate::config::Config,
+) -> Result<String, serde_json::Error> {
+    Ok(format!(
+        "applyReloadConfig({});",
+        serde_json::to_string(config)?
+    ))
+}
 
 #[cfg(test)]
 mod tests {
@@ -2535,20 +3366,219 @@ mod tests {
 
     #[test]
     #[ignore = "Needs Node.js on PATH for the optional Settings JavaScript check"]
-    fn translations_render_literally_in_settings_and_switch_live() {
+    fn report_draft_restores_and_required_fields_gate_submit() {
         use std::io::Write;
         use std::process::{Command, Stdio};
+        let script = r#"
+const assert = require('assert');
+const html = require('fs').readFileSync(0, 'utf8');
+const start = html.indexOf('/* ── Report an Issue ── */');
+const end = html.indexOf('/* ── Auto-save', start);
+assert(start >= 0 && end > start);
+assert.match(html, /<div id="report-status" role="status"><div class="info-bar" id="report-status-bar" hidden>/);
+const els = {};
+function node() { const classes = new Set(); return {value:'', textContent:'', disabled:false, hidden:false, dataset:{},
+  classList:{add(...names){names.forEach(name => classes.add(name));}, remove(...names){names.forEach(name => classes.delete(name));}, contains(name){return classes.has(name);}},
+  listeners:{}, addEventListener(event, callback) { this.listeners[event] = callback; },
+  setAttribute(name, value) { this[name] = value; }, getAttribute(name) { return this[name] || null; },
+  removeAttribute(name) { delete this[name]; }, closest() { return null; },
+  scrolled:0, scrollIntoView() { this.scrolled++; },
+  dispatchEvent(event) { this.listeners[event.type]?.call(this, event); }}; }
+function el(id) { return els[id] ||= node(); }
+function combo(id, values) {
+  const cb = el(id), trigger = node(), text = node(), popup = node();
+  trigger.id = id + '-trigger';
+  const options = values.map(value => Object.assign(node(), {dataset:{value}, textContent:value}));
+  cb.dataset.value = values[0]; cb.dataset.noConfig = '';
+  cb.querySelector = selector => ({'.combobox-trigger':trigger, '.combobox-text':text, '.combobox-popup':popup})[selector];
+  cb.querySelectorAll = () => options;
+  popup.contains = opt => options.includes(opt);
+  options.forEach(opt => opt.closest = () => opt);
+  return {cb, options, popup};
+}
+const category = combo('report-category', ['', 'Focus', 'Settings']);
+const regression = combo('report-regression', ['Not sure', 'Yes', 'No']);
+const iconPath = {setAttribute(name, value) { this[name] = value; }};
+const icon = {setAttribute(name, value) { this[name] = value; }, querySelector() { return iconPath; }};
+const bar = el('report-status-bar'); bar.hidden = true;
+bar.querySelector = selector => selector === '.info-bar-icon' ? icon : el('report-status-text');
+const sources = {};
+for (const id of ['hc-info-bar', 'hotkey-warn-bar']) {
+  const source = html.slice(html.indexOf('id="' + id + '"'));
+  const viewBox = source.match(/viewBox="([^"]+)"/)[1], path = source.match(/<path d="([^"]+)"/)[1];
+  sources[id] = {getAttribute: () => viewBox, querySelector: () => ({getAttribute: () => path})};
+}
+global.document = {getElementById: el, querySelector: selector => sources[selector.split(' ')[0].slice(1)]};
+eval(html.slice(html.indexOf('function showInfoBar('), start));
+let saves = 0; global.autoSave = () => saves++;
+const comboStart = html.indexOf('function closeCombobox(');
+eval(html.slice(comboStart, html.indexOf("document.querySelectorAll('.combobox').forEach", comboStart)));
+eval(html.slice(html.indexOf('function cbVal('), html.indexOf('function hexToInput(')));
+initCombobox(category.cb); initCombobox(regression.cb);
+const messages = [];
+global.window = {_reportDraft:{title:'Saved title', actual:'Saved details', category:'Focus', regression:'Yes'},
+  _version:'1', _windowsVersion:'Windows', ipc:{postMessage(message){messages.push(JSON.parse(message));}}, addEventListener(){}};
+global.t = key => key;
+eval(html.slice(start, end));
+assert.equal(el('report-title').value, 'Saved title');
+assert.equal(el('report-actual').value, 'Saved details');
+assert.equal(cbVal('report-category'), 'Focus');
+assert.equal(cbVal('report-regression'), 'Yes');
+assert.equal(el('report-submit').disabled, false);
+el('report-title').value = '   '; el('report-title').listeners.input();
+assert.equal(el('report-submit').disabled, true);
+el('report-title').value = 'Title'; el('report-title').listeners.input();
+el('report-actual').value = ''; el('report-actual').listeners.input();
+assert.equal(el('report-submit').disabled, true);
+el('report-actual').value = 'Details'; el('report-actual').listeners.input();
+assert.equal(el('report-submit').disabled, false);
+assert.equal(messages.at(-1).action, 'report_draft');
+assert.equal(messages.at(-1).draft.actual, 'Details');
+category.popup.listeners.click({target:category.options[2], stopPropagation(){}});
+assert.equal(messages.at(-1).draft.category, 'Settings');
+regression.popup.listeners.click({target:regression.options[2], stopPropagation(){}});
+assert.equal(messages.at(-1).draft.regression, 'No');
+assert.equal(saves, 0);
+window.reportStatus({file:'snapshot'}); assert(bar.classList.contains('success'));
+assert(bar.scrolled > 0, 'the report result must scroll into view');
+const successGlyph = iconPath.d;
+window.reportStatus({file:'snapshot', error:'reveal'}); assert(bar.classList.contains('warning'));
+window.reportStatus({error:'snapshot'}); assert(bar.classList.contains('error'));
+assert.notEqual(iconPath.d, successGlyph);
+assert.equal(el('report-status').hidden, false);
+el('report-clear').listeners.click();
+assert.equal(bar.hidden, true);
+assert.equal(el('report-status').hidden, false);
+assert.equal(messages.at(-1).draft.category, '');
+assert.equal(messages.at(-1).draft.regression, 'Not sure');
+"#;
+        let mut child = Command::new("node")
+            .args(["-e", script])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(SETTINGS_HTML.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
+    #[test]
+    #[ignore = "Needs Node.js on PATH for the optional Settings JavaScript check"]
+    fn combobox_keyboard_navigation_uses_selection_click_path() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let script = r#"
+const assert = require('assert');
+const html = require('fs').readFileSync(0, 'utf8');
+function node() {
+  const classes = new Set(), listeners = {};
+  return {dataset:{}, attrs:{}, style:{}, textContent:'', disabled:false,
+    classList:{add(c){classes.add(c)}, remove(c){classes.delete(c)}, contains(c){return classes.has(c)}, toggle(c){classes.has(c) ? classes.delete(c) : classes.add(c)}},
+    setAttribute(k,v){this.attrs[k]=v}, getAttribute(k){return this.attrs[k] || null}, removeAttribute(k){delete this.attrs[k]}, closest(){return null}, addEventListener(k,fn){(listeners[k] ||= []).push(fn)},
+    emit(type, event={}){event.type=type; event.target ||= this; event.preventDefault ||= () => {}; event.stopPropagation ||= () => {}; for(const fn of listeners[type] || []) fn.call(this,event)},
+    focus(){document.activeElement=this}, click(){this.emit('click')},
+    getBoundingClientRect(){return {width:100,left:10,right:110,top:10,bottom:42}}};
+}
+const cb=node(), trigger=node(), popup=node(), text=node();
+const options=['one','two','three'].map(value => Object.assign(node(), {dataset:{value},textContent:value}));
+options[0].classList.add('selected'); cb.dataset.value='one'; cb.dataset.noConfig='';
+cb.querySelector = s => ({'.combobox-trigger':trigger,'.combobox-popup':popup,'.combobox-text':text})[s];
+cb.querySelectorAll = () => options;
+popup.contains = opt => options.includes(opt);
+let extra=0, changes=0, saves=0;
+options.forEach(opt => { opt.closest=()=>opt; opt.addEventListener('click',()=>extra++); opt.click=()=>{opt.emit('click'); popup.emit('click',{target:opt})}; });
+cb.dispatchEvent=()=>changes++;
+global.document={activeElement:null,querySelectorAll:()=>[],getElementById:id=>id==='combo'?cb:null};
+global.window={innerWidth:1000,innerHeight:800}; global.autoSave=()=>saves++;
+let start=html.indexOf('function closeCombobox('); if(start<0) start=html.indexOf('function initCombobox(');
+const end=html.indexOf("document.querySelectorAll('.combobox').forEach",start);
+assert(start>=0 && end>start); eval(html.slice(start,end)); initCombobox(cb);
+eval(html.slice(html.indexOf('function setCb('), html.indexOf('function hexToInput(')));
+setCb('combo','two'); assert.equal(options[0].attrs['aria-selected'],'false'); assert.equal(options[1].attrs['aria-selected'],'true');
+setCb('combo','one');
+assert.equal(popup.attrs.role,'listbox'); assert.equal(trigger.attrs['aria-haspopup'],'listbox');
+trigger.emit('keydown',{key:'ArrowDown'}); assert.equal(trigger.attrs['aria-expanded'],'true'); assert.equal(document.activeElement,options[0]);
+popup.emit('keydown',{key:'ArrowDown'}); assert.equal(document.activeElement,options[1]);
+popup.emit('keydown',{key:'Enter'}); assert.equal(cb.dataset.value,'two'); assert.equal(extra,1); assert.equal(changes,1); assert.equal(saves,0);
+assert.equal(options[0].attrs['aria-selected'],'false'); assert.equal(options[1].attrs['aria-selected'],'true'); assert.equal(trigger.attrs['aria-expanded'],'false'); assert.equal(document.activeElement,trigger);
+trigger.emit('keydown',{key:'ArrowUp'}); assert.equal(document.activeElement,options[1]);
+popup.emit('keydown',{key:'End'}); popup.emit('keydown',{key:' '}); assert.equal(cb.dataset.value,'three'); assert.equal(extra,2); assert.equal(changes,2);
+trigger.emit('keydown',{key:' '}); popup.emit('keydown',{key:'Escape'}); assert.equal(trigger.attrs['aria-expanded'],'false'); assert.equal(document.activeElement,trigger);
+trigger.focus(); trigger.click(); let prevented=false;
+trigger.emit('keydown',{key:'Escape',preventDefault(){prevented=true}}); assert(prevented); assert.equal(trigger.attrs['aria-expanded'],'false'); assert.equal(document.activeElement,trigger);
+prevented=false; trigger.emit('keydown',{key:'Escape',preventDefault(){prevented=true}}); assert.equal(prevented,false);
+trigger.click(); trigger.emit('keydown',{key:'Tab',preventDefault(){prevented=true}}); assert.equal(prevented,false); assert.equal(trigger.attrs['aria-expanded'],'false');
+for (const key of ['Enter',' ']) {
+  trigger.emit('keydown',{key,repeat:true}); assert.equal(trigger.attrs['aria-expanded'],'false');
+  trigger.emit('keydown',{key}); assert.equal(trigger.attrs['aria-expanded'],'true');
+  const before=changes; popup.emit('keydown',{key,repeat:true}); assert.equal(changes,before); assert.equal(trigger.attrs['aria-expanded'],'true');
+  popup.emit('keydown',{key:'Escape'});
+}
+function checkName(triggerLabel, comboLabel, fieldLabel, attr, expected) {
+  const c=node(), t=node(), p=node();
+  if (triggerLabel) t.setAttribute('aria-labelledby',triggerLabel);
+  if (comboLabel) c.setAttribute('aria-label',comboLabel);
+  c.closest=()=>fieldLabel ? {querySelector:()=>({textContent:fieldLabel})} : null;
+  c.querySelector=s=>s==='.combobox-trigger'?t:p; c.querySelectorAll=()=>[];
+  initCombobox(c);
+  if (!expected) assert(t.id);
+  assert.equal(p.attrs[attr], expected || t.id);
+}
+checkName('report-label report-value','combo label','field label','aria-labelledby','report-label report-value');
+checkName(null,'combo label','field label','aria-label','combo label');
+checkName(null,null,'field label','aria-label','field label');
+checkName(null,null,null,'aria-labelledby');
+trigger.disabled=true; trigger.emit('keydown',{key:'ArrowDown'}); assert.equal(trigger.attrs['aria-expanded'],'false');
+"#;
+        let mut child = Command::new("node")
+            .args(["-e", script])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(SETTINGS_HTML.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    #[ignore = "Needs Node.js on PATH for the optional Settings JavaScript check"]
+    fn troubleshooting_renders_safely_and_routes_snapshot_results() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
         let payload = serde_json::json!({
             "page": SETTINGS_HTML,
-            "hotkeyCatalog": leopardwm_ipc::hotkeys::hotkey_catalog(),
-            "languages": serde_json::from_str::<serde_json::Value>(&crate::locale::languages_json()).unwrap(),
             "english": serde_json::from_str::<serde_json::Value>(&crate::locale::page_json("en")).unwrap(),
             "chinese": serde_json::from_str::<serde_json::Value>(&crate::locale::page_json("zh-CN")).unwrap(),
         });
         let mut child = Command::new("node")
-            .arg("-e")
-            .arg(include_str!("locale.test.js"))
+            .arg(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/settings/troubleshooting.test.js"
+            ))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -2570,14 +3600,524 @@ mod tests {
     }
 
     #[test]
-    fn center_single_column_is_wired_into_settings_config() {
-        assert!(SETTINGS_HTML.contains("id=\"layout-center_single_column\""));
-        assert!(SETTINGS_HTML.contains(
-            "setChecked('layout-center_single_column', cfg.layout.center_single_column);"
-        ));
+    #[ignore = "Needs Node.js on PATH for the optional Settings JavaScript check"]
+    fn translations_render_literally_in_settings_and_switch_live() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        let payload = serde_json::json!({
+            "page": SETTINGS_HTML,
+            "hotkeyCatalog": leopardwm_ipc::hotkeys::hotkey_catalog(),
+            "hotkeyCategories": leopardwm_ipc::hotkeys::hotkey_categories(),
+            "languages": serde_json::from_str::<serde_json::Value>(&crate::locale::languages_json()).unwrap(),
+            "english": serde_json::from_str::<serde_json::Value>(&crate::locale::page_json("en")).unwrap(),
+            "chinese": serde_json::from_str::<serde_json::Value>(&crate::locale::page_json("zh-CN")).unwrap(),
+        });
+        let mut child = Command::new("node")
+            .arg(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/settings/locale.test.js"
+            ))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("Node.js is required for the Settings JavaScript test");
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(payload.to_string().as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
         assert!(
-            SETTINGS_HTML.contains("center_single_column: checked('layout-center_single_column')")
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    #[test]
+    #[ignore = "Needs Node.js on PATH for the optional Settings JavaScript check"]
+    fn tray_changes_survive_the_next_settings_save() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        let script = r#"
+const assert = require('assert');
+const payload = JSON.parse(require('fs').readFileSync(0, 'utf8'));
+const html = payload.html;
+function section(start, end) {
+  const a = html.indexOf(start), b = html.indexOf(end, a);
+  assert(a >= 0 && b > a, 'missing Settings function: ' + start);
+  return html.slice(a, b);
+}
+const elements = {};
+const workspaceSplit = { value: '50%, 50%' };
+const workspaceInput = { value: '1' };
+const workspaceRow = { querySelector(selector) { return selector === '.ws-row-split' ? workspaceSplit : workspaceInput; } };
+global.document = { getElementById(id) {
+  return elements[id] ||= { value: '', checked: false, dataset: {},
+    querySelectorAll() { return []; }, querySelector() { return { textContent: '' }; } };
+}, querySelectorAll(selector) { return selector === '#workspace-rows-body tr' ? [workspaceRow] : []; } };
+global.window = { _initConfig: { behavior: { check_for_updates: true } } };
+global.autoSave = () => { throw Error('tray push must not save'); };
+eval(section('function val(id)', 'var selectedWidthPresetRow'));
+eval(section('function checked(id)', 'function hexToInput(hex)'));
+eval(section('function hexToInput(hex)', 'function applyTrayConfig('));
+eval(section('function applyTrayConfig(', '/* ── Init'));
+eval(section('function parseWorkspaceInput(', 'function escAttr('));
+eval(section('function readConfig(', 'function readWorkspaceNames()'));
+global.readPresets = () => [0.5];
+global.lastValidDefaultWidthPreset = 1;
+global.lastValidWidthPresets = [0.5];
+global.readRules = global.readWorkspaceNames = global.readDisabledHotkeys = () => [];
+global.readHotkeys = () => ({});
+global.readScrollModifier = () => 'none';
+global.gestureCaptureSecs = 0;
+document.getElementById('layout-gap').value = '37';
+document.getElementById('layout-rows-split').value = '25%, 75%';
+document.getElementById('layout-rows-split')._lastValidSplit = ['25%', '75%'];
+document.getElementById('layout-rows-split')._lastSplitText = '25%, 75%';
+document.getElementById('cb-layout-centering_mode').dataset.value = 'center';
+document.getElementById('cb-layout-center_columns').dataset.value = 'off';
+document.getElementById('behavior-focus_new_windows').checked = true;
+document.getElementById('cb-behavior-focus_lock_modifier').dataset.value = 'Alt';
+document.getElementById('cb-behavior-taskbar_buttons').dataset.value = 'hide_offscreen';
+document.getElementById('cb-behavior-new_window_placement').dataset.value = 'new_column';
+const cfg = { layout: { centering_mode: 'on_overflow', center_columns: 'fit' },
+  appearance: { active_border: true }, behavior: { focus_new_windows: false,
+  focus_follows_mouse: true, keep_awake: true, focus_lock_modifier: 'F13', taskbar_buttons: 'show_all', new_window_placement: 'in_column' } };
+eval(payload.script);
+payload.config.behavior.uncontrolled = { value: 42 };
+payload.config.high_contrast = true;
+payload.config.auto_start = true;
+payload.config.glazewm_compat.port = 7890;
+applyTrayConfig(payload.config);
+let saved = readConfig();
+assert.strictEqual(saved.glazewm_compat.port, 7890, 'save uses the pushed port');
+assert.strictEqual(saved.behavior.check_for_updates, false, 'tray-pushed update opt-out');
+assert.deepStrictEqual(saved.behavior.uncontrolled, { value: 42 });
+assert(!('high_contrast' in saved) && !('auto_start' in saved));
+assert.deepStrictEqual(Object.keys(saved.hotkeys).sort(), ['disabled', 'scroll_modifier']);
+workspaceSplit.value = '1/';
+document.getElementById('layout-rows-split').value = '1/';
+saved = readConfig();
+assert.deepStrictEqual(saved.layout.rows.workspaces[0].split, ['50%', '50%'], 'workspace incomplete split');
+assert.deepStrictEqual(saved.layout.rows.split, ['25%', '75%'], 'global incomplete split');
+workspaceSplit.value = '';
+document.getElementById('layout-rows-split').value = '';
+saved = readConfig();
+assert.deepStrictEqual(saved.layout.rows.workspaces[0].split, ['50%', '50%'], 'empty workspace edit');
+assert.deepStrictEqual(saved.layout.rows.split, ['25%', '75%'], 'empty global edit');
+assert.strictEqual(saved.layout.gap, 37);
+for (const [section, keys] of Object.entries({layout: ['centering_mode', 'center_columns'],
+  appearance: ['active_border'], behavior: ['focus_new_windows', 'focus_follows_mouse', 'keep_awake', 'focus_lock_modifier', 'taskbar_buttons', 'new_window_placement']})) {
+  for (const key of keys) assert.strictEqual(saved[section][key], cfg[section][key], section + '.' + key);
+}
+
+function input(id, className) {
+  const listeners = [];
+  return { id, value: '', checked: false, dataset: {},
+    classList: { contains(name) { return name === className; } },
+    querySelectorAll() { return []; }, querySelector() { return { textContent: '' }; },
+    hasAttribute() { return false; }, hasChildNodes() { return true; },
+    addEventListener(type, fn) { if (type === 'input') listeners.push(fn); },
+    edit(value) { this.value = value; listeners.forEach(fn => fn()); } };
+}
+const controls = {};
+const rows = [];
+const tbody = { appendChild(row) { rows.push(row); }, set innerHTML(_) { rows.length = 0; } };
+global.document = {
+  getElementById(id) { return id === 'workspace-rows-body' ? tbody : (controls[id] ||= input(id)); },
+  querySelectorAll(selector) {
+    if (selector === '#workspace-rows-body tr') return rows;
+    if (selector === 'input[type="text"], input[type="number"]') return [this.getElementById('layout-rows-split')];
+    return [];
+  },
+  createElement() {
+    const ws = input('', 'ws-row-workspaces'), split = input('', 'ws-row-split');
+    return { set innerHTML(markup) {
+      ws.value = markup.match(/class="ws-row-workspaces" value="([^"]*)"/)[1];
+      split.value = markup.match(/class="ws-row-split" value="([^"]*)"/)[1];
+    }, querySelector(selector) { return selector === '.ws-row-split' ? split : ws; },
+    querySelectorAll() { return [ws, split]; } };
+  }
+};
+global.autoSave = () => {};
+global.escAttr = s => s || '';
+global.wrapAllInputs = global.addPresetRow = global.refreshDefaultWidthPresetOptions = () => {};
+global.loadHotkeysSorted = global.renderFailedHotkeys = global.addRuleRow = global.updateScrollLabels = () => {};
+global.deleteIcon = '';
+eval(section('function init(cfg)', '/* ── Delete icon'));
+eval(section('/* Debounced: text and number inputs */', '/* Troubleshooting */'));
+const reloaded = JSON.parse(JSON.stringify(payload.config));
+reloaded.layout.gap = 91;
+reloaded.behavior.check_for_updates = true;
+reloaded.layout.rows.split = ['30%', '70%'];
+reloaded.layout.rows.workspaces = [{workspaces: [2], split: ['40%', '60%']}];
+global.autoSave = () => { throw Error('reload push must not save'); };
+applyReloadConfig(reloaded);
+applyReloadConfig(reloaded);
+let refreshed = readConfig();
+assert.strictEqual(document.getElementById('layout-gap').value, 91);
+assert.strictEqual(refreshed.layout.gap, 91);
+assert.strictEqual(refreshed.behavior.check_for_updates, true);
+assert.deepStrictEqual(refreshed.layout.rows.split, ['30%', '70%']);
+assert.strictEqual(rows.length, 1);
+assert.deepStrictEqual(refreshed.layout.rows.workspaces[0].split, ['40%', '60%']);
+const originalTimeout = global.setTimeout, originalClearTimeout = global.clearTimeout;
+const timers = new Map(); let nextTimer = 0;
+global.setTimeout = (callback, delay) => { const id = ++nextTimer; timers.set(id, {callback, delay}); return id; };
+global.clearTimeout = id => timers.delete(id);
+function tick(delay) {
+  const pending = Array.from(timers.entries()).filter(([,timer]) => timer.delay === delay);
+  for (const [id, timer] of pending) { timers.delete(id); timer.callback(); }
+}
+const sent = [];
+window.ipc = {postMessage(message) { sent.push(JSON.parse(message)); }};
+eval(section('/* ── Auto-save', '/* Immediate: toggles'));
+const saveNow = () => { autoSave(0); tick(0); };
+const reply = success => window.lwmSaveResult(sent.filter(m => m.action === 'save').at(-1).id, success);
+function resetSplits(loaded, workspaceLoaded = loaded) {
+  const config = JSON.parse(JSON.stringify(payload.config));
+  config.layout.rows.split = loaded;
+  config.layout.rows.workspaces = [{workspaces: [1], split: workspaceLoaded}];
+  init(config);
+  return [document.getElementById('layout-rows-split'), rows[0].querySelector('.ws-row-split')];
+}
+for (const success of [true, false]) {
+  const [g, w] = resetSplits(['30%', '70%'], ['40%', '60%']);
+  g.edit('25%, 75%'); w.edit('20%, 80%'); saveNow();
+  const first = sent.at(-1), count = sent.length;
+  if (success) { g.edit('1/'); w.edit('1/'); }
+  saveNow();
+  assert.equal(sent.length, count, 'only one save may be in flight');
+  window.lwmSaveResult(first.id, success);
+  const second = sent.at(-1);
+  assert.equal(second.action, 'save'); assert.notEqual(second.id, first.id);
+  assert.deepStrictEqual(second.config.layout.rows.split, success ? ['25%', '75%'] : ['30%', '70%']);
+  assert.deepStrictEqual(second.config.layout.rows.workspaces[0].split, success ? ['20%', '80%'] : ['40%', '60%']);
+  window.lwmSaveResult(first.id, true);
+  saveNow(); assert.strictEqual(sent.at(-1).id, second.id, 'stale reply must not release current save');
+  window.lwmSaveResult(second.id, true);
+  reply(true);
+}
+for (const full of [true, false]) {
+  for (const success of [true, false]) {
+    const [g, w] = resetSplits(['30%', '70%'], ['40%', '60%']);
+    g.edit('25%, 75%'); w.edit('20%, 80%'); saveNow();
+    const first = sent.at(-1), beforePush = sent.length;
+    const changed = JSON.parse(JSON.stringify(payload.config));
+    changed.layout.rows.split = ['10%', '90%'];
+    changed.layout.rows.workspaces = [{workspaces: [1], split: ['15%', '85%']}];
+    if (full) applyReloadConfig(changed); else applyTrayConfig(changed);
+    assert.strictEqual(sent.length, beforePush, 'push must not autosave');
+    const currentWorkspace = rows[0].querySelector('.ws-row-split');
+    if (full || success) { g.edit('1/'); currentWorkspace.edit('1/'); }
+    saveNow();
+    assert.strictEqual(sent.length, beforePush);
+    window.lwmSaveResult(first.id, success);
+    const queued = sent.at(-1);
+    assert.deepStrictEqual(queued.config.layout.rows.split, full ? ['10%', '90%'] : success ? ['25%', '75%'] : ['30%', '70%']);
+    assert.deepStrictEqual(queued.config.layout.rows.workspaces[0].split, full ? ['15%', '85%'] : success ? ['20%', '80%'] : ['40%', '60%']);
+    window.lwmSaveResult(queued.id, true);
+  }
+}
+{
+  const [g, w] = resetSplits(['30%', '70%'], ['40%', '60%']);
+  g.edit('25%, 75%'); w.edit('20%, 80%'); saveNow();
+  const first = sent.at(-1);
+  const changed = JSON.parse(JSON.stringify(payload.config));
+  changed.layout.rows.split = ['25%', '75%'];
+  changed.layout.rows.workspaces = [{workspaces:[1], split:['20%', '80%']}];
+  applyReloadConfig(changed);
+  window.lwmSaveResult(first.id, false);
+  assert.strictEqual(g._rejectedSplitText, undefined, 'pre-refresh failure cannot reject refreshed text');
+  const newWorkspace = rows[0].querySelector('.ws-row-split');
+  g.edit('1/'); newWorkspace.edit('1/'); saveNow();
+  assert.deepStrictEqual(sent.at(-1).config.layout.rows.split, ['25%', '75%']);
+  assert.deepStrictEqual(sent.at(-1).config.layout.rows.workspaces[0].split, ['20%', '80%']);
+  reply(true);
+}
+{
+  const [g, w] = resetSplits(['30%', '70%'], ['40%', '60%']);
+  g.edit('25%, 75%'); w.edit('20%, 80%'); saveNow();
+  const first = sent.at(-1); g.edit('1/'); w.edit('1/'); saveNow();
+  const count = sent.length; tick(2000);
+  assert.equal(sent.length, count + 1);
+  assert.deepStrictEqual(sent.at(-1), {action:'save_result', id:first.id});
+  tick(2000); assert.deepStrictEqual(sent.at(-1), {action:'save_result', id:first.id});
+  window.lwmSaveResult(first.id, true);
+  const second = sent.at(-1);
+  assert.deepStrictEqual(second.config.layout.rows.split, ['25%', '75%']);
+  assert.deepStrictEqual(second.config.layout.rows.workspaces[0].split, ['20%', '80%']);
+  window.lwmSaveResult(first.id, false);
+  assert.strictEqual(_pendingSave.id, second.id);
+  window.lwmSaveResult(second.id, true);
+  assert.equal(timers.size, 0);
+}
+{
+  const [g, w] = resetSplits(['30%', '70%'], ['40%', '60%']);
+  g.edit('25%, 75%'); w.edit('20%, 80%'); saveNow();
+  const first = sent.at(-1);
+  g.edit('35%, 65%'); w.edit('45%, 55%'); tick(500);
+  g.edit('10%, 90%'); w.edit('15%, 85%');
+  const count = sent.length;
+  window.lwmSaveResult(first.id, true);
+  assert.equal(sent.length, count, 'new edit still observes its debounce');
+  tick(500);
+  assert.deepStrictEqual(sent.at(-1).config.layout.rows.split, ['10%', '90%']);
+  assert.deepStrictEqual(sent.at(-1).config.layout.rows.workspaces[0].split, ['15%', '85%']);
+  reply(true);
+}
+for (const success of [true, false]) {
+  eval(section('/* ── Auto-save', '/* Immediate: toggles'));
+  const [g, w] = resetSplits(['30%', '70%'], ['40%', '60%']);
+  g.edit('25%, 75%'); w.edit('20%, 80%'); saveNow();
+  const first = sent.at(-1);
+  if (success) { g.edit('1/'); w.edit('1/'); }
+  saveNow();
+  const count = sent.length;
+  window.lwmRequestClose();
+  assert.equal(sent.length, count, 'close waits for the pending result');
+  tick(2000);
+  assert.deepStrictEqual(sent.at(-1), {action:'save_result', id:first.id});
+  window.lwmSaveResult(first.id, success);
+  const second = sent.at(-1);
+  assert.equal(second.action, 'save'); assert.notEqual(second.id, first.id);
+  assert.deepStrictEqual(second.config.layout.rows.split, success ? ['25%', '75%'] : ['30%', '70%']);
+  assert.deepStrictEqual(second.config.layout.rows.workspaces[0].split, success ? ['20%', '80%'] : ['40%', '60%']);
+  window.lwmSaveResult(first.id, true);
+  assert.strictEqual(sent.at(-1), second);
+  window.lwmSaveResult(second.id, true);
+  assert.deepStrictEqual(sent.at(-1), {action:'finish_close'});
+  const afterClose = sent.length;
+  window.lwmSaveResult(second.id, true); window.lwmRequestClose();
+  assert.equal(sent.length, afterClose, 'duplicate close or result does not save again');
+}
+{
+  eval(section('/* ── Auto-save', '/* Immediate: toggles'));
+  const [g, w] = resetSplits(['30%', '70%'], ['40%', '60%']);
+  g.edit('25%, 75%'); w.edit('20%, 80%'); saveNow();
+  const first = sent.at(-1);
+  g.edit('35%, 65%'); w.edit('45%, 55%');
+  window.lwmRequestClose();
+  g.edit('10%, 90%'); w.edit('15%, 85%');
+  window.lwmSaveResult(first.id, true);
+  const second = sent.at(-1);
+  assert.deepStrictEqual(second.config.layout.rows.split, ['10%', '90%']);
+  assert.deepStrictEqual(second.config.layout.rows.workspaces[0].split, ['15%', '85%']);
+  window.lwmSaveResult(second.id, true);
+  assert.deepStrictEqual(sent.at(-1), {action:'finish_close'});
+  assert.equal(timers.size, 0);
+}
+for (const withPending of [false, true]) {
+  eval(section('/* ── Auto-save', '/* Immediate: toggles'));
+  resetSplits(['30%', '70%']);
+  if (withPending) saveNow();
+  const before = sent.length;
+  window.lwmRequestClose();
+  assert.equal(sent.length, before + 1);
+  assert.deepStrictEqual(sent.at(-1), {action:'finish_close'});
+  timers.clear();
+}
+eval(section('/* ── Auto-save', '/* Immediate: toggles'));
+const savedAutoSave = autoSave;
+global.autoSave = () => {};
+const splitShapes = [
+  { name:'literal comma', loaded:['25%, 75%'], afterCandidate:['25%', '75%'] },
+  { name:'raw spaces', loaded:[' 25% ', '75%'], afterCandidate:['25%', '75%'] },
+  { name:'plain entries', loaded:['25%', '75%'], afterCandidate:['25%', '75%'] },
+  { name:'invalid segment', loaded:['25%', 'oops'], afterCandidate:['60%', '40%'] }
+];
+const splitSequences = [
+  { name:'untouched save', edit:null, success:true },
+  { name:'fallback success then undo', edit:'1/', success:true },
+  { name:'fallback failure then undo', edit:'1/', success:false },
+  { name:'candidate success then undo', edit:'60%, 40%', success:true, candidate:true },
+  { name:'candidate failure then undo', edit:'60%, 40%', success:false, candidate:true },
+  { name:'fallback success then paste original', edit:'1/', success:true, paste:true }
+];
+const splitFailures = [];
+function checkSplitPayload(expected, label) {
+  const actual = sent.at(-1);
+  for (const [location, split] of [['global', actual.config.layout.rows.split],
+    ['workspace', actual.config.layout.rows.workspaces[0].split]]) {
+    try { assert.deepStrictEqual(split, expected); }
+    catch (error) { splitFailures.push(label + ' ' + location + ': ' + error.message); }
+  }
+}
+for (const shape of splitShapes) {
+  for (const sequence of splitSequences) {
+    const [g, w] = resetSplits(shape.loaded);
+    const original = g.value;
+    if (sequence.edit !== null) { g.edit(sequence.edit); w.edit(sequence.edit); }
+    savedAutoSave(0); tick(0);
+    checkSplitPayload(sequence.candidate ? ['60%', '40%'] : shape.loaded, shape.name + ' / ' + sequence.name + ' first save');
+    reply(sequence.success);
+    if (sequence.paste) { g.edit('1/0'); w.edit('1/0'); }
+    if (sequence.edit !== null) { g.edit(original); w.edit(original); }
+    savedAutoSave(0); tick(0);
+    checkSplitPayload(sequence.candidate && sequence.success ? shape.afterCandidate : shape.loaded,
+      shape.name + ' / ' + sequence.name + ' next save');
+    reply(true);
+  }
+}
+assert.deepStrictEqual(splitFailures, []);
+{
+  const [g, w] = resetSplits(['30%', '70%'], ['40%', '60%']);
+  g.edit('25%, 75%'); w.edit('20%, 80%'); savedAutoSave(0); tick(0); reply(false);
+  savedAutoSave(0); tick(0);
+  g.edit('25%, 75%'); w.edit('20%, 80%'); reply(false);
+  assert.deepStrictEqual(readConfig().layout.rows.split, ['25%', '75%']);
+  assert.deepStrictEqual(readConfig().layout.rows.workspaces[0].split, ['20%', '80%']);
+  savedAutoSave(0); tick(0); g.edit('25%, 75%'); w.edit('20%, 80%'); reply(false);
+  assert.deepStrictEqual(readConfig().layout.rows.split, ['25%', '75%']);
+  assert.deepStrictEqual(readConfig().layout.rows.workspaces[0].split, ['20%', '80%']);
+}
+global.autoSave = () => {};
+const cases = [
+  { name: 'intermediate keystroke', loaded: ['50%', '50%'], edits: ['1', '1/'], expected: ['50%', '50%'] },
+  { name: 'fully invalid loaded split', loaded: ['1/'], edits: [], expected: ['1/'] },
+  { name: 'partly valid fraction', loaded: ['60%', '40%', '1/'], edits: [], expected: ['60%', '40%', '1/'] },
+  { name: 'partly valid text', loaded: ['50%', '50%', 'oops'], edits: [], expected: ['50%', '50%', 'oops'] },
+  { name: 'raw loaded text', loaded: [' 50% ', '50%'], edits: [], expected: [' 50% ', '50%'] },
+  { name: 'tray push during incomplete edit', loaded: ['50%', '50%'], edits: ['1/'], push: ['60%', '40%'], expected: ['50%', '50%'] },
+  { name: 'retype displayed split after tray push', loaded: ['50%', '50%'], edits: [], push: ['60%', '40%'], afterPush: ['1', '50%, 50%'], expected: ['50%', '50%'] },
+  { name: 'retargeted workspace after tray push', loaded: ['50%', '50%'], edits: [], push: ['60%', '40%'], retarget: true, expected: ['50%', '50%'] },
+  { name: 'empty edit', loaded: ['50%', '50%'], edits: [''], expected: ['50%', '50%'] },
+  { name: 'valid edit', loaded: ['50%', '50%'], edits: ['1/3, 2/3'], expected: ['1/3', '2/3'], then: '1/' },
+  { name: 'new empty workspace row', loaded: ['100%'], edits: [], expected: ['100%'], newRow: true }
+];
+const failures = [];
+for (const test of cases) {
+  const config = JSON.parse(JSON.stringify(payload.config));
+  config.high_contrast = false;
+  config.layout.rows.split = test.loaded;
+  config.layout.rows.workspaces = test.newRow ? [] : [{workspaces: [1], split: test.loaded}];
+  delete document.getElementById('layout-rows-split')._lastValidSplit;
+  init(config);
+  if (test.newRow) { addWorkspaceRow(); rows[0].querySelector('.ws-row-workspaces').value = '1'; }
+  const globalSplit = document.getElementById('layout-rows-split');
+  const rowSplit = rows[0].querySelector('.ws-row-split');
+  for (const edit of test.edits) { globalSplit.edit(edit); rowSplit.edit(edit); }
+  if (test.retarget) {
+    rows[0].querySelector('.ws-row-workspaces').edit('2');
+    const retargeted = readConfig();
+    assert.deepStrictEqual(retargeted.layout.rows.workspaces[0], { workspaces: [2], split: test.loaded });
+    config.layout.rows.workspaces = [retargeted.layout.rows.workspaces[0], { workspaces: [1], split: test.push }];
+  }
+  if (test.push) {
+    if (!test.retarget) {
+      config.layout.rows.split = test.push;
+      config.layout.rows.workspaces[0].split = test.push;
+    }
+    applyTrayConfig(config);
+  }
+  for (const edit of test.afterPush || []) { globalSplit.edit(edit); rowSplit.edit(edit); }
+  let result = readConfig();
+  try { assert.deepStrictEqual(result.layout.rows.split, test.expected); }
+  catch (error) { failures.push(test.name + ' global: ' + error.message); }
+  try { assert.deepStrictEqual(result.layout.rows.workspaces[0].split, test.newRow ? ['50%', '50%'] : test.expected); }
+  catch (error) { failures.push(test.name + ' workspace: ' + error.message); }
+  if (test.then) {
+    savedAutoSave(0); tick(0); reply(true);
+    globalSplit.edit(test.then); rowSplit.edit(test.then);
+    result = readConfig();
+    try { assert.deepStrictEqual(result.layout.rows.split, test.expected); }
+    catch (error) { failures.push(test.name + ' global fallback: ' + error.message); }
+    try { assert.deepStrictEqual(result.layout.rows.workspaces[0].split, test.expected); }
+    catch (error) { failures.push(test.name + ' workspace fallback: ' + error.message); }
+  }
+}
+assert.deepStrictEqual(failures, []);
+global.setTimeout = originalTimeout; global.clearTimeout = originalClearTimeout;
+"#;
+        let mut child = Command::new("node")
+            .args(["-e", script])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("Node.js is required for the Settings JavaScript test");
+        let mut config = crate::config::Config::default();
+        config.layout.centering_mode = crate::config::CenteringModeConfig::OnOverflow;
+        config.layout.center_columns.center_columns = crate::config::CenterColumnsConfig::Fit;
+        config.appearance.active_border = true;
+        config.behavior.focus_new_windows = false;
+        config.behavior.check_for_updates = false;
+        config.behavior.focus_follows_mouse = true;
+        config.behavior.keep_awake = true;
+        config.behavior.focus_lock_modifier = "F13".to_string();
+        config.behavior.taskbar_buttons = crate::config::TaskbarButtons::ShowAll;
+        config.behavior.new_window_placement = crate::config::NewWindowPlacement::InColumn;
+        let payload = serde_json::json!({
+            "html": SETTINGS_HTML,
+            "script": super::tray_config_script(&config).unwrap(),
+            "config": config,
+        });
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(payload.to_string().as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn report_text_inputs_stay_out_of_config_autosave() {
+        for (element, id) in [
+            ("input", "report-title"),
+            ("input", "report-affected_apps"),
+            ("textarea", "report-actual"),
+            ("textarea", "report-expected"),
+            ("textarea", "report-repro"),
+            ("div", "report-category"),
+            ("div", "report-regression"),
+        ] {
+            let input = SETTINGS_HTML
+                .split(&format!("<{element}"))
+                .find(|tag| tag.contains(&format!("id=\"{id}\"")))
+                .unwrap_or_else(|| panic!("{id} control missing"));
+            let tag = &input[..input.find('>').unwrap()];
+            assert!(tag.contains("data-no-config"), "{id}: {tag}");
+            if element != "div" {
+                assert!(tag.contains("autocomplete=\"off\""), "{id}: {tag}");
+            }
+        }
+    }
+
+    #[test]
+    fn mouse_resize_is_wired_into_settings_config() {
+        assert!(SETTINGS_HTML.contains("id=\"cb-layout-mouse_resize\""));
+        assert!(SETTINGS_HTML
+            .contains("setCb('cb-layout-mouse_resize', cfg.layout.mouse_resize || 'presets');"));
+        assert!(SETTINGS_HTML.contains("mouse_resize: cbVal('cb-layout-mouse_resize')"));
+    }
+
+    #[test]
+    fn offscreen_mode_is_wired_into_settings_config() {
+        assert!(SETTINGS_HTML.contains("id=\"cb-layout-offscreen_mode\""));
+        assert!(SETTINGS_HTML
+            .contains("setCb('cb-layout-offscreen_mode', cfg.layout.offscreen_mode || 'bleed');"));
+        assert!(SETTINGS_HTML.contains("offscreen_mode: cbVal('cb-layout-offscreen_mode')"));
+    }
+
+    #[test]
+    fn center_columns_is_wired_into_settings_config() {
+        assert!(SETTINGS_HTML.contains("id=\"cb-layout-center_columns\""));
+        assert!(SETTINGS_HTML
+            .contains("setCb('cb-layout-center_columns', cfg.layout.center_columns || 'off');"));
+        assert!(SETTINGS_HTML.contains("center_columns: cbVal('cb-layout-center_columns')"));
     }
 
     #[test]
@@ -2685,8 +4225,49 @@ mod tests {
             "t('settings.text.enter_a_finite_fraction_from_0_05_to_1_0_or_leave_this_blank')"
         ));
         assert!(!SETTINGS_HTML.contains("validateRuleColumnWidths"));
-        assert!(SETTINGS_HTML
-            .contains("function autoSave(delay) {\n  clearTimeout(_saveTimer);\n  _saveTimer"));
         assert!(SETTINGS_HTML.contains("Object.assign({}, tr._rule || {})"));
+    }
+
+    #[test]
+    fn rows_and_move_window_across_rows_and_rule_row_are_wired_into_settings_html() {
+        // Layout rows inputs
+        assert!(SETTINGS_HTML.contains("id=\"layout-rows-split\""));
+        assert!(SETTINGS_HTML.contains("id=\"layout-rows-gap\""));
+        assert!(SETTINGS_HTML.contains("setVal('layout-rows-split', rowsSplit);"));
+        assert!(SETTINGS_HTML.contains("setVal('layout-rows-gap',"));
+        assert!(SETTINGS_HTML.contains("rows: {"));
+        assert!(SETTINGS_HTML.contains("gap: num('layout-rows-gap')"));
+
+        assert!(SETTINGS_HTML.contains("id=\"workspace-rows-body\""));
+        assert!(SETTINGS_HTML.contains("addWorkspaceRow"));
+        assert!(SETTINGS_HTML.contains("removeWorkspaceRow"));
+        assert!(SETTINGS_HTML.contains("readWorkspaceRows"));
+
+        for option in ["focus_crosses_monitors", "move_crosses_monitors"] {
+            assert!(SETTINGS_HTML.contains(&format!("id=\"behavior-{option}\"")));
+            assert!(SETTINGS_HTML.contains(&format!(
+                "setChecked('behavior-{option}', cfg.behavior.{option} === true);"
+            )));
+            assert!(SETTINGS_HTML.contains(&format!("{option}: checked('behavior-{option}')")));
+        }
+
+        // Behavior move_window_across_rows toggle
+        assert!(SETTINGS_HTML.contains("id=\"behavior-move_window_across_rows\""));
+        assert!(SETTINGS_HTML.contains(
+            "setChecked('behavior-move_window_across_rows', cfg.behavior.move_window_across_rows === true);"
+        ));
+        assert!(SETTINGS_HTML
+            .contains("move_window_across_rows: checked('behavior-move_window_across_rows')"));
+
+        // Window rules row input
+        assert!(SETTINGS_HTML.contains("class=\"rule-row opt-num\""));
+        assert!(SETTINGS_HTML.contains("min=\"1\" max=\"4\""));
+        assert!(SETTINGS_HTML.contains("delete r.row;"));
+        assert!(SETTINGS_HTML.contains("if (rowv >= 1 && rowv <= 4) r.row = rowv;"));
+        assert!(SETTINGS_HTML
+            .contains("parts.push(t('settings.text.row_index', {index:rowEl.value.trim()}));"));
+        assert!(
+            SETTINGS_HTML.contains("for (var i = Math.max(1, start); i <= Math.min(9, end); i++)")
+        );
     }
 }

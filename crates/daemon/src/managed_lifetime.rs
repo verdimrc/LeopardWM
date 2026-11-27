@@ -148,6 +148,7 @@ impl AppState {
         self.post_admission_maximize_restore_eligible.remove(&hwnd);
         self.forget_recreated_window_lifetime(hwnd);
         self.managed_lifetime_admitted_at_event_ms.remove(&hwnd);
+        leopardwm_platform_win32::forget_stale_frame_refresh(hwnd);
         self.managed_lifetime_tokens.remove(&hwnd)
     }
 

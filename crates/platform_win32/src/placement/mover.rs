@@ -1,6 +1,7 @@
 use super::{cached_placement_owner_answer, placement_owner_answers, DeferEntry};
 use crate::window_id_to_hwnd;
 use leopardwm_core_layout::WindowId;
+use leopardwm_ipc::log_text;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Condvar, LazyLock, Mutex};
 use std::time::{Duration, Instant};
@@ -16,6 +17,7 @@ struct Target {
     w: i32,
     h: i32,
     flags: SET_WINDOW_POS_FLAGS,
+    frame_refresh: Option<u64>,
     generation: u64,
 }
 
@@ -91,10 +93,10 @@ pub(super) fn mark(window_id: WindowId) {
         })
         .unwrap_or_default();
     tracing::info!(
-        "Window ignores queued moves; LeopardWM now moves it synchronously on the mover thread: hwnd={:#x} class={:?} executable={:?}",
+        "Window ignores queued moves; LeopardWM now moves it synchronously on the mover thread: hwnd={:#x} class={} executable={}",
         window_id,
-        class,
-        executable
+        log_text::name(&class),
+        log_text::name(executable.as_deref().unwrap_or(""))
     );
 }
 
@@ -131,6 +133,7 @@ pub(super) fn seal(entry: &DeferEntry) -> bool {
         w: entry.w,
         h: entry.h,
         flags: entry.flags & !SWP_ASYNCWINDOWPOS,
+        frame_refresh: entry.frame_refresh,
         generation: slot.generation,
     };
     if state.in_flight != Some((window_id, lifetime))
@@ -217,6 +220,7 @@ pub(super) fn submit(entry: &DeferEntry, generation: Option<u64>) {
         w: entry.w,
         h: entry.h,
         flags: entry.flags & !SWP_ASYNCWINDOWPOS,
+        frame_refresh: entry.frame_refresh,
         generation,
     });
     if !state.ready.contains(&entry.window_id) {
@@ -314,11 +318,24 @@ fn run() {
                         )
                     } {
                         tracing::warn!(window_id, %error, "Placement mover could not apply target");
-                    } else if correction.is_some() {
-                        let mut rect = RECT::default();
-                        completed = unsafe { GetWindowRect(hwnd, &mut rect) }
-                            .ok()
-                            .map(|()| (target, rect));
+                    } else {
+                        if let Some(mark) = target.frame_refresh {
+                            super::clear_frame_refresh_at_target(
+                                window_id,
+                                hwnd,
+                                mark,
+                                leopardwm_core_layout::Rect::new(
+                                    target.x, target.y, target.w, target.h,
+                                ),
+                                target.flags,
+                            );
+                        }
+                        if correction.is_some() {
+                            let mut rect = RECT::default();
+                            completed = unsafe { GetWindowRect(hwnd, &mut rect) }
+                                .ok()
+                                .map(|()| (target, rect));
+                        }
                     }
                 } else {
                     crate::visibility::recover_after_placement_mover(
@@ -471,6 +488,7 @@ mod tests {
             flags: SET_WINDOW_POS_FLAGS::default(),
             column_index: 0,
             offscreen_rect: None,
+            frame_refresh: None,
         };
         let previously_started = lock().started;
         lock().started = true;

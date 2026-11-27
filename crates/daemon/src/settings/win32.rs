@@ -1,6 +1,8 @@
 //! The WebView2 settings UI lives in html.rs. Rust sends scripts through
 //! evaluate_script; JS sends messages through window.ipc.postMessage.
 
+use leopardwm_ipc::log_text;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Mutex;
 
@@ -93,7 +95,84 @@ const DARK_BG: u32 = 0x00202020;
 const WM_SETTINGS_PUSH_BINDS: u32 = WM_APP + 1;
 const WM_SETTINGS_PUSH_RECORDED: u32 = WM_APP + 2;
 const WM_SETTINGS_PUSH_LOCALE: u32 = WM_APP + 3;
+const WM_SETTINGS_PUSH_CONFIG: u32 = WM_APP + 4;
+const WM_SETTINGS_PUSH_REPORT: u32 = WM_APP + 5;
+const WM_SETTINGS_PUSH_HEALTH: u32 = WM_APP + 6;
+const WM_SETTINGS_PUSH_SNAPSHOT: u32 = WM_APP + 7;
+const WM_SETTINGS_SAVE_RESULT: u32 = WM_APP + 10;
+const WM_SETTINGS_FINISH_CLOSE: u32 = WM_APP + 11;
+const WM_SETTINGS_LIST_DIAGNOSTICS: u32 = WM_APP + 8;
+static SETTINGS_WINDOW: Mutex<Option<isize>> = Mutex::new(None);
+static CLOSE_REQUESTED: AtomicBool = AtomicBool::new(false);
+static LAST_SAVE_RESULT: Mutex<Option<(u64, bool)>> = Mutex::new(None);
+static PENDING_HEALTH: Mutex<Option<String>> = Mutex::new(None);
+static PENDING_SNAPSHOTS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+static REPORT_DRAFT: Mutex<Option<super::issue_report::IssueReport>> = Mutex::new(None);
+static PENDING_REPORT: Mutex<Option<String>> = Mutex::new(None);
+
+pub fn push_report_status(
+    file: Option<String>,
+    error: Option<String>,
+    truncated: bool,
+    copied: bool,
+) {
+    let Ok(thread) = SETTINGS_THREAD.lock() else {
+        return;
+    };
+    let Some(thread_id) = *thread else { return };
+    if let Ok(mut pending) = PENDING_REPORT.lock() {
+        *pending = Some(serde_json::json!({ "file": file, "error": error, "truncated": truncated, "copied": copied }).to_string());
+        unsafe {
+            let _ = PostThreadMessageW(thread_id, WM_SETTINGS_PUSH_REPORT, WPARAM(0), LPARAM(0));
+        }
+    }
+}
 static PENDING_LOCALE: Mutex<Option<String>> = Mutex::new(None);
+#[derive(Clone, Copy)]
+enum ConfigPush {
+    Reload,
+    Tray,
+}
+
+#[derive(Default)]
+struct PendingConfig {
+    reload: Option<String>,
+    tray: Option<String>,
+    wake_posted: bool,
+}
+
+impl PendingConfig {
+    fn enqueue(&mut self, kind: ConfigPush, script: String) -> bool {
+        match kind {
+            ConfigPush::Reload => {
+                self.reload = Some(script);
+                self.tray = None;
+            }
+            ConfigPush::Tray => self.tray = Some(script),
+        }
+        if self.wake_posted {
+            false
+        } else {
+            self.wake_posted = true;
+            true
+        }
+    }
+
+    fn wake_failed(&mut self) {
+        self.wake_posted = false;
+    }
+
+    fn drain(&mut self) -> impl Iterator<Item = String> {
+        self.wake_posted = false;
+        self.reload.take().into_iter().chain(self.tray.take())
+    }
+}
+
+static PENDING_CONFIG: Mutex<PendingConfig> = Mutex::new(PendingConfig {
+    reload: None,
+    tray: None,
+    wake_posted: false,
+});
 
 /// Thread id of the open settings window's message loop, or `None` when closed.
 /// We target the thread queue (not the HWND) so a destroyed or recycled window
@@ -121,6 +200,46 @@ pub fn push_failed_binds(failed_binds: &[String]) {
     }
 }
 
+pub(crate) fn push_health(health: &super::troubleshooting::Health) {
+    let window = SETTINGS_WINDOW
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let Some(hwnd) = *window else { return };
+    if let (Ok(json), Ok(mut pending)) = (serde_json::to_string(health), PENDING_HEALTH.lock()) {
+        *pending = Some(json);
+        unsafe {
+            let _ = PostMessageW(
+                Some(HWND(hwnd as *mut _)),
+                WM_SETTINGS_PUSH_HEALTH,
+                WPARAM(0),
+                LPARAM(0),
+            );
+        }
+    }
+}
+
+pub(crate) fn push_snapshot_result(id: u64, result: Result<std::path::PathBuf>) {
+    let window = SETTINGS_WINDOW
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let Some(hwnd) = *window else { return };
+    let result = match result {
+        Ok(path) => serde_json::json!({"id": id, "ok": true, "path": path.display().to_string()}),
+        Err(error) => serde_json::json!({"id": id, "ok": false, "error": format!("{error:#}")}),
+    };
+    if let Ok(mut pending) = PENDING_SNAPSHOTS.lock() {
+        pending.push(result.to_string());
+        unsafe {
+            let _ = PostMessageW(
+                Some(HWND(hwnd as *mut _)),
+                WM_SETTINGS_PUSH_SNAPSHOT,
+                WPARAM(0),
+                LPARAM(0),
+            );
+        }
+    }
+}
+
 pub fn push_locale(language: &str) {
     let settings_thread = match SETTINGS_THREAD.lock() {
         Ok(thread) => thread,
@@ -134,6 +253,41 @@ pub fn push_locale(language: &str) {
     }
     unsafe {
         let _ = PostThreadMessageW(thread_id, WM_SETTINGS_PUSH_LOCALE, WPARAM(0), LPARAM(0));
+    }
+}
+
+pub fn push_tray_config(config: &Config) {
+    push_config(config, ConfigPush::Tray);
+}
+
+pub fn push_reload_config(config: &Config) {
+    push_config(config, ConfigPush::Reload);
+}
+
+fn push_config(config: &Config, kind: ConfigPush) {
+    let window = SETTINGS_WINDOW
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let Some(hwnd) = *window else { return };
+    let script = match kind {
+        ConfigPush::Reload => super::html::reload_config_script(config),
+        ConfigPush::Tray => super::html::tray_config_script(config),
+    };
+    let Ok(script) = script else { return };
+    if let Ok(mut pending) = PENDING_CONFIG.lock() {
+        if pending.enqueue(kind, script)
+            && unsafe {
+                PostMessageW(
+                    Some(HWND(hwnd as *mut _)),
+                    WM_SETTINGS_PUSH_CONFIG,
+                    WPARAM(0),
+                    LPARAM(0),
+                )
+            }
+            .is_err()
+        {
+            pending.wake_failed();
+        }
     }
 }
 
@@ -187,6 +341,7 @@ pub fn run_settings_window(
     high_contrast: bool,
     failed_binds: Vec<String>,
 ) -> Result<()> {
+    CLOSE_REQUESTED.store(false, Ordering::Release);
     unsafe {
         let hinstance = GetModuleHandleW(None)?;
         let dark = is_dark_mode();
@@ -259,6 +414,9 @@ pub fn run_settings_window(
         let _ = SetWindowPos(hwnd, None, x, y, width, height, flags);
 
         if let Ok(mut g) = SETTINGS_THREAD.lock() {
+            if let Ok(mut pending) = PENDING_CONFIG.lock() {
+                *pending = PendingConfig::default();
+            }
             *g = Some(GetCurrentThreadId());
             if let Ok(mut pending) = PENDING_RECORDED.lock() {
                 pending.clear();
@@ -304,6 +462,8 @@ pub fn run_settings_window(
         // reset-to-defaults from this single catalog (see ipc::hotkeys).
         let catalog_json = serde_json::to_string(&leopardwm_ipc::hotkeys::hotkey_catalog())
             .unwrap_or_else(|_| "[]".to_string());
+        let categories_json = serde_json::to_string(&leopardwm_ipc::hotkeys::hotkey_categories())
+            .unwrap_or_else(|_| "[]".to_string());
         let failed_binds_json =
             serde_json::to_string(&failed_binds).unwrap_or_else(|_| "[]".to_string());
 
@@ -313,8 +473,13 @@ pub fn run_settings_window(
         let webview = wry::WebViewBuilder::new_with_web_context(&mut web_context)
             .with_html(settings_html)
             .with_initialization_script(format!(
-                "window._initConfig = {}; window._hotkeyCatalog = {}; window._failedHotkeys = {}; window._localeStrings = {}; window._language = {}; window._version = {}; window._languages = {};",
-                config_json, catalog_json, failed_binds_json, crate::locale::page_json(&config.appearance.language), serde_json::to_string(&config.appearance.language)?, serde_json::to_string(env!("CARGO_PKG_VERSION"))?, crate::locale::languages_json()
+                "window._initConfig = {}; window._hotkeyCatalog = {}; window._hotkeyCategories = {}; window._failedHotkeys = {}; window._localeStrings = {}; window._language = {}; window._version = {}; window._languages = {};",
+                config_json, catalog_json, categories_json, failed_binds_json, crate::locale::page_json(&config.appearance.language), serde_json::to_string(&config.appearance.language)?, serde_json::to_string(env!("CARGO_PKG_VERSION"))?, crate::locale::languages_json()
+            ))
+            .with_initialization_script(format!(
+                "window._reportDraft = {}; window._windowsVersion = {};",
+                serde_json::to_string(&REPORT_DRAFT.lock().ok().and_then(|draft| draft.clone()))?,
+                serde_json::to_string(&leopardwm_platform_win32::get_windows_version())?
             ))
             .with_ipc_handler(move |req| {
                 if let Some(event_tx) = event_tx.upgrade() {
@@ -324,7 +489,40 @@ pub fn run_settings_window(
             .with_transparent(true)
             .with_background_color((0, 0, 0, 0))
             .with_additional_browser_args("--disable-features=msSmartScreenProtection")
-            .build(&win_handle)?;
+            .build(&win_handle)
+            .inspect_err(|_| {
+                let _ = DestroyWindow(hwnd);
+                if let Ok(mut thread) = SETTINGS_THREAD.lock() {
+                    *thread = None;
+                    if let Ok(mut pending) = PENDING_CONFIG.lock() { *pending = PendingConfig::default(); }
+                }
+                if let Ok(mut pending) = PENDING_HEALTH.lock() { *pending = None; }
+                if let Ok(mut pending) = PENDING_SNAPSHOTS.lock() { pending.clear(); }
+            })?;
+
+        // The WebView remains at this address until WM_DESTROY clears the pointer.
+        SetWindowLongPtrW(
+            hwnd,
+            GWLP_USERDATA,
+            &webview as *const wry::WebView as isize,
+        );
+        *LAST_SAVE_RESULT
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = None;
+        *SETTINGS_WINDOW
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(hwnd.0 as isize);
+        let _ = PostMessageW(Some(hwnd), WM_SETTINGS_PUSH_HEALTH, WPARAM(0), LPARAM(0));
+        let _ = PostMessageW(Some(hwnd), WM_SETTINGS_PUSH_SNAPSHOT, WPARAM(0), LPARAM(0));
+        let _ = PostMessageW(
+            Some(hwnd),
+            WM_SETTINGS_LIST_DIAGNOSTICS,
+            WPARAM(0),
+            LPARAM(0),
+        );
+        if let Some(sender) = close_tx.upgrade() {
+            let _ = sender.send(SettingsEvent::RequestHealth);
+        }
 
         let init_js = "init(window._initConfig)".to_string();
         let _ = webview.evaluate_script(&init_js);
@@ -382,6 +580,18 @@ pub fn run_settings_window(
                 }
                 continue;
             }
+            if msg_buf.message == WM_SETTINGS_PUSH_REPORT {
+                if let Some(json) = PENDING_REPORT
+                    .lock()
+                    .ok()
+                    .and_then(|mut pending| pending.take())
+                {
+                    let _ = webview.evaluate_script(&format!(
+                        "if (window.reportStatus) window.reportStatus({json});"
+                    ));
+                }
+                continue;
+            }
             if msg_buf.message == WM_SETTINGS_PUSH_RECORDED {
                 let chords = PENDING_RECORDED
                     .lock()
@@ -402,9 +612,34 @@ pub fn run_settings_window(
             DispatchMessageW(&msg_buf);
         }
 
+        let window_still_open = {
+            let mut window = SETTINGS_WINDOW
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if *window == Some(hwnd.0 as isize) {
+                SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+                *window = None;
+                true
+            } else {
+                false
+            }
+        };
+        if window_still_open {
+            let _ = DestroyWindow(hwnd);
+        }
+
         // The window is gone; stop the daemon from posting to a dead thread.
         if let Ok(mut g) = SETTINGS_THREAD.lock() {
             *g = None;
+            if let Ok(mut pending) = PENDING_CONFIG.lock() {
+                *pending = PendingConfig::default();
+            }
+            if let Ok(mut pending) = PENDING_HEALTH.lock() {
+                *pending = None;
+            }
+            if let Ok(mut pending) = PENDING_SNAPSHOTS.lock() {
+                pending.clear();
+            }
             if let Ok(mut pending) = PENDING_RECORDED.lock() {
                 pending.clear();
             }
@@ -427,6 +662,49 @@ pub fn run_settings_window(
     Ok(())
 }
 
+#[derive(serde::Serialize)]
+struct DiagnosticFile {
+    name: String,
+    size: u64,
+    modified: Option<u64>,
+}
+
+fn list_diagnostics(dir: &std::path::Path) -> std::io::Result<Vec<DiagnosticFile>> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let mut files = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        // Only snapshots are redacted; anything else in the folder stays off the list.
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !(name.starts_with("leopardwm-snapshot-") && name.ends_with(".txt")) {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        let modified = metadata.modified().ok();
+        files.push((
+            modified,
+            DiagnosticFile {
+                name,
+                size: metadata.len(),
+                modified: modified
+                    .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|time| time.as_secs()),
+            },
+        ));
+    }
+    files.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.name.cmp(&b.1.name)));
+    Ok(files.into_iter().map(|(_, file)| file).collect())
+}
+
 fn is_allowed_url(url: &str) -> bool {
     let Some((scheme, rest)) = url.split_once("://") else {
         return false;
@@ -437,11 +715,11 @@ fn is_allowed_url(url: &str) -> bool {
         && !authority.chars().any(char::is_whitespace)
 }
 
-fn handle_ipc(body: &str, event_tx: &mpsc::Sender<SettingsEvent>, _hwnd: HWND) {
+fn handle_ipc(body: &str, event_tx: &mpsc::Sender<SettingsEvent>, hwnd: HWND) {
     let msg: serde_json::Value = match serde_json::from_str(body) {
         Ok(v) => v,
         Err(e) => {
-            warn!("Settings IPC: invalid JSON: {}", e);
+            warn!("Settings IPC: invalid JSON: {}", log_text::text(e));
             return;
         }
     };
@@ -449,9 +727,121 @@ fn handle_ipc(body: &str, event_tx: &mpsc::Sender<SettingsEvent>, _hwnd: HWND) {
     let action = msg.get("action").and_then(|v| v.as_str()).unwrap_or("");
 
     match action {
+        "report_draft" => {
+            if let Some(draft) = msg
+                .get("draft")
+                .and_then(|value| serde_json::from_value(value.clone()).ok())
+            {
+                if let Ok(mut stored) = REPORT_DRAFT.lock() {
+                    *stored = Some(draft);
+                }
+            }
+        }
+        "report_issue" => {
+            let Some(report): Option<super::issue_report::IssueReport> = msg
+                .get("report")
+                .and_then(|value| serde_json::from_value(value.clone()).ok())
+            else {
+                warn!("Settings: invalid issue report");
+                return;
+            };
+            if report.title.trim().is_empty() || report.actual.trim().is_empty() {
+                warn!("Settings: issue report is missing required fields");
+                return;
+            }
+            if let Ok(mut stored) = REPORT_DRAFT.lock() {
+                *stored = Some(report.clone());
+            }
+            let version = env!("CARGO_PKG_VERSION");
+            let windows = leopardwm_platform_win32::get_windows_version();
+            let (url, truncated) = super::issue_report::issue_url(&report, version, &windows);
+            let copied = if truncated {
+                match leopardwm_platform_win32::clipboard::set_text(
+                    hwnd.0 as isize,
+                    &super::issue_report::full_text(&report, version, &windows),
+                ) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        warn!("Settings: clipboard copy failed: {}", log_text::text(error));
+                        false
+                    }
+                }
+            } else {
+                false
+            };
+            let _ = event_tx.send(SettingsEvent::ReportIssue {
+                url,
+                truncated,
+                copied,
+            });
+        }
         "save" => {
-            if let Some(cfg_val) = msg.get("config") {
-                do_save(cfg_val, event_tx);
+            let Some(id) = msg.get("id").and_then(|value| value.as_u64()) else {
+                return;
+            };
+            let saved = msg
+                .get("config")
+                .is_some_and(|cfg_val| do_save(cfg_val, event_tx));
+            *LAST_SAVE_RESULT
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = Some((id, saved));
+            unsafe {
+                let _ = PostMessageW(Some(hwnd), WM_SETTINGS_SAVE_RESULT, WPARAM(0), LPARAM(0));
+            }
+        }
+        "save_result" => {
+            let id = msg.get("id").and_then(|value| value.as_u64());
+            let result = *LAST_SAVE_RESULT
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if result.is_some_and(|(saved_id, _)| Some(saved_id) == id) {
+                unsafe {
+                    let _ = PostMessageW(Some(hwnd), WM_SETTINGS_SAVE_RESULT, WPARAM(0), LPARAM(0));
+                }
+            }
+        }
+        "finish_close" => unsafe {
+            let _ = PostMessageW(Some(hwnd), WM_SETTINGS_FINISH_CLOSE, WPARAM(0), LPARAM(0));
+        },
+        "request_health" => {
+            let _ = event_tx.send(SettingsEvent::RequestHealth);
+        }
+        "create_snapshot" => {
+            if let Some(id) = msg.get("id").and_then(|value| value.as_u64()) {
+                let _ = event_tx.send(SettingsEvent::CreateSnapshot(id));
+            }
+        }
+        "list_diagnostics" => unsafe {
+            let _ = PostMessageW(
+                Some(hwnd),
+                WM_SETTINGS_LIST_DIAGNOSTICS,
+                WPARAM(0),
+                LPARAM(0),
+            );
+        },
+        "reveal_diagnostics" => {
+            let path = leopardwm_ipc::diagnostics_dir();
+            if let Err(error) = leopardwm_ipc::anchored_fs::AnchoredDir::for_path(&path) {
+                warn!(
+                    "Cannot create diagnostics folder {}: {}",
+                    log_text::path(path.display()),
+                    log_text::text(error)
+                );
+            } else {
+                leopardwm_platform_win32::shell::open(&path);
+            }
+        }
+        "reveal_config" => {
+            let path = crate::config::config_rejection()
+                .map(|rejection| rejection.path)
+                .or_else(|| {
+                    crate::config::config_paths()
+                        .into_iter()
+                        .find(|path| path.exists())
+                })
+                .or_else(|| crate::config::config_paths().into_iter().next());
+            if let Some(folder) = path.as_deref().and_then(std::path::Path::parent) {
+                leopardwm_platform_win32::shell::open(folder);
             }
         }
         "set_recording" => {
@@ -476,9 +866,15 @@ fn handle_ipc(body: &str, event_tx: &mpsc::Sender<SettingsEvent>, _hwnd: HWND) {
                 autostart::disable_autostart().map(|()| None)
             };
             match result {
-                Ok(Some(exe)) => info!("Auto-start enabled via Settings (path: {})", exe.display()),
+                Ok(Some(exe)) => info!(
+                    "Auto-start enabled via Settings (path: {})",
+                    log_text::path(exe.display())
+                ),
                 Ok(None) => info!("Auto-start disabled via Settings"),
-                Err(e) => warn!("Settings: failed to update auto-start: {}", e),
+                Err(e) => warn!(
+                    "Settings: failed to update auto-start: {}",
+                    log_text::text(e)
+                ),
             }
         }
         "open_url" => {
@@ -487,13 +883,13 @@ fn handle_ipc(body: &str, event_tx: &mpsc::Sender<SettingsEvent>, _hwnd: HWND) {
                 return;
             };
             if !is_allowed_url(url) {
-                warn!("Settings IPC: rejected open_url: {:?}", url);
+                warn!("Settings IPC: rejected open_url: {}", log_text::text(url));
                 return;
             }
             leopardwm_platform_win32::shell::open(url);
         }
         other => {
-            warn!("Settings IPC: unknown action: {}", other);
+            warn!("Settings IPC: unknown action: {}", log_text::text(other));
         }
     }
 }
@@ -502,14 +898,17 @@ fn do_save(cfg_val: &serde_json::Value, event_tx: &mpsc::Sender<SettingsEvent>) 
     let mut cfg: Config = match serde_json::from_value(cfg_val.clone()) {
         Ok(c) => c,
         Err(e) => {
-            warn!("Settings: failed to parse config JSON: {}", e);
+            warn!(
+                "Settings: failed to parse config JSON: {}",
+                log_text::text(e)
+            );
             return false;
         }
     };
 
     let warnings = cfg.validate();
     for w in &warnings {
-        warn!("Config: {} - {}", w.field, w.message);
+        warn!("Config: {} - {}", w.field, log_text::text(&w.message));
     }
 
     match cfg.save() {
@@ -519,7 +918,7 @@ fn do_save(cfg_val: &serde_json::Value, event_tx: &mpsc::Sender<SettingsEvent>) 
             true
         }
         Err(e) => {
-            warn!("Failed to save settings: {}", e);
+            warn!("Failed to save settings: {}", log_text::text(e));
             false
         }
     }
@@ -532,6 +931,67 @@ unsafe extern "system" fn wndproc(
     lparam: LPARAM,
 ) -> LRESULT {
     match message {
+        WM_SETTINGS_PUSH_CONFIG
+        | WM_SETTINGS_PUSH_HEALTH
+        | WM_SETTINGS_PUSH_SNAPSHOT
+        | WM_SETTINGS_LIST_DIAGNOSTICS
+        | WM_SETTINGS_SAVE_RESULT => {
+            let webview = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const wry::WebView;
+            if let Some(webview) = webview.as_ref() {
+                match message {
+                    WM_SETTINGS_SAVE_RESULT => {
+                        let result = *LAST_SAVE_RESULT
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner());
+                        if let Some((id, saved)) = result {
+                            let _ = webview
+                                .evaluate_script(&format!("window.lwmSaveResult({id}, {saved});"));
+                        }
+                    }
+                    WM_SETTINGS_PUSH_CONFIG => {
+                        let scripts: Vec<_> = PENDING_CONFIG
+                            .lock()
+                            .map(|mut pending| pending.drain().collect())
+                            .unwrap_or_default();
+                        for script in scripts {
+                            let _ = webview.evaluate_script(&script);
+                        }
+                    }
+                    WM_SETTINGS_PUSH_HEALTH => {
+                        if let Some(json) = PENDING_HEALTH
+                            .lock()
+                            .ok()
+                            .and_then(|mut pending| pending.take())
+                        {
+                            let _ = webview
+                                .evaluate_script(&format!("window.lwmReceiveHealth({json})"));
+                        }
+                    }
+                    WM_SETTINGS_PUSH_SNAPSHOT => {
+                        let results = PENDING_SNAPSHOTS
+                            .lock()
+                            .map(|mut pending| std::mem::take(&mut *pending))
+                            .unwrap_or_default();
+                        for result in results {
+                            let _ = webview
+                                .evaluate_script(&format!("window.lwmReceiveSnapshot({result})"));
+                        }
+                    }
+                    WM_SETTINGS_LIST_DIAGNOSTICS => {
+                        let listing = match list_diagnostics(&leopardwm_ipc::diagnostics_dir()) {
+                            Ok(files) => serde_json::json!({"ok": true, "files": files}),
+                            Err(error) => {
+                                serde_json::json!({"ok": false, "error": error.to_string()})
+                            }
+                        };
+                        let _ = webview
+                            .evaluate_script(&format!("window.lwmReceiveDiagnostics({listing})"));
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            LRESULT(0)
+        }
         WM_GETMINMAXINFO => {
             let minmax = &mut *(lparam.0 as *mut MINMAXINFO);
             let ((width, height), _) =
@@ -556,10 +1016,36 @@ unsafe extern "system" fn wndproc(
             DefWindowProcW(hwnd, message, wparam, lparam)
         }
         WM_CLOSE => {
+            let webview = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const wry::WebView;
+            if CLOSE_REQUESTED.swap(true, Ordering::AcqRel)
+                || webview.as_ref().is_none_or(|webview| {
+                    webview
+                        .evaluate_script("window.lwmRequestClose();")
+                        .is_err()
+                })
+            {
+                let _ = DestroyWindow(hwnd);
+            }
+            LRESULT(0)
+        }
+        WM_SETTINGS_FINISH_CLOSE => {
             let _ = DestroyWindow(hwnd);
             LRESULT(0)
         }
         WM_DESTROY => {
+            {
+                let mut window = SETTINGS_WINDOW
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                *window = None;
+                if let Ok(mut pending) = PENDING_CONFIG.lock() {
+                    *pending = PendingConfig::default();
+                }
+            }
+            *LAST_SAVE_RESULT
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = None;
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
             PostQuitMessage(0);
             LRESULT(0)
         }
@@ -624,6 +1110,137 @@ unsafe fn apply_win11_theming(hwnd: HWND, dark: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_push_coalesces_all_short_sequences() {
+        for len in 0..=7 {
+            for bits in 0..(1 << len) {
+                let mut pending = PendingConfig::default();
+                let mut sequence = Vec::new();
+                for i in 0..len {
+                    let reload = bits & (1 << i) != 0;
+                    let script = format!("{}{i}", if reload { 'R' } else { 'T' });
+                    assert_eq!(
+                        pending.enqueue(
+                            if reload {
+                                ConfigPush::Reload
+                            } else {
+                                ConfigPush::Tray
+                            },
+                            script.clone()
+                        ),
+                        i == 0
+                    );
+                    sequence.push((reload, script));
+                }
+                let latest_reload = sequence.iter().rposition(|(reload, _)| *reload);
+                let latest_tray = sequence
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .find(|(i, (reload, _))| !reload && latest_reload.is_none_or(|r| *i > r))
+                    .map(|(_, (_, script))| script.clone());
+                let expected: Vec<_> = latest_reload
+                    .map(|i| sequence[i].1.clone())
+                    .into_iter()
+                    .chain(latest_tray)
+                    .collect();
+                assert_eq!(
+                    pending.drain().collect::<Vec<_>>(),
+                    expected,
+                    "sequence {bits:b}, length {len}"
+                );
+                assert!(pending.drain().next().is_none());
+                assert!(pending.enqueue(ConfigPush::Tray, "next".into()));
+            }
+        }
+    }
+
+    #[test]
+    fn config_push_retries_failed_wake_and_resets_session() {
+        let mut pending = PendingConfig::default();
+        assert!(pending.enqueue(ConfigPush::Reload, "reload".into()));
+        pending.wake_failed();
+        assert!(pending.enqueue(ConfigPush::Tray, "tray".into()));
+        assert_eq!(pending.drain().collect::<Vec<_>>(), ["reload", "tray"]);
+        assert!(pending.enqueue(ConfigPush::Reload, "old session".into()));
+        pending = PendingConfig::default();
+        assert!(pending.drain().next().is_none());
+        assert!(pending.enqueue(ConfigPush::Tray, "new session".into()));
+        assert_eq!(pending.drain().collect::<Vec<_>>(), ["new session"]);
+    }
+
+    #[test]
+    fn save_result_query_retains_correlated_failure_without_saving() {
+        let (sender, receiver) = mpsc::channel();
+        let hwnd = HWND(std::ptr::null_mut());
+        handle_ipc(r#"{"action":"save","id":41,"config":0}"#, &sender, hwnd);
+        assert_eq!(*LAST_SAVE_RESULT.lock().unwrap(), Some((41, false)));
+        handle_ipc(
+            r#"{"action":"save_result","id":40,"config":0}"#,
+            &sender,
+            hwnd,
+        );
+        assert_eq!(*LAST_SAVE_RESULT.lock().unwrap(), Some((41, false)));
+        handle_ipc(
+            r#"{"action":"save_result","id":41,"config":0}"#,
+            &sender,
+            hwnd,
+        );
+        assert_eq!(*LAST_SAVE_RESULT.lock().unwrap(), Some((41, false)));
+        assert!(receiver.try_recv().is_err());
+        *LAST_SAVE_RESULT.lock().unwrap() = None;
+    }
+
+    #[test]
+    fn save_requests_config_reload() {
+        let mut config = Config::default();
+        config.layout.gap = -1;
+        let (sender, receiver) = mpsc::channel();
+        assert!(do_save(&serde_json::to_value(config).unwrap(), &sender));
+        assert!(matches!(receiver.try_recv(), Ok(SettingsEvent::Saved)));
+    }
+
+    #[test]
+    fn diagnostics_listing_sorts_by_full_modification_time_and_includes_metadata() {
+        use std::time::{Duration, SystemTime, UNIX_EPOCH};
+        let dir = std::env::temp_dir().join(format!(
+            "leopardwm-diagnostics-list-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        for (name, bytes, nanos) in [
+            ("leopardwm-snapshot-a-older.txt", &b"old"[..], 100_000_000),
+            ("leopardwm-snapshot-z-newer.txt", &b"newer"[..], 800_000_000),
+            ("leopardwm-recording.log", &b"unredacted"[..], 900_000_000),
+        ] {
+            let path = dir.join(name);
+            std::fs::write(&path, bytes).unwrap();
+            let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+            file.set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(UNIX_EPOCH + Duration::new(1_700_000_000, nanos)),
+            )
+            .unwrap();
+        }
+        std::fs::create_dir(dir.join("subfolder")).unwrap();
+        let files = list_diagnostics(&dir).unwrap();
+        assert_eq!(
+            files
+                .iter()
+                .map(|file| (file.name.as_str(), file.size, file.modified))
+                .collect::<Vec<_>>(),
+            vec![
+                ("leopardwm-snapshot-z-newer.txt", 5, Some(1_700_000_000)),
+                ("leopardwm-snapshot-a-older.txt", 3, Some(1_700_000_000))
+            ]
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn window_sizes_scale_from_96_dpi_logical_pixels() {

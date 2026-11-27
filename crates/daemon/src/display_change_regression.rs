@@ -1,3 +1,6 @@
+#[path = "display_change_regression/parked_frame_refresh.rs"]
+mod parked_frame_refresh;
+
 use super::*;
 use leopardwm_core_layout::{Visibility, WindowPlacement};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -320,8 +323,8 @@ impl MoveControl {
     }
 }
 
-struct PlacementOwner {
-    window_id: u64,
+pub(crate) struct PlacementOwner {
+    pub(crate) window_id: u64,
     thread_id: u32,
     release: mpsc::Sender<()>,
     pumping: mpsc::Receiver<()>,
@@ -334,7 +337,7 @@ impl PlacementOwner {
         Self::spawn_at(Rect::new(48, 48, 160, 120))
     }
 
-    fn spawn_at(rect: Rect) -> Self {
+    pub(crate) fn spawn_at(rect: Rect) -> Self {
         Self::spawn_with(rect, 0, false)
     }
 
@@ -465,7 +468,7 @@ impl PlacementOwner {
         }
     }
 
-    fn resume(&self) {
+    pub(crate) fn resume(&self) {
         self.release.send(()).unwrap();
         self.pumping.recv_timeout(Duration::from_secs(5)).unwrap();
     }
@@ -554,6 +557,39 @@ fn classify_non_draining_owner(owner: &PlacementOwner) -> (AppState, Vec<WindowP
         Duration::from_secs(2),
     ));
     (state, placements)
+}
+
+#[test]
+fn floating_resize_adopts_native_minimum_width() {
+    if run_in_placement_test_process(
+        "tests::display_change_regression::floating_resize_adopts_native_minimum_width",
+    ) {
+        return;
+    }
+    let _desktop = FixtureDesktop::enter();
+    for (initial_width, minimum, delta) in [(320, 240, -200), (700, 600, -600)] {
+        let owner =
+            PlacementOwner::spawn_with(Rect::new(48, 48, initial_width, 200), minimum, false);
+        owner.resume();
+        let mut state = placement_state(&[]);
+        let initial = leopardwm_platform_win32::get_window_visible_rect(owner.window_id).unwrap();
+        state.workspaces.get_mut(&1).unwrap()[0]
+            .add_floating(owner.window_id, initial)
+            .unwrap();
+        state.previous_focused_hwnd = Some(owner.window_id);
+        assert_eq!(
+            state.handle_command(IpcCommand::Resize { delta }),
+            IpcResponse::Ok
+        );
+        let actual = leopardwm_platform_win32::get_window_visible_rect(owner.window_id).unwrap();
+        assert!(actual.width > initial.width + delta);
+        let stored = state.workspaces[&1][0].floating_windows()[0].rect;
+        assert_eq!(stored.width, actual.width);
+        assert_eq!(
+            (stored.x, stored.y, stored.height),
+            (initial.x, initial.y, initial.height)
+        );
+    }
 }
 
 #[test]
@@ -3020,6 +3056,7 @@ fn fixture_placement(window_id: u64, visibility: Visibility) -> WindowPlacement 
         },
         visibility,
         column_index: 0,
+        row_index: 0,
     }
 }
 

@@ -2,6 +2,19 @@ use leopardwm_ipc::IpcResponse;
 
 pub(crate) fn print_response(response: &IpcResponse) {
     match response {
+        IpcResponse::Recording { active, path } => {
+            println!(
+                "Recording {}",
+                match active {
+                    Some(true) => "active",
+                    Some(false) => "stopped",
+                    None => "state unknown",
+                }
+            );
+            if let Some(path) = path {
+                println!("{path}");
+            }
+        }
         IpcResponse::Ok => {
             println!("OK");
         }
@@ -11,6 +24,7 @@ pub(crate) fn print_response(response: &IpcResponse) {
         IpcResponse::ApplyPending { message } => {
             println!("{}", message);
         }
+        IpcResponse::DiagnosticSnapshotWritten { path } => println!("{path}"),
         IpcResponse::WorkspaceState {
             columns,
             windows,
@@ -20,11 +34,17 @@ pub(crate) fn print_response(response: &IpcResponse) {
             total_width,
             active_workspace,
             active_workspace_name,
+            focused_row,
+            rows,
         } => {
             println!("Workspace State:");
             match active_workspace_name {
                 Some(name) => println!("  Active workspace: {} ({})", active_workspace, name),
                 None => println!("  Active workspace: {}", active_workspace),
+            }
+            if rows.len() > 1 {
+                println!("  Focused row: {}", focused_row + 1);
+                println!("  Rows: {}", rows.len());
             }
             println!("  Columns: {}", columns);
             println!("  Windows: {}", windows);
@@ -32,9 +52,22 @@ pub(crate) fn print_response(response: &IpcResponse) {
             println!("  Focused window in column: {}", focused_window);
             println!("  Scroll offset: {:.1}", scroll_offset);
             println!("  Total width: {}", total_width);
+            if rows.len() > 1 {
+                for (i, row) in rows.iter().enumerate() {
+                    let marker = if i == *focused_row { " [FOCUSED]" } else { "" };
+                    println!(
+                        "    Row {}: {} cols, scroll {:.1}{}",
+                        i + 1,
+                        row.columns.len(),
+                        row.scroll_offset,
+                        marker
+                    );
+                }
+            }
         }
         IpcResponse::FocusedWindow {
             window_id,
+            row_index,
             column_index,
             window_index,
             is_floating,
@@ -47,6 +80,9 @@ pub(crate) fn print_response(response: &IpcResponse) {
             if *is_floating {
                 println!("  Floating: yes");
             } else {
+                if let Some(row_index) = row_index {
+                    println!("  Row index: {}", row_index + 1);
+                }
                 println!("  Column index: {}", column_index);
                 println!("  Window index: {}", window_index);
             }
@@ -57,8 +93,13 @@ pub(crate) fn print_response(response: &IpcResponse) {
                 let location = if win.is_floating {
                     "floating".to_string()
                 } else {
+                    let row = win
+                        .row_index
+                        .map(|r| format!("row {} ", r + 1))
+                        .unwrap_or_default();
                     format!(
-                        "col {} win {}",
+                        "{}col {} win {}",
+                        row,
                         win.column_index.unwrap_or(0),
                         win.window_index.unwrap_or(0)
                     )
@@ -83,8 +124,13 @@ pub(crate) fn print_response(response: &IpcResponse) {
                 if win.is_floating {
                     println!("  Layout: floating");
                 } else {
+                    let row = win
+                        .row_index
+                        .map(|r| format!("row {}, ", r + 1))
+                        .unwrap_or_default();
                     println!(
-                        "  Layout: tiled (col {}, win {})",
+                        "  Layout: tiled ({}col {}, win {})",
+                        row,
                         win.column_index.unwrap_or(0),
                         win.window_index.unwrap_or(0)
                     );

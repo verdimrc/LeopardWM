@@ -4,15 +4,18 @@ mod animation_worker;
 mod command_handler;
 mod config;
 mod daemon_log;
+mod diagnostic_snapshot;
 #[cfg(test)]
 mod diagnostics_validation;
 mod drag;
 mod event_handler;
 mod events;
 mod gesture_diagnostics;
+mod glazewm_compat;
 mod helpers;
 mod hotkey_resolution;
 mod ipc_server;
+mod keep_awake;
 mod layout_apply;
 mod locale;
 mod managed_lifetime;
@@ -24,6 +27,7 @@ mod overview;
 mod persistence;
 mod physical_placement;
 mod quit_fallback;
+mod recording;
 mod recreated_window_slot;
 #[cfg(test)]
 mod recreated_window_slot_tests;
@@ -50,6 +54,7 @@ mod workspace_ipc;
 mod workspace_ipc_tests;
 
 use ipc_server::*;
+use leopardwm_ipc::log_text;
 use startup::*;
 use state::*;
 
@@ -336,6 +341,7 @@ fn quick_toggle_state(config: &Config) -> tray::QuickToggleState {
         active_border: config.appearance.active_border,
         focus_new_windows: config.behavior.focus_new_windows,
         focus_follows_mouse: config.behavior.focus_follows_mouse,
+        keep_awake: config.behavior.keep_awake,
         taskbar_buttons: match config.behavior.taskbar_buttons {
             config::TaskbarButtons::HideOffscreen => tray::TASKBAR_HIDE_OFFSCREEN,
             config::TaskbarButtons::HideInactiveWorkspaces => {
@@ -348,8 +354,11 @@ fn quick_toggle_state(config: &Config) -> tray::QuickToggleState {
             config::CenteringModeConfig::Center => tray::CENTERING_CENTER,
             config::CenteringModeConfig::JustInView => tray::CENTERING_JUST_IN_VIEW,
             config::CenteringModeConfig::OnOverflow => tray::CENTERING_ON_OVERFLOW,
-            // No tray item for this mode: none is checked.
-            config::CenteringModeConfig::CenterColumnsWhenNarrower => tray::CENTERING_NONE,
+        },
+        center_columns: match config.layout.center_columns.center_columns {
+            config::CenterColumnsConfig::Off => tray::CENTER_COLUMNS_OFF,
+            config::CenterColumnsConfig::Single => tray::CENTER_COLUMNS_SINGLE,
+            config::CenterColumnsConfig::Fit => tray::CENTER_COLUMNS_FIT,
         },
         placement_mode: placement_to_tray(config.behavior.new_window_placement),
     }
@@ -396,14 +405,24 @@ fn sync_tray_and_clear_once_placement(tray_manager: &Option<tray::TrayManager>, 
     }
 }
 
-async fn reload_config_and_hotkeys(
-    state: &Arc<Mutex<AppState>>,
-    hotkey_state: &mut HotkeyState,
-    event_tx: &mpsc::Sender<DaemonEvent>,
-    tray_manager: &Option<tray::TrayManager>,
-    snap_hint_overlay: &Option<OverlayWindow>,
-    mouse_hook_handle: &mut Option<MouseHookHandle>,
-) {
+/// Sync the tray after a quick toggle and push the in-memory config to an open
+/// Settings window. Tray toggles never write config.toml.
+fn sync_tray_after_quick_toggle(tray_manager: &Option<tray::TrayManager>, state: &mut AppState) {
+    sync_tray_toggles(tray_manager, &state.config);
+    settings::push_tray_config(&state.config);
+    // Refresh Settings health so it reflects the toggled value.
+    state.settings_health_dirty = true;
+}
+
+async fn reload_config_and_hotkeys(ctx: &mut EventLoopCtx<'_>) {
+    let state = ctx.state;
+    let hotkey_state = &mut *ctx.hotkey_state;
+    let event_tx = ctx.event_tx;
+    let tray_manager = ctx.tray_manager;
+    let snap_hint_overlay = ctx.snap_hint_overlay;
+    let mouse_hook_handle = &mut *ctx.mouse_hook_handle;
+    let keep_awake = ctx.keep_awake;
+    let glazewm_compat = &mut *ctx.glazewm_compat;
     // Drop both handles BEFORE setup_hotkeys rebuilds them: assignment drops the
     // old HotkeyState last, so an unhook-then-reinstall must happen here or the
     // keyboard hook's double-install guard would reject the new one.
@@ -414,6 +433,10 @@ async fn reload_config_and_hotkeys(
         let state = state.lock().await;
         state.config.clone()
     };
+    keep_awake.set(new_config.behavior.keep_awake);
+    glazewm_compat
+        .configure(&new_config.glazewm_compat, event_tx.clone())
+        .await;
     *hotkey_state = setup_hotkeys(&new_config, event_tx.clone());
     if was_recording {
         set_recording(true);
@@ -427,6 +450,12 @@ async fn reload_config_and_hotkeys(
     // Refresh the rejected-hotkey warning in an open settings window so it
     // reflects the new registration instead of the snapshot taken at open.
     settings::push_failed_binds(&hotkey_state.failed_binds);
+    {
+        let mut state = state.lock().await;
+        state.settings_failed_binds = hotkey_state.failed_binds.clone();
+        state.keyboard_hook_unavailable = hotkey_state.hook.is_none();
+        state.settings_health_dirty = true;
+    }
     // A reload always clears the daemon-side one-shot placement override
     // (see AppState::handle_reload); mirror that on the tray badge too.
     sync_tray_and_clear_once_placement(tray_manager, &new_config);
@@ -557,7 +586,9 @@ fn setup_hotkeys(config: &Config, event_tx: mpsc::Sender<DaemonEvent>) -> Hotkey
     for issue in &resolved.issues {
         warn!(
             "Hotkey {} -> {}: {}",
-            issue.binding, issue.action_id, issue.message
+            log_text::text(&issue.binding),
+            log_text::text(&issue.action_id),
+            log_text::text(&issue.message)
         );
     }
     // Include blocked F-key triggers to preserve the hook's modifier mask.
@@ -568,7 +599,9 @@ fn setup_hotkeys(config: &Config, event_tx: mpsc::Sender<DaemonEvent>) -> Hotkey
         } = entry.hook_binding;
         debug!(
             "Configured hotkey {}: {} -> {:?}",
-            id, entry.binding, entry.command
+            id,
+            log_text::text(&entry.binding),
+            entry.command
         );
         binds.push(entry.hook_binding);
         mapping.insert(id, entry.command);
@@ -590,7 +623,7 @@ fn setup_hotkeys(config: &Config, event_tx: mpsc::Sender<DaemonEvent>) -> Hotkey
     if !failed_binds.is_empty() {
         warn!(
             "These hotkeys are reserved by Windows and can't be intercepted: {}",
-            failed_binds.join(", ")
+            log_text::text(failed_binds.join(", "))
         );
     }
 
@@ -623,6 +656,7 @@ async fn run_shutdown_cleanup(
     mode: ShutdownMode,
     quit_fallback: &quit_fallback::QuitFallback,
 ) {
+    recording::stop_on_exit();
     quit_fallback.started();
     info!("Running {} shutdown cleanup", mode.label());
 
@@ -633,7 +667,7 @@ async fn run_shutdown_cleanup(
         let pending_apply_workers = state.begin_shutdown_or_revert();
         if mode.should_save_state() {
             if let Err(e) = state.save_state() {
-                warn!("Failed to save workspace state: {}", e);
+                warn!("Failed to save workspace state: {}", log_text::text(e));
             }
         }
         (
@@ -797,7 +831,9 @@ struct EventLoopCtx<'a> {
     idle_layout_reapply_timer: &'a mut Option<tokio::task::JoinHandle<()>>,
     display_change_apply_retry_timer: &'a mut Option<(u64, tokio::task::JoinHandle<()>)>,
     mouse_hook_handle: &'a mut Option<MouseHookHandle>,
+    keep_awake: &'a keep_awake::KeepAwake,
     gestures: &'a mut GestureRuntime,
+    glazewm_compat: &'a mut glazewm_compat::Server,
 }
 
 async fn sync_pending_layout_apply_timeout_ui(
@@ -873,11 +909,16 @@ async fn apply_initial_layout(
     sync_pending_layout_apply_timeout_ui(state, tray_manager, hotkey_state).await;
 }
 
+struct LoggingState {
+    health: daemon_log::LogHealth,
+    _recording_guard: recording::Guard,
+}
+
 fn bootstrap_config() -> Result<(
     Config,
     Vec<config::ConfigWarning>,
     Option<gesture_diagnostics::GestureCaptureHandle>,
-    daemon_log::LogHealth,
+    LoggingState,
 )> {
     // Set DPI awareness before any window/GDI operations
     if set_dpi_awareness() {
@@ -887,15 +928,30 @@ fn bootstrap_config() -> Result<(
     }
 
     match config::ensure_config_on_disk() {
-        Ok(Some(path)) => eprintln!("[leopardwm] Created default config: {}", path.display()),
+        Ok(Some(path)) => eprintln!(
+            "[leopardwm] Created default config: {}",
+            log_text::path(path.display())
+        ),
         Ok(None) => {}
-        Err(e) => eprintln!("[leopardwm] Warning: Could not create config file: {}", e),
+        Err(e) => eprint!(
+            "{}",
+            log_text::error_record(format_args!(
+                "Could not create config file: {}",
+                log_text::text(format_args!("{e:#}"))
+            ))
+        ),
     }
 
     // Load configuration first (needed for log level)
     let mut config = Config::load().unwrap_or_else(|e| {
         // Can't use tracing yet, fall back to eprintln
-        eprintln!("Failed to load configuration: {}. Using defaults.", e);
+        eprint!(
+            "{}",
+            log_text::error_record(format_args!(
+                "Failed to load configuration: {}. Using defaults.",
+                log_text::text(format_args!("{e:#}"))
+            ))
+        );
         Config::default()
     });
 
@@ -911,14 +967,23 @@ fn bootstrap_config() -> Result<(
     // bound for the in-memory config. Zero does not open or truncate a file.
     let capture_secs =
         config::clamp_diagnostic_capture_secs(config.gestures.diagnostic_capture_secs);
-    let (capture_handle, log_health) = init_logging(log_level, &config, capture_secs)?;
+    let (capture_handle, log_health, recording_guard) =
+        init_logging(log_level, &config, capture_secs)?;
 
     let config_warnings = config.validate();
     for w in &config_warnings {
-        warn!("Config: {} - {}", w.field, w.message);
+        warn!("Config: {} - {}", w.field, log_text::text(&w.message));
     }
 
-    Ok((config, config_warnings, capture_handle, log_health))
+    Ok((
+        config,
+        config_warnings,
+        capture_handle,
+        LoggingState {
+            health: log_health,
+            _recording_guard: recording_guard,
+        },
+    ))
 }
 
 /// Install stdout + daemon-log layers at the configured level, and optionally a
@@ -931,6 +996,7 @@ fn init_logging(
 ) -> Result<(
     Option<gesture_diagnostics::GestureCaptureHandle>,
     daemon_log::LogHealth,
+    recording::Guard,
 )> {
     use tracing_subscriber::prelude::*;
     let log_dir = leopardwm_ipc::log_dir();
@@ -952,7 +1018,15 @@ fn init_logging(
         None
     };
 
+    let (recording_filter, filter_handle) =
+        tracing_subscriber::reload::Layer::new(tracing_subscriber::filter::LevelFilter::OFF);
+    let recording = recording::Recording::new(filter_handle, leopardwm_ipc::recordings_dir());
+    let writer = recording.clone();
     tracing_subscriber::registry()
+        .with(log_text::file_layer(
+            move || writer.writer(),
+            recording_filter,
+        ))
         .with(
             tracing_subscriber::fmt::layer()
                 .with_writer(std::io::stdout)
@@ -961,12 +1035,10 @@ fn init_logging(
                 )),
         )
         .with(file_appender.map(|writer| {
-            tracing_subscriber::fmt::layer()
-                .with_ansi(false)
-                .with_writer(writer)
-                .with_filter(tracing_subscriber::filter::LevelFilter::from_level(
-                    log_level,
-                ))
+            log_text::file_layer(
+                writer,
+                tracing_subscriber::filter::LevelFilter::from_level(log_level),
+            )
         }))
         .with(
             capture_handle
@@ -980,7 +1052,7 @@ fn init_logging(
         if capture_handle.is_some() {
             info!(
                 capture_secs,
-                path = %gesture_diagnostics::capture_log_path(&log_dir).display(),
+                path = %log_text::path(gesture_diagnostics::capture_log_path(&log_dir).display()),
                 "Gesture diagnostic capture started for this process (startup-only; reload does not start a new capture)"
             );
         } else {
@@ -991,12 +1063,25 @@ fn init_logging(
         }
     }
 
-    Ok((capture_handle, log_health))
+    Ok((capture_handle, log_health, recording::install(recording)))
+}
+
+fn write_crash_report(
+    dir: &std::path::Path,
+    name: &std::ffi::OsStr,
+    report: &str,
+) -> std::io::Result<()> {
+    use std::io::Write;
+    let directory = leopardwm_ipc::anchored_fs::AnchoredDir::for_path(dir)?;
+    directory.create_new(name)?.write_all(report.as_bytes())
 }
 
 fn install_panic_hook() {
-    let default_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
+    std::panic::set_hook(Box::new(|info| {
+        eprint!(
+            "{}",
+            log_text::panic_record(info.location(), log_text::panic_payload(info.payload()))
+        );
         eprintln!("[leopardwm] PANIC detected — emergency uncloaking all windows");
         leopardwm_platform_win32::restore_maximizebox_panic_recovery();
         uncloak_all_visible_windows();
@@ -1029,9 +1114,11 @@ fn install_panic_hook() {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let crash_path = std::env::temp_dir().join(format!("leopardwm-crash-{}.txt", ts));
+        let temp_dir = std::env::temp_dir();
+        let crash_name = format!("leopardwm-crash-{}.txt", ts);
+        let crash_path = temp_dir.join(&crash_name);
         let report = format_crash_report(info);
-        if let Err(e) = std::fs::write(&crash_path, &report) {
+        if let Err(e) = write_crash_report(&temp_dir, crash_name.as_ref(), &report) {
             eprintln!("[leopardwm] Failed to write crash report: {}", e);
         } else {
             eprintln!(
@@ -1039,8 +1126,6 @@ fn install_panic_hook() {
                 crash_path.display()
             );
         }
-
-        default_hook(info);
     }));
 }
 
@@ -1060,7 +1145,7 @@ fn detect_monitors() -> Vec<MonitorInfo> {
                     m.work_area.y,
                     m.scale_factor * 100.0,
                     if m.is_primary { " [PRIMARY]" } else { "" },
-                    m.device_name
+                    log_text::name(&m.device_name)
                 );
             }
             monitors
@@ -1112,7 +1197,7 @@ fn init_workspace_state(state: &mut AppState) {
         .workspaces
         .values()
         .flat_map(|ws_vec| ws_vec.iter())
-        .map(|w| w.column_count())
+        .map(|w| w.rows().iter().map(|r| r.column_count()).sum::<usize>())
         .sum();
     info!(
         "Workspaces initialized across {} monitors: {} total columns, {} total windows",
@@ -1143,7 +1228,7 @@ fn init_workspace_state(state: &mut AppState) {
             if restored_slots.contains(&(monitor_id, ws_idx)) {
                 continue;
             }
-            if workspace.column_count() > 0 {
+            if !workspace.is_empty() {
                 let width = monitor_widths
                     .get(&monitor_id)
                     .copied()
@@ -1186,7 +1271,9 @@ fn init_workspace_state(state: &mut AppState) {
             if restored_slots.contains(&(monitor_id, ws_idx)) {
                 continue;
             }
-            workspace.set_scroll_offset(0.0);
+            for r in 0..workspace.row_count() {
+                workspace.set_scroll_offset_for_row(r, 0.0);
+            }
         }
     }
 }
@@ -1216,6 +1303,7 @@ async fn spawn_tab_forwarders(
                         .blocking_send(DaemonEvent::TabAction {
                             monitor: action_event.monitor,
                             workspace_idx: action_event.workspace_idx,
+                            row_idx: action_event.row_idx,
                             column_idx: action_event.column_idx,
                             tab_idx: action_event.tab_idx,
                             action: action_event.action,
@@ -1249,6 +1337,7 @@ async fn spawn_tab_forwarders(
                         .blocking_send(DaemonEvent::TabRenameSubmitted {
                             monitor: result.monitor,
                             workspace_idx: result.workspace_idx,
+                            row_idx: result.row_idx,
                             column_idx: result.column_idx,
                             tab_idx: result.tab_idx,
                             target_hwnd: result.target_hwnd,
@@ -1423,6 +1512,7 @@ fn setup_mouse_hook(
     event_tx: &mpsc::Sender<DaemonEvent>,
     thread_handles: &mut Vec<std::thread::JoinHandle<()>>,
 ) -> Option<MouseHookHandle> {
+    leopardwm_platform_win32::set_focus_lock_modifier(&config.behavior.focus_lock_modifier);
     if config.behavior.focus_follows_mouse {
         install_ffm_hook(event_tx, Some(thread_handles))
     } else {
@@ -1708,7 +1798,7 @@ async fn print_banner(
         config_path,
         config_warnings: config_warnings
             .iter()
-            .map(|w| format!("{}: {}", w.field, w.message))
+            .map(|w| format!("{}: {}", w.field, log_text::text(&w.message)))
             .collect(),
         log_path,
         safe_mode: args.safe_mode,
@@ -1776,16 +1866,19 @@ async fn handle_ipc_subscribe(
     if events.contains(&EventKind::Layout) {
         let monitor = s.focused_monitor;
         let workspace_index = s.active_workspace_idx(monitor);
-        let focused_column = s
+        let (focused_column, focused_row) = s
             .workspaces
             .get(&monitor)
             .and_then(|list| list.get(workspace_index))
-            .map(|ws| ws.focused_column_index());
+            .map(|ws| (Some(ws.focused_column_index()), ws.focused_row()))
+            .unwrap_or((None, 0));
         snapshot.push(leopardwm_ipc::IpcEvent::LayoutChanged {
             monitor: monitor as i64,
             workspace_index: workspace_index as u8,
             focused_column,
             columns: s.focused_layout_columns(),
+            focused_row,
+            rows: s.focused_layout_rows(),
         });
     }
 
@@ -1811,6 +1904,37 @@ async fn handle_ipc_command(
     cmd: IpcCommand,
     responder: tokio::sync::oneshot::Sender<IpcResponse>,
 ) -> bool {
+    if let IpcCommand::Record {
+        action,
+        timeout_secs,
+    } = cmd
+    {
+        use leopardwm_ipc::RecordAction;
+        let recording = recording::global();
+        let result = match action {
+            RecordAction::Start => recording.start(timeout_secs).map(|info| Some(info.path)),
+            RecordAction::Stop => Ok(recording
+                .stop(recording::StopReason::Stopped)
+                .map(|info| info.path)
+                .or_else(|| recording.last_recording_path())),
+            RecordAction::Status => Ok(recording
+                .status()
+                .map(|info| info.path)
+                .or_else(|| recording.last_recording_path())),
+        };
+        let response = match result {
+            Ok(path) => IpcResponse::Recording {
+                active: Some(recording.status().is_some()),
+                path: path.map(|path| path.to_string_lossy().into_owned()),
+            },
+            Err(message) => {
+                warn!("Cannot start recording: {}", log_text::text(&message));
+                IpcResponse::error(message)
+            }
+        };
+        let _ = responder.send(response);
+        return false;
+    }
     if let Some(mode) = shutdown_mode_for_command(&cmd) {
         if mode == ShutdownMode::PanicRevert {
             warn!("IPC: panic_revert requested");
@@ -1852,15 +1976,8 @@ async fn handle_ipc_command(
     };
 
     if is_reload && matches!(response, IpcResponse::Ok) {
-        reload_config_and_hotkeys(
-            ctx.state,
-            ctx.hotkey_state,
-            ctx.event_tx,
-            ctx.tray_manager,
-            ctx.snap_hint_overlay,
-            ctx.mouse_hook_handle,
-        )
-        .await;
+        reload_config_and_hotkeys(ctx).await;
+        settings::push_reload_config(&ctx.state.lock().await.config);
         info!("Hotkeys reloaded after config reload");
     }
 
@@ -1927,6 +2044,38 @@ async fn handle_ipc_command(
     false
 }
 
+fn schedule_mouse_focus(
+    timer: &mut Option<tokio::task::JoinHandle<()>>,
+    event_tx: &tokio::sync::mpsc::Sender<DaemonEvent>,
+    hwnd: u64,
+    delay_ms: u32,
+    locked: bool,
+    generation: u64,
+    held: impl FnOnce() -> bool + Send + 'static,
+) {
+    if let Some(handle) = timer.take() {
+        handle.abort();
+    }
+    if locked {
+        return;
+    }
+    let focus_tx = event_tx.clone();
+    *timer = Some(tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(delay_ms as u64)).await;
+        if held() {
+            return;
+        }
+        let _ = focus_tx
+            .send(DaemonEvent::FocusFollowsMouse(
+                events::FocusFollowsMouseRequest {
+                    window_id: hwnd,
+                    generation,
+                },
+            ))
+            .await;
+    }));
+}
+
 async fn process_window_event(ctx: &mut EventLoopCtx<'_>, win_event: WindowEvent) {
     // Debounce DisplayChange / WorkAreaChanged into a single reconcile.
     // Contrast/DPI changes fire multiple WM_DISPLAYCHANGE messages with
@@ -1969,30 +2118,35 @@ async fn process_window_event(ctx: &mut EventLoopCtx<'_>, win_event: WindowEvent
         }));
         return;
     }
-    if let WindowEvent::MouseEnterWindow(hwnd) = win_event {
-        let (enabled, delay_ms) = {
-            let state = ctx.state.lock().await;
+    if let WindowEvent::MouseEnterWindow(hwnd, locked) = win_event {
+        let (enabled, delay_ms, generation) = {
+            let mut state = ctx.state.lock().await;
+            state.focus_follows_mouse_generation =
+                state.focus_follows_mouse_generation.wrapping_add(1);
             (
                 state.config.behavior.focus_follows_mouse,
                 state.config.behavior.focus_follows_mouse_delay_ms,
+                state.focus_follows_mouse_generation,
             )
         };
 
         if enabled {
-            if let Some(handle) = ctx.focus_follows_mouse_timer.take() {
-                handle.abort();
-            }
-
-            let focus_tx = ctx.event_tx.clone();
-            let delay = delay_ms;
-            *ctx.focus_follows_mouse_timer = Some(tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_millis(delay as u64)).await;
-                let _ = focus_tx
-                    .send(DaemonEvent::FocusFollowsMouse { window_id: hwnd })
-                    .await;
-            }));
+            schedule_mouse_focus(
+                ctx.focus_follows_mouse_timer,
+                ctx.event_tx,
+                hwnd,
+                delay_ms,
+                locked,
+                generation,
+                leopardwm_platform_win32::focus_lock_blocks_focus,
+            );
         }
     } else if let WindowEvent::MouseLeftManaged = win_event {
+        {
+            let mut state = ctx.state.lock().await;
+            state.focus_follows_mouse_generation =
+                state.focus_follows_mouse_generation.wrapping_add(1);
+        }
         // The cursor left a managed window for the taskbar/a popup. Drop any
         // pending focus so the debounce doesn't foreground the window we just
         // left (which makes Windows flash that window's taskbar button).
@@ -2002,6 +2156,11 @@ async fn process_window_event(ctx: &mut EventLoopCtx<'_>, win_event: WindowEvent
     } else {
         {
             let mut state = ctx.state.lock().await;
+            if let WindowEvent::Uncloaked(hwnd, _) = win_event {
+                if !state.has_pending_uncloak_retry(hwnd) {
+                    return;
+                }
+            }
             state.handle_window_event(win_event);
 
             // Keep an open overview in sync with window lifecycle changes
@@ -2122,7 +2281,7 @@ async fn handle_hotkey_event(
                 let mut state = ctx.state.lock().await;
                 let response = state.handle_command(cmd);
                 if let IpcResponse::Error { message } = response {
-                    warn!("Hotkey command failed: {}", message);
+                    warn!("Hotkey command failed: {}", log_text::text(message));
                 }
                 if is_once_toggle {
                     sync_once_badge(ctx.tray_manager, state.next_window_placement_override);
@@ -2251,7 +2410,7 @@ async fn handle_gesture_event(ctx: &mut EventLoopCtx<'_>, gesture_event: Gesture
                 let mut state = ctx.state.lock().await;
                 let response = state.handle_command(cmd);
                 if let IpcResponse::Error { message } = response {
-                    warn!("Gesture command failed: {}", message);
+                    warn!("Gesture command failed: {}", log_text::text(message));
                 }
                 if state.is_animating() && !*ctx.animation_active {
                     state.tick_animations(0);
@@ -2263,7 +2422,7 @@ async fn handle_gesture_event(ctx: &mut EventLoopCtx<'_>, gesture_event: Gesture
             }
         }
         GestureCommand::Unknown(cmd) => {
-            warn!("Unknown command for gesture: {}", cmd);
+            warn!("Unknown command for gesture: {}", log_text::text(cmd));
         }
     }
 
@@ -2273,6 +2432,22 @@ async fn handle_gesture_event(ctx: &mut EventLoopCtx<'_>, gesture_event: Gesture
 #[cfg(test)]
 mod gesture_dispatch_tests {
     use super::*;
+
+    #[test]
+    fn configured_wheel_nudges_resolve_for_gesture_dispatch() {
+        let config: config::Config = toml::from_str(
+            "[gestures]\nscroll_up = \"nudge_left\"\nscroll_down = \"nudge_right\"\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            classify_gesture_command(&config.gestures.scroll_up),
+            GestureCommand::Known(IpcCommand::NudgeLeft)
+        ));
+        assert!(matches!(
+            classify_gesture_command(&config.gestures.scroll_down),
+            GestureCommand::Known(IpcCommand::NudgeRight)
+        ));
+    }
 
     #[test]
     fn classify_empty_known_and_unknown_commands() {
@@ -2385,7 +2560,7 @@ async fn handle_tray_event(ctx: &mut EventLoopCtx<'_>, tray_event: tray::TrayEve
             let mut state = ctx.state.lock().await;
             let response = state.handle_command(IpcCommand::Refresh);
             if let IpcResponse::Error { message } = response {
-                warn!("Refresh failed: {}", message);
+                warn!("Refresh failed: {}", log_text::text(message));
             }
         }
         tray::TrayEvent::Reload => {
@@ -2396,18 +2571,11 @@ async fn handle_tray_event(ctx: &mut EventLoopCtx<'_>, tray_event: tray::TrayEve
             };
 
             if matches!(response, IpcResponse::Ok) {
-                reload_config_and_hotkeys(
-                    ctx.state,
-                    ctx.hotkey_state,
-                    ctx.event_tx,
-                    ctx.tray_manager,
-                    ctx.snap_hint_overlay,
-                    ctx.mouse_hook_handle,
-                )
-                .await;
+                reload_config_and_hotkeys(ctx).await;
+                settings::push_reload_config(&ctx.state.lock().await.config);
                 info!("Hotkeys reloaded after tray config reload");
             } else if let IpcResponse::Error { message } = response {
-                warn!("Reload failed: {}", message);
+                warn!("Reload failed: {}", log_text::text(message));
             }
         }
         tray::TrayEvent::Exit => {
@@ -2475,10 +2643,10 @@ async fn handle_tray_event(ctx: &mut EventLoopCtx<'_>, tray_event: tray::TrayEve
         tray::TrayEvent::ViewLogs => {
             info!("Tray: View logs requested");
             let log_dir = leopardwm_ipc::log_dir();
-            if let Err(e) = std::fs::create_dir_all(&log_dir) {
+            if let Err(e) = leopardwm_ipc::anchored_fs::AnchoredDir::for_path(&log_dir) {
                 warn!(
                     "Failed to create log directory {}: {}",
-                    log_dir.display(),
+                    log_text::path(log_dir.display()),
                     e
                 );
                 return;
@@ -2500,6 +2668,7 @@ async fn handle_tray_event(ctx: &mut EventLoopCtx<'_>, tray_event: tray::TrayEve
             }
             // Tray toggles are transient: only the settings GUI configurator
             // persists config.toml.
+            sync_tray_after_quick_toggle(ctx.tray_manager, &mut state);
         }
         tray::TrayEvent::ToggleFocusNewWindows => {
             let mut state = ctx.state.lock().await;
@@ -2508,16 +2677,22 @@ async fn handle_tray_event(ctx: &mut EventLoopCtx<'_>, tray_event: tray::TrayEve
                 "Tray: Focus new windows toggled to {}",
                 state.config.behavior.focus_new_windows
             );
+            sync_tray_after_quick_toggle(ctx.tray_manager, &mut state);
         }
         tray::TrayEvent::ToggleFocusFollowsMouse => {
             let enabled = {
                 let mut state = ctx.state.lock().await;
                 state.config.behavior.focus_follows_mouse =
                     !state.config.behavior.focus_follows_mouse;
+                if !state.config.behavior.focus_follows_mouse {
+                    state.focus_follows_mouse_generation =
+                        state.focus_follows_mouse_generation.wrapping_add(1);
+                }
                 info!(
                     "Tray: Focus follows mouse toggled to {}",
                     state.config.behavior.focus_follows_mouse
                 );
+                sync_tray_after_quick_toggle(ctx.tray_manager, &mut state);
                 state.config.behavior.focus_follows_mouse
             };
             sync_mouse_hook(enabled, ctx.mouse_hook_handle, ctx.event_tx);
@@ -2527,13 +2702,21 @@ async fn handle_tray_event(ctx: &mut EventLoopCtx<'_>, tray_event: tray::TrayEve
                 }
             }
         }
+        tray::TrayEvent::ToggleKeepAwake => {
+            let mut state = ctx.state.lock().await;
+            state.config.behavior.keep_awake = !state.config.behavior.keep_awake;
+            let on = state.config.behavior.keep_awake;
+            info!("Tray: Keep awake toggled to {}", on);
+            ctx.keep_awake.set(on);
+            sync_tray_after_quick_toggle(ctx.tray_manager, &mut state);
+        }
         tray::TrayEvent::SetTaskbarButtons(mode) => {
             let mut state = ctx.state.lock().await;
             // Transient: only the settings window writes config.toml.
             state.config.behavior.taskbar_buttons = mode;
             info!("Tray: Taskbar buttons set to {:?}", mode);
             state.sync_taskbar_buttons();
-            sync_tray_toggles(ctx.tray_manager, &state.config);
+            sync_tray_after_quick_toggle(ctx.tray_manager, &mut state);
         }
         tray::TrayEvent::ToggleAutoStart => {
             use leopardwm_platform_win32::autostart;
@@ -2551,7 +2734,7 @@ async fn handle_tray_event(ctx: &mut EventLoopCtx<'_>, tray_event: tray::TrayEve
                     "Tray: Auto-start {}",
                     if target { "enabled" } else { "disabled" }
                 ),
-                Err(e) => warn!("Tray: failed to update auto-start: {}", e),
+                Err(e) => warn!("Tray: failed to update auto-start: {}", log_text::text(e)),
             }
             let state_guard = ctx.state.lock().await;
             sync_tray_toggles(ctx.tray_manager, &state_guard.config);
@@ -2567,7 +2750,7 @@ async fn handle_tray_event(ctx: &mut EventLoopCtx<'_>, tray_event: tray::TrayEve
                     warn!("Layout apply after centering change failed: {}", e);
                 }
             }
-            sync_tray_toggles(ctx.tray_manager, &state.config);
+            sync_tray_after_quick_toggle(ctx.tray_manager, &mut state);
         }
         tray::TrayEvent::OpenReleasesPage => {
             info!("Tray: opening releases page");
@@ -2584,7 +2767,7 @@ async fn handle_tray_event(ctx: &mut EventLoopCtx<'_>, tray_event: tray::TrayEve
                     warn!("Layout apply after centering change failed: {}", e);
                 }
             }
-            sync_tray_toggles(ctx.tray_manager, &state.config);
+            sync_tray_after_quick_toggle(ctx.tray_manager, &mut state);
         }
         tray::TrayEvent::SetCenteringOnOverflow => {
             let mut state = ctx.state.lock().await;
@@ -2597,7 +2780,53 @@ async fn handle_tray_event(ctx: &mut EventLoopCtx<'_>, tray_event: tray::TrayEve
                     warn!("Layout apply after centering change failed: {}", e);
                 }
             }
-            sync_tray_toggles(ctx.tray_manager, &state.config);
+            sync_tray_after_quick_toggle(ctx.tray_manager, &mut state);
+        }
+        tray::TrayEvent::SetCenterColumnsOff => {
+            let mut state = ctx.state.lock().await;
+            if state.config.layout.center_columns.center_columns != config::CenterColumnsConfig::Off
+            {
+                state.config.layout.center_columns.center_columns =
+                    config::CenterColumnsConfig::Off;
+                info!("Tray: Center columns set to Off");
+                let cfg = state.config.clone();
+                state.apply_config(cfg);
+                if let Err(e) = state.apply_layout() {
+                    warn!("Layout apply after center columns change failed: {}", e);
+                }
+            }
+            sync_tray_after_quick_toggle(ctx.tray_manager, &mut state);
+        }
+        tray::TrayEvent::SetCenterColumnsSingle => {
+            let mut state = ctx.state.lock().await;
+            if state.config.layout.center_columns.center_columns
+                != config::CenterColumnsConfig::Single
+            {
+                state.config.layout.center_columns.center_columns =
+                    config::CenterColumnsConfig::Single;
+                info!("Tray: Center columns set to Single");
+                let cfg = state.config.clone();
+                state.apply_config(cfg);
+                if let Err(e) = state.apply_layout() {
+                    warn!("Layout apply after center columns change failed: {}", e);
+                }
+            }
+            sync_tray_after_quick_toggle(ctx.tray_manager, &mut state);
+        }
+        tray::TrayEvent::SetCenterColumnsFit => {
+            let mut state = ctx.state.lock().await;
+            if state.config.layout.center_columns.center_columns != config::CenterColumnsConfig::Fit
+            {
+                state.config.layout.center_columns.center_columns =
+                    config::CenterColumnsConfig::Fit;
+                info!("Tray: Center columns set to Fit");
+                let cfg = state.config.clone();
+                state.apply_config(cfg);
+                if let Err(e) = state.apply_layout() {
+                    warn!("Layout apply after center columns change failed: {}", e);
+                }
+            }
+            sync_tray_after_quick_toggle(ctx.tray_manager, &mut state);
         }
         tray::TrayEvent::SetPlacementNewColumn => {
             set_persistent_placement(ctx, config::NewWindowPlacement::NewColumn).await;
@@ -2632,6 +2861,7 @@ async fn set_persistent_placement(
         );
     }
     sync_tray_and_clear_once_placement(ctx.tray_manager, &state.config);
+    settings::push_tray_config(&state.config);
 }
 
 fn spawn_periodic_ticker(event_tx: &mpsc::Sender<DaemonEvent>) {
@@ -2677,7 +2907,10 @@ async fn handle_tab_strip_icon_poll(state: &Arc<Mutex<AppState>>) {
         && !s.paused
         && s.focused_workspace().is_some_and(|ws| {
             !ws.is_fullscreen()
-                && (0..ws.column_count()).any(|i| ws.column(i).is_some_and(|c| c.is_tabbed()))
+                && ws
+                    .rows()
+                    .iter()
+                    .any(|r| r.columns().iter().any(|c| c.is_tabbed()))
         });
     if needs_refresh {
         s.update_tab_strip();
@@ -2697,11 +2930,11 @@ async fn handle_persist_state_now(state: &Arc<Mutex<AppState>>) {
         Ok(s) => {
             tokio::task::spawn_blocking(move || {
                 if let Err(e) = AppState::write_state_file(&s) {
-                    warn!("debounced save failed: {e}");
+                    warn!("debounced save failed: {}", log_text::text(e));
                 }
             });
         }
-        Err(e) => warn!("debounced save serialize failed: {e}"),
+        Err(e) => warn!("debounced save serialize failed: {}", log_text::text(e)),
     }
 }
 
@@ -2748,6 +2981,7 @@ async fn handle_tab_action(
     state: &Arc<Mutex<AppState>>,
     monitor: isize,
     workspace_idx: usize,
+    row_idx: usize,
     column_idx: usize,
     tab_idx: usize,
     action: leopardwm_platform_win32::tab_strip::TabAction,
@@ -2756,6 +2990,7 @@ async fn handle_tab_action(
         state,
         monitor,
         workspace_idx,
+        row_idx,
         column_idx,
         tab_idx,
         action,
@@ -2764,10 +2999,12 @@ async fn handle_tab_action(
     .await;
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_tab_action_with_restore(
     state: &Arc<Mutex<AppState>>,
     monitor: isize,
     workspace_idx: usize,
+    row_idx: usize,
     column_idx: usize,
     tab_idx: usize,
     action: leopardwm_platform_win32::tab_strip::TabAction,
@@ -2781,12 +3018,16 @@ async fn handle_tab_action_with_restore(
                 .handle_tab_action_activation_with_restore(
                     monitor,
                     workspace_idx,
+                    row_idx,
                     column_idx,
                     tab_idx,
                     restore,
                 )
             {
-                warn!("SetActiveTab from tab click failed: {}", message);
+                warn!(
+                    "SetActiveTab from tab click failed: {}",
+                    log_text::text(message)
+                );
             }
         }
         TabAction::Close => {
@@ -2795,7 +3036,7 @@ async fn handle_tab_action_with_restore(
                 .workspaces
                 .get(&monitor)
                 .and_then(|wss| wss.get(workspace_idx))
-                .and_then(|ws| ws.column(column_idx))
+                .and_then(|ws| ws.column_for_row(row_idx, column_idx))
                 .and_then(|col| col.get(tab_idx));
             drop(s);
             match target_hwnd {
@@ -2805,8 +3046,8 @@ async fn handle_tab_action_with_restore(
                     }
                 }
                 None => debug!(
-                    "TabAction::Close target missing (monitor={}, ws={}, col={}, tab={})",
-                    monitor, workspace_idx, column_idx, tab_idx
+                    "TabAction::Close target missing (monitor={}, ws={}, row={}, col={}, tab={})",
+                    monitor, workspace_idx, row_idx, column_idx, tab_idx
                 ),
             }
         }
@@ -2818,6 +3059,7 @@ async fn handle_tab_action_with_restore(
             s.pending_tab_focus = Some(crate::state::PendingTabFocus {
                 monitor,
                 workspace_idx,
+                row_idx,
                 column_idx,
                 tab_idx,
                 set_at: std::time::Instant::now(),
@@ -2825,13 +3067,15 @@ async fn handle_tab_action_with_restore(
             let proceed = match s.focused_workspace_mut() {
                 None => false,
                 Some(ws) => {
-                    if ws.set_focus(column_idx, 0).is_err() {
+                    if ws.set_focus_in_row(row_idx, column_idx, 0).is_err() {
                         false
-                    } else if let Err(e) = ws.set_active_tab(column_idx, tab_idx) {
-                        warn!("Untab set_active_tab failed: {}", e);
+                    } else if let Err(e) = ws.set_active_tab_in_row(row_idx, column_idx, tab_idx) {
+                        warn!("Untab set_active_tab_in_row failed: {}", e);
                         false
                     } else {
-                        let col_len = ws.column(column_idx).map_or(0, |c| c.windows().len());
+                        let col_len = ws
+                            .column_for_row(row_idx, column_idx)
+                            .map_or(0, |c| c.windows().len());
                         col_len > 1
                     }
                 }
@@ -2839,7 +3083,10 @@ async fn handle_tab_action_with_restore(
             if proceed {
                 let resp = s.untab_tiled_focus();
                 if let IpcResponse::Error { message } = resp {
-                    warn!("ExpelToRight from untab failed: {}", message);
+                    warn!(
+                        "ExpelToRight from untab failed: {}",
+                        log_text::text(message)
+                    );
                     s.pending_tab_focus = None;
                 }
             } else {
@@ -2854,11 +3101,11 @@ async fn handle_tab_action_with_restore(
             {
                 debug!("Rename popup already active, ignoring duplicate request");
             } else {
-                let initial = s.tab_title_for(monitor, workspace_idx, column_idx, tab_idx);
+                let initial = s.tab_title_for(monitor, workspace_idx, row_idx, column_idx, tab_idx);
                 let (tab_rect, colors) =
                     match s
                         .tab_strip_overlays
-                        .get(&(monitor, workspace_idx, column_idx))
+                        .get(&(monitor, workspace_idx, row_idx, column_idx))
                     {
                         Some(strip) => (strip.tab_screen_rect(tab_idx), strip.current_colors()),
                         None => (None, None),
@@ -2869,7 +3116,7 @@ async fn handle_tab_action_with_restore(
                     .workspaces
                     .get(&monitor)
                     .and_then(|wss| wss.get(workspace_idx))
-                    .and_then(|ws| ws.column(column_idx))
+                    .and_then(|ws| ws.column_for_row(row_idx, column_idx))
                     .and_then(|col| col.get(tab_idx));
                 let icon = target_hwnd_opt.and_then(leopardwm_platform_win32::get_window_icon);
                 let tx = s.rename_result_tx.as_ref().map(Arc::downgrade);
@@ -2897,6 +3144,7 @@ async fn handle_tab_action_with_restore(
                                     let _ = sender.send(crate::events::TabRenameResult {
                                         monitor,
                                         workspace_idx,
+                                        row_idx,
                                         column_idx,
                                         tab_idx,
                                         target_hwnd,
@@ -2954,7 +3202,7 @@ mod tab_action_tests {
         app.ensure_workspace_exists(1, 1);
         let state = Arc::new(Mutex::new(app));
 
-        handle_tab_action(&state, 1, 1, 0, 0, TabAction::Activate).await;
+        handle_tab_action(&state, 1, 1, 0, 0, 0, TabAction::Activate).await;
 
         let app = state.lock().await;
         assert_eq!(app.focused_monitor, 1);
@@ -2973,13 +3221,44 @@ mod tab_action_tests {
         workspace.toggle_focused_column_tabbed_mode();
         let state = Arc::new(Mutex::new(app));
 
-        handle_tab_action_with_restore(&state, 2, 0, 0, 1, TabAction::Activate, |_| Ok(())).await;
+        handle_tab_action_with_restore(&state, 2, 0, 0, 0, 1, TabAction::Activate, |_| Ok(()))
+            .await;
 
         let app = state.lock().await;
         assert_eq!(app.focused_monitor, 2);
         let workspace = &app.workspaces[&2][0];
         assert_eq!(workspace.column(0).unwrap().active_tab_idx(), Some(1));
         assert_eq!(workspace.focused_window(), Some(200));
+    }
+
+    #[tokio::test]
+    async fn tab_activation_in_second_row_switches_row_and_activates_tab() {
+        let mut app = AppState::new_with_config(Config::default(), vec![monitor(1, true)]);
+        {
+            let workspace = app.workspaces.get_mut(&1).unwrap().first_mut().unwrap();
+            workspace.set_row_layout(&[0.5, 0.5]);
+            workspace.insert_window_in_row(100, 0, None).unwrap();
+            workspace.insert_window_in_row(200, 1, None).unwrap();
+            workspace
+                .insert_window_in_row_column_at(201, 1, 0, 1)
+                .unwrap();
+            workspace.set_focus_in_row(1, 0, 0).unwrap();
+            workspace.toggle_focused_column_tabbed_mode();
+            workspace.set_focus_in_row(0, 0, 0).unwrap();
+        }
+        let state = Arc::new(Mutex::new(app));
+
+        handle_tab_action_with_restore(&state, 1, 0, 1, 0, 1, TabAction::Activate, |_| Ok(()))
+            .await;
+
+        let app = state.lock().await;
+        let workspace = &app.workspaces[&1][0];
+        assert_eq!(workspace.focused_row(), 1);
+        assert_eq!(
+            workspace.column_for_row(1, 0).unwrap().active_tab_idx(),
+            Some(1)
+        );
+        assert_eq!(workspace.focused_window(), Some(201));
     }
 
     #[tokio::test]
@@ -3000,13 +3279,14 @@ mod tab_action_tests {
         app.pending_tab_focus = Some(PendingTabFocus {
             monitor: 1,
             workspace_idx: 0,
+            row_idx: 0,
             column_idx: 0,
             tab_idx: 0,
             set_at: Instant::now(),
         });
         let state = Arc::new(Mutex::new(app));
 
-        handle_tab_action_with_restore(&state, 2, 0, 0, 1, TabAction::Activate, |_| {
+        handle_tab_action_with_restore(&state, 2, 0, 0, 0, 1, TabAction::Activate, |_| {
             Err(Win32Error::WindowNotFound(200))
         })
         .await;
@@ -3023,10 +3303,11 @@ mod tab_action_tests {
             (
                 pending.monitor,
                 pending.workspace_idx,
+                pending.row_idx,
                 pending.column_idx,
                 pending.tab_idx
             ),
-            (1, 0, 0, 0)
+            (1, 0, 0, 0, 0)
         );
         let workspace = &app.workspaces[&2][0];
         assert!(workspace.is_minimized(200));
@@ -3052,7 +3333,7 @@ mod tab_action_tests {
         app.previous_focused_hwnd = Some(FLOATING);
         let state = Arc::new(Mutex::new(app));
 
-        handle_tab_action(&state, 1, 0, 0, 1, TabAction::Untab).await;
+        handle_tab_action(&state, 1, 0, 0, 0, 1, TabAction::Untab).await;
 
         let app = state.lock().await;
         let workspace = app.focused_workspace().unwrap();
@@ -3077,7 +3358,7 @@ mod tab_action_tests {
         workspace.toggle_focused_column_tabbed_mode();
         let state = Arc::new(Mutex::new(app));
 
-        handle_tab_action(&state, 2, 0, 1, 0, TabAction::Activate).await;
+        handle_tab_action(&state, 2, 0, 0, 1, 0, TabAction::Activate).await;
 
         let app = state.lock().await;
         assert_eq!(app.focused_monitor, 1);
@@ -3096,33 +3377,7 @@ async fn handle_overview_event(
     match event {
         OverviewEvent::ActivateWindow(wid) => {
             let mut s = ctx.state.lock().await;
-            // Resolve the target workspace BEFORE hiding so the close
-            // animation zooms toward the activated workspace's row.
-            let target = s.find_window_workspace(wid);
-            s.hide_overview_animated(target.map(|(_, ws_idx)| ws_idx));
-            let Some((monitor, ws_idx)) = target else {
-                debug!("Overview activate: window {} no longer managed", wid);
-                return;
-            };
-            s.focused_monitor = monitor;
-            if ws_idx != s.active_workspace_idx(monitor) {
-                let resp = s.handle_command(IpcCommand::SwitchWorkspace {
-                    index: (ws_idx + 1) as u8,
-                });
-                if let IpcResponse::Error { message } = resp {
-                    warn!("Overview workspace switch failed: {}", message);
-                    return;
-                }
-            }
-            // Tiled focus flows through the workspace; floating focus is
-            // tracked via previous_focused_hwnd (same split as elsewhere).
-            if s.focused_workspace().is_some_and(|ws| ws.is_floating(wid)) {
-                s.previous_focused_hwnd = Some(wid);
-            } else if let Some(ws) = s.focused_workspace_mut() {
-                let _ = ws.focus_window(wid);
-            }
-            let _ = leopardwm_platform_win32::set_foreground_window(wid);
-            s.sync_foreground_window();
+            s.activate_overview_window(wid);
         }
         OverviewEvent::SwitchWorkspace(idx) => {
             let mut s = ctx.state.lock().await;
@@ -3131,7 +3386,10 @@ async fn handle_overview_event(
                 index: (idx + 1) as u8,
             });
             if let IpcResponse::Error { message } = resp {
-                warn!("Overview workspace switch failed: {}", message);
+                warn!(
+                    "Overview workspace switch failed: {}",
+                    log_text::text(message)
+                );
             }
         }
         OverviewEvent::MoveWindow {
@@ -3143,7 +3401,7 @@ async fn handle_overview_event(
             if let IpcResponse::Error { message } =
                 s.move_overview_window(window_id, forward, generation)
             {
-                warn!("Overview window move failed: {}", message);
+                warn!("Overview window move failed: {}", log_text::text(message));
             }
         }
         OverviewEvent::CloseWindow(wid) => {
@@ -3176,10 +3434,12 @@ async fn handle_overview_event(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_tab_rename_submitted(
     state: &Arc<Mutex<AppState>>,
     monitor: isize,
     workspace_idx: usize,
+    row_idx: usize,
     column_idx: usize,
     tab_idx: usize,
     target_hwnd: u64,
@@ -3195,8 +3455,8 @@ async fn handle_tab_rename_submitted(
     let hwnd = target_hwnd;
     if !leopardwm_platform_win32::is_window_valid(hwnd) {
         debug!(
-            "TabRenameSubmitted: target window gone (monitor={}, ws={}, col={}, tab={}, hwnd={})",
-            monitor, workspace_idx, column_idx, tab_idx, hwnd
+            "TabRenameSubmitted: target window gone (monitor={}, ws={}, row={}, col={}, tab={}, hwnd={})",
+            monitor, workspace_idx, row_idx, column_idx, tab_idx, hwnd
         );
         return;
     }
@@ -3222,6 +3482,57 @@ async fn handle_settings_event(
     settings_event: settings::SettingsEvent,
 ) {
     match settings_event {
+        settings::SettingsEvent::ReportIssue {
+            url,
+            truncated,
+            copied,
+        } => {
+            use std::os::windows::process::CommandExt;
+            let snapshot = {
+                let state = ctx.state.lock().await;
+                crate::diagnostic_snapshot::create_diagnostic_snapshot(
+                    &state,
+                    "Settings",
+                    env!("CARGO_PKG_VERSION").to_owned(),
+                    leopardwm_platform_win32::current_process_integrity(),
+                )
+            };
+            let (file, error) = match snapshot {
+                Ok(path) => {
+                    let mut argument = std::ffi::OsString::from("/select,\"");
+                    argument.push(&path);
+                    argument.push("\"");
+                    let error = std::process::Command::new("explorer.exe")
+                        .raw_arg(argument)
+                        .spawn()
+                        .err();
+                    if let Some(ref error) = error {
+                        warn!(
+                            "Settings: cannot reveal diagnostic snapshot: {}",
+                            log_text::text(error)
+                        );
+                    }
+                    (
+                        Some(
+                            path.file_name()
+                                .unwrap_or_default()
+                                .to_string_lossy()
+                                .into_owned(),
+                        ),
+                        error.map(|e| e.to_string()),
+                    )
+                }
+                Err(error) => {
+                    warn!(
+                        "Settings: cannot create diagnostic snapshot: {}",
+                        log_text::text(&error)
+                    );
+                    (None, Some(error.to_string()))
+                }
+            };
+            leopardwm_platform_win32::shell::open_labeled(&url, "GitHub issue form");
+            settings::push_report_status(file, error, truncated, copied);
+        }
         settings::SettingsEvent::Saved => {
             info!("Settings: config saved, triggering reload");
             let response = {
@@ -3230,19 +3541,34 @@ async fn handle_settings_event(
                 state.reload_config(false)
             };
             if matches!(response, IpcResponse::Ok) {
-                reload_config_and_hotkeys(
-                    ctx.state,
-                    ctx.hotkey_state,
-                    ctx.event_tx,
-                    ctx.tray_manager,
-                    ctx.snap_hint_overlay,
-                    ctx.mouse_hook_handle,
-                )
-                .await;
+                reload_config_and_hotkeys(ctx).await;
                 info!("Hotkeys reloaded after settings save");
             } else if let IpcResponse::Error { message } = response {
-                warn!("Reload after settings save failed: {}", message);
+                warn!(
+                    "Reload after settings save failed: {}",
+                    log_text::text(message)
+                );
             }
+        }
+        settings::SettingsEvent::RequestHealth | settings::SettingsEvent::LogFailure => {
+            let state = ctx.state.lock().await;
+            settings::push_health(&settings::troubleshooting::health(&state));
+        }
+        settings::SettingsEvent::CreateSnapshot(id) => {
+            let state = ctx.state.lock().await;
+            let result = diagnostic_snapshot::create_diagnostic_snapshot(
+                &state,
+                "Settings",
+                env!("CARGO_PKG_VERSION").to_string(),
+                leopardwm_platform_win32::current_process_integrity(),
+            );
+            if let Err(error) = &result {
+                warn!(
+                    "Settings: cannot create diagnostic snapshot: {}",
+                    log_text::text(error)
+                );
+            }
+            settings::push_snapshot_result(id, result);
         }
         settings::SettingsEvent::SetRecording(true) => {
             debug!("Settings: recording started, capturing hotkeys");
@@ -3550,9 +3876,18 @@ async fn handle_animation_frame_applied(
     }
 }
 
-async fn handle_focus_follows_mouse(ctx: &mut EventLoopCtx<'_>, window_id: u64) {
+async fn handle_focus_follows_mouse(
+    ctx: &mut EventLoopCtx<'_>,
+    request: events::FocusFollowsMouseRequest,
+) {
     let mut state = ctx.state.lock().await;
-    if state.config.behavior.focus_follows_mouse {
+    if request.generation != state.focus_follows_mouse_generation {
+        return;
+    }
+    let window_id = request.window_id;
+    if state.config.behavior.focus_follows_mouse
+        && !leopardwm_platform_win32::focus_lock_blocks_focus()
+    {
         // Last gate before forcing foreground: the debounce may have elapsed
         // after the cursor moved off this window without a cancel reaching us
         // (window closed mid-delay, or an event we never got). Skip unless the
@@ -3715,6 +4050,9 @@ async fn finish_daemon_event(ctx: &mut EventLoopCtx<'_>) {
             .as_ref()
             .map(|retry| retry.generation);
         state.publish_workspace_state_if_subscribed();
+        if std::mem::take(&mut state.settings_health_dirty) {
+            settings::push_health(&settings::troubleshooting::health(&state));
+        }
         (timer_needed, retry_generation)
     };
     if should_arm_idle_reapply {
@@ -3743,6 +4081,127 @@ async fn initialize_state(
     state
 }
 
+async fn handle_update_available(
+    state: &Arc<Mutex<AppState>>,
+    tray: &Option<tray::TrayManager>,
+    tag: String,
+) {
+    {
+        let mut state = state.lock().await;
+        state.available_update = Some(tag.clone());
+        state.settings_health_dirty = true;
+    }
+    if let Some(manager) = tray {
+        manager.set_available_update(Some(tag));
+    }
+}
+
+fn start_update_check(
+    config: &Config,
+    event_tx: &mpsc::Sender<DaemonEvent>,
+) -> Arc<std::sync::atomic::AtomicBool> {
+    let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    if config.behavior.check_for_updates {
+        let tx = event_tx.clone();
+        update_check::spawn_update_checker(cancel.clone(), move |tag| {
+            let _ = tx.blocking_send(DaemonEvent::UpdateAvailable(tag));
+        });
+    }
+    cancel
+}
+
+async fn initialize_settings_health(
+    state: &Arc<Mutex<AppState>>,
+    warnings: &[config::ConfigWarning],
+    hotkeys: &HotkeyState,
+    hotkeys_enabled: bool,
+    sender: &Arc<std::sync::mpsc::Sender<settings::SettingsEvent>>,
+) {
+    let mut state = state.lock().await;
+    state.config_warnings = warnings.to_vec();
+    state.watchdog_restarts = std::env::var("LEOPARDWM_WATCHDOG_RESTARTS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
+    // Processes the daemon starts (Explorer, browsers) must not inherit the restart count.
+    std::env::remove_var("LEOPARDWM_WATCHDOG_RESTARTS");
+    state.settings_failed_binds = hotkeys.failed_binds.clone();
+    state.keyboard_hook_unavailable = hotkeys_enabled && hotkeys.hook.is_none();
+    if let Some(log) = &state.daemon_log {
+        log.set_settings_events(Arc::downgrade(sender));
+    }
+}
+
+async fn start_glazewm_compat(
+    state: &Arc<Mutex<AppState>>,
+    events: mpsc::Sender<DaemonEvent>,
+) -> glazewm_compat::Server {
+    let config = state.lock().await.config.glazewm_compat.clone();
+    let mut server = glazewm_compat::Server::default();
+    server.configure(&config, events).await;
+    server
+}
+
+fn spawn_tab_icon_poll(event_tx: &mpsc::Sender<DaemonEvent>) {
+    let tx = event_tx.clone();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_millis(2000));
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            if tx.send(DaemonEvent::TabStripIconPoll).await.is_err() {
+                break;
+            }
+        }
+    });
+}
+
+fn notify_rejected_config() {
+    for key in config::unknown_config_keys() {
+        warn!("Unknown config key: {}", log_text::text(&key));
+    }
+    if let Some(rejection) = config::config_rejection() {
+        let location = rejection
+            .location
+            .map(|(line, column)| format!(" at line {line}, column {column}"))
+            .unwrap_or_default();
+        let mut backup = rejection.path.as_os_str().to_owned();
+        backup.push(".corrupt");
+        if rejection.recovered_fields.is_empty() {
+            warn!(
+                "Configuration rejected: {}",
+                log_text::text(&rejection.reason)
+            );
+            notify::show_toast(
+                "Configuration rejected",
+                &format!("LeopardWM is using defaults. Configuration was rejected{location}. Before saving, LeopardWM will try to keep a copy at {} (or .corrupt.1 if occupied); saving is blocked if it cannot.", std::path::PathBuf::from(backup).display()),
+            );
+        } else {
+            for field in &rejection.recovered_fields {
+                warn!(
+                    "Config: {} reset to default: {}",
+                    log_text::path(&field.path),
+                    log_text::text(&field.reason)
+                );
+            }
+            let fields = &rejection.recovered_fields;
+            let mut names = fields
+                .iter()
+                .take(3)
+                .map(|field| field.path.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            if fields.len() > 3 {
+                names.push_str(&format!(" and {} more", fields.len() - 3));
+            }
+            notify::show_toast(
+                "Configuration recovered",
+                &format!("Settings reset to defaults: {names}{location}. Before saving, LeopardWM will try to keep the original at {} (or .corrupt.1 if occupied); saving is blocked if it cannot.", std::path::PathBuf::from(backup).display()),
+            );
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -3759,18 +4218,21 @@ async fn main() -> Result<()> {
         std::process::exit(1);
     }
 
-    let (config, config_warnings, _gesture_capture, log_health) = bootstrap_config()?;
+    // `logging` keeps the recording guard alive until main returns.
+    let (config, config_warnings, _gesture_capture, logging) = bootstrap_config()?;
 
     install_panic_hook();
 
     info!("LeopardWM daemon starting...");
     info!("Version: {}", env!("CARGO_PKG_VERSION"));
+    leopardwm_platform_win32::warm_virtual_desktop_queries();
 
     // Register the toast AppUserModelID so notify::show_toast can surface
     // user-facing notices (e.g. "can't tile this elevated window"). Non-fatal.
     if let Err(e) = notify::init() {
         warn!("Toast notification setup failed (notifications disabled): {e:#}");
     }
+    notify_rejected_config();
 
     info!(
         "Configuration loaded: gap={}, outer_gaps=[{},{},{},{}], width_presets={:?}, log_level={}",
@@ -3785,7 +4247,7 @@ async fn main() -> Result<()> {
 
     let monitors = detect_monitors();
 
-    let state = initialize_state(config.clone(), monitors, log_health).await;
+    let state = initialize_state(config.clone(), monitors, logging.health).await;
 
     info!("Enumerating windows...");
     {
@@ -3808,6 +4270,8 @@ async fn main() -> Result<()> {
     let (mut hotkey_state, _mouse_press_hook) =
         setup_input_hooks(&config, event_tx.clone(), args.skip_hotkeys());
 
+    let keep_awake = keep_awake::KeepAwake::new(leopardwm_platform_win32::set_keep_awake);
+    keep_awake.set(config.behavior.keep_awake);
     let mut mouse_hook_handle = setup_mouse_hook(&config, &event_tx, &mut thread_handles);
 
     let mut gestures = setup_gestures(&config, &event_tx, &state).await;
@@ -3839,14 +4303,7 @@ async fn main() -> Result<()> {
     let (tray_manager, quit_fallback) =
         setup_tray(&state, &config, &event_tx, &mut thread_handles).await;
 
-    let update_check_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    if config.behavior.check_for_updates {
-        let tx = event_tx.clone();
-        let cancel = update_check_cancel.clone();
-        update_check::spawn_update_checker(cancel, move |tag| {
-            let _ = tx.blocking_send(DaemonEvent::UpdateAvailable(tag));
-        });
-    }
+    let update_check_cancel = start_update_check(&config, &event_tx);
 
     // Tab-strip icon poll: Windows has no MSAA event for icon-only
     // changes (e.g., Discord/Slack swapping in a notification-badge
@@ -3854,24 +4311,20 @@ async fn main() -> Result<()> {
     // is the pragmatic way to keep background tab icons fresh. 2s is
     // slow enough that the periodic GDI work is negligible and fast
     // enough that badge updates feel responsive.
-    {
-        let tx = event_tx.clone();
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(Duration::from_millis(2000));
-            ticker.tick().await;
-            loop {
-                ticker.tick().await;
-                if tx.send(DaemonEvent::TabStripIconPoll).await.is_err() {
-                    break;
-                }
-            }
-        });
-    }
+    spawn_tab_icon_poll(&event_tx);
 
     spawn_periodic_ticker(&event_tx);
 
     let (settings_sync_tx, settings_sync_rx) = std::sync::mpsc::channel();
     let settings_sync_tx = Arc::new(settings_sync_tx);
+    initialize_settings_health(
+        &state,
+        &config_warnings,
+        &hotkey_state,
+        !args.skip_hotkeys(),
+        &settings_sync_tx,
+    )
+    .await;
     match spawn_forwarding_thread(
         "settings-fwd",
         settings_sync_rx,
@@ -3891,7 +4344,12 @@ async fn main() -> Result<()> {
         run_ipc_server(ipc_tx).await;
     });
 
-    info!("IPC server listening on {}", preferred_pipe_name());
+    let mut glazewm_compat = start_glazewm_compat(&state, event_tx.clone()).await;
+
+    info!(
+        "IPC server listening on {}",
+        log_text::path(preferred_pipe_name())
+    );
 
     {
         let s = state.lock().await;
@@ -3945,13 +4403,14 @@ async fn main() -> Result<()> {
         idle_layout_reapply_timer: &mut idle_layout_reapply_timer,
         display_change_apply_retry_timer: &mut display_change_apply_retry_timer,
         mouse_hook_handle: &mut mouse_hook_handle,
+        keep_awake: &keep_awake,
         gestures: &mut gestures,
+        glazewm_compat: &mut glazewm_compat,
     };
 
     loop {
-        let event = match event_rx.recv().await {
-            Some(e) => e,
-            None => break,
+        let Some(event) = event_rx.recv().await else {
+            break;
         };
 
         match event {
@@ -3983,35 +4442,37 @@ async fn main() -> Result<()> {
                 handle_tray_event(&mut ctx, tray_event).await;
             }
             DaemonEvent::UpdateAvailable(tag) => {
-                if let Some(ref mgr) = tray_manager {
-                    mgr.set_available_update(Some(tag));
-                }
+                handle_update_available(&state, &tray_manager, tag).await
             }
-            DaemonEvent::TabStripIconPoll => {
-                handle_tab_strip_icon_poll(&state).await;
-            }
-            DaemonEvent::PeriodicCheck => {
-                handle_periodic_check(&mut ctx).await;
-            }
-            DaemonEvent::PersistStateNow => {
-                handle_persist_state_now(&state).await;
-            }
+            DaemonEvent::TabStripIconPoll => handle_tab_strip_icon_poll(&state).await,
+            DaemonEvent::PeriodicCheck => handle_periodic_check(&mut ctx).await,
+            DaemonEvent::PersistStateNow => handle_persist_state_now(&state).await,
             DaemonEvent::Overview(overview_event) => {
-                handle_overview_event(&mut ctx, overview_event).await;
+                handle_overview_event(&mut ctx, overview_event).await
             }
             DaemonEvent::TabAction {
                 monitor,
                 workspace_idx,
+                row_idx,
                 column_idx,
                 tab_idx,
                 action,
             } => {
-                handle_tab_action(&state, monitor, workspace_idx, column_idx, tab_idx, action)
-                    .await;
+                handle_tab_action(
+                    &state,
+                    monitor,
+                    workspace_idx,
+                    row_idx,
+                    column_idx,
+                    tab_idx,
+                    action,
+                )
+                .await
             }
             DaemonEvent::TabRenameSubmitted {
                 monitor,
                 workspace_idx,
+                row_idx,
                 column_idx,
                 tab_idx,
                 target_hwnd,
@@ -4021,18 +4482,19 @@ async fn main() -> Result<()> {
                     &state,
                     monitor,
                     workspace_idx,
+                    row_idx,
                     column_idx,
                     tab_idx,
                     target_hwnd,
                     new_title,
                 )
-                .await;
+                .await
             }
             DaemonEvent::Settings(settings_event) => {
-                handle_settings_event(&mut ctx, settings_event).await;
+                handle_settings_event(&mut ctx, settings_event).await
             }
             DaemonEvent::AnimationFrameApplied(frame_result) => {
-                handle_animation_frame_applied(&mut ctx, frame_result).await;
+                handle_animation_frame_applied(&mut ctx, frame_result).await
             }
             DaemonEvent::CrossfadeTargetDropped { epoch, window_id } => {
                 let mut state = state.lock().await;
@@ -4048,8 +4510,8 @@ async fn main() -> Result<()> {
                     debug!("Snap hint hidden");
                 }
             }
-            DaemonEvent::FocusFollowsMouse { window_id } => {
-                handle_focus_follows_mouse(&mut ctx, window_id).await;
+            DaemonEvent::FocusFollowsMouse(request) => {
+                handle_focus_follows_mouse(&mut ctx, request).await;
             }
             DaemonEvent::SuspendResume(event) => state.lock().await.handle_suspend_resume(event),
             DaemonEvent::PowerStateChanged {
@@ -4076,6 +4538,8 @@ async fn main() -> Result<()> {
         finish_daemon_event(&mut ctx).await;
     }
 
+    ctx.keep_awake.set(false);
+    ctx.glazewm_compat.stop().await;
     update_check_cancel.store(true, std::sync::atomic::Ordering::SeqCst);
     abort_event_timers(&mut ctx);
     ctx.gestures.stop();

@@ -71,6 +71,7 @@ mod menu_ids {
     pub const TOGGLE_ACTIVE_BORDER: &str = "toggle_active_border";
     pub const TOGGLE_FOCUS_NEW_WINDOWS: &str = "toggle_focus_new_windows";
     pub const TOGGLE_FOCUS_FOLLOWS_MOUSE: &str = "toggle_focus_follows_mouse";
+    pub const TOGGLE_KEEP_AWAKE: &str = "toggle_keep_awake";
     pub const TASKBAR_HIDE_OFFSCREEN: &str = "taskbar_hide_offscreen";
     pub const TASKBAR_HIDE_INACTIVE_WORKSPACES: &str = "taskbar_hide_inactive_workspaces";
     pub const TASKBAR_SHOW_ALL: &str = "taskbar_show_all";
@@ -78,6 +79,9 @@ mod menu_ids {
     pub const CENTERING_CENTER: &str = "centering_center";
     pub const CENTERING_JUST_IN_VIEW: &str = "centering_just_in_view";
     pub const CENTERING_ON_OVERFLOW: &str = "centering_on_overflow";
+    pub const CENTER_COLUMNS_OFF: &str = "center_columns_off";
+    pub const CENTER_COLUMNS_SINGLE: &str = "center_columns_single";
+    pub const CENTER_COLUMNS_FIT: &str = "center_columns_fit";
     pub const PLACEMENT_NEW_COLUMN: &str = "placement_new_column";
     pub const PLACEMENT_IN_COLUMN: &str = "placement_in_column";
     pub const CHECK_UPDATES: &str = "check_updates";
@@ -97,11 +101,15 @@ pub enum TrayEvent {
     ToggleActiveBorder,
     ToggleFocusNewWindows,
     ToggleFocusFollowsMouse,
+    ToggleKeepAwake,
     SetTaskbarButtons(crate::config::TaskbarButtons),
     ToggleAutoStart,
     SetCenteringCenter,
     SetCenteringJustInView,
     SetCenteringOnOverflow,
+    SetCenterColumnsOff,
+    SetCenterColumnsSingle,
+    SetCenterColumnsFit,
     SetPlacementNewColumn,
     SetPlacementInColumn,
     OpenReleasesPage,
@@ -110,7 +118,9 @@ pub enum TrayEvent {
 pub const CENTERING_CENTER: u8 = 0;
 pub const CENTERING_JUST_IN_VIEW: u8 = 1;
 pub const CENTERING_ON_OVERFLOW: u8 = 2;
-pub const CENTERING_NONE: u8 = 3;
+pub const CENTER_COLUMNS_OFF: u8 = 0;
+pub const CENTER_COLUMNS_SINGLE: u8 = 1;
+pub const CENTER_COLUMNS_FIT: u8 = 2;
 pub const PLACEMENT_NEW_COLUMN: u8 = 0;
 pub const PLACEMENT_IN_COLUMN: u8 = 1;
 pub const TASKBAR_HIDE_OFFSCREEN: u8 = 0;
@@ -131,9 +141,11 @@ struct SharedState {
     active_border: AtomicBool,
     focus_new_windows: AtomicBool,
     focus_follows_mouse: AtomicBool,
+    keep_awake: AtomicBool,
     taskbar_buttons: AtomicU8,
     auto_start: AtomicBool,
     centering_mode: AtomicU8,
+    center_columns: AtomicU8,
     placement_mode: AtomicU8,
     /// Which placement the one-shot override (`ToggleNewWindowPlacementOnce`)
     /// is active for — `PLACEMENT_NEW_COLUMN`, `PLACEMENT_IN_COLUMN`, or
@@ -148,6 +160,7 @@ struct TrayItems {
     active_border_item: CheckMenuItem,
     focus_new_windows_item: CheckMenuItem,
     focus_follows_mouse_item: CheckMenuItem,
+    keep_awake_item: CheckMenuItem,
     taskbar_hide_offscreen_item: CheckMenuItem,
     taskbar_hide_inactive_workspaces_item: CheckMenuItem,
     taskbar_show_all_item: CheckMenuItem,
@@ -155,6 +168,9 @@ struct TrayItems {
     centering_center_item: CheckMenuItem,
     centering_just_in_view_item: CheckMenuItem,
     centering_on_overflow_item: CheckMenuItem,
+    center_columns_off_item: CheckMenuItem,
+    center_columns_single_item: CheckMenuItem,
+    center_columns_fit_item: CheckMenuItem,
     placement_new_column_item: CheckMenuItem,
     placement_in_column_item: CheckMenuItem,
     update_item: MenuItem,
@@ -165,10 +181,13 @@ pub struct QuickToggleState {
     pub active_border: bool,
     pub focus_new_windows: bool,
     pub focus_follows_mouse: bool,
+    pub keep_awake: bool,
     pub taskbar_buttons: u8,
     pub auto_start: bool,
     /// 0 = Center, 1 = JustInView, 2 = OnOverflow, 3 = none (no tray item)
     pub centering_mode: u8,
+    /// 0 = Off, 1 = Single, 2 = Fit
+    pub center_columns: u8,
     /// 0 = NewColumn, 1 = InColumn
     pub placement_mode: u8,
 }
@@ -204,9 +223,11 @@ impl TrayManager {
             active_border: AtomicBool::new(initial.active_border),
             focus_new_windows: AtomicBool::new(initial.focus_new_windows),
             focus_follows_mouse: AtomicBool::new(initial.focus_follows_mouse),
+            keep_awake: AtomicBool::new(initial.keep_awake),
             taskbar_buttons: AtomicU8::new(initial.taskbar_buttons),
             auto_start: AtomicBool::new(initial.auto_start),
             centering_mode: AtomicU8::new(initial.centering_mode),
+            center_columns: AtomicU8::new(initial.center_columns),
             placement_mode: AtomicU8::new(initial.placement_mode),
             // Always starts inactive: the one-shot override is session-only
             // runtime state that never survives daemon startup.
@@ -299,6 +320,9 @@ impl TrayManager {
             .focus_follows_mouse
             .store(toggles.focus_follows_mouse, Ordering::Relaxed);
         self.shared
+            .keep_awake
+            .store(toggles.keep_awake, Ordering::Relaxed);
+        self.shared
             .taskbar_buttons
             .store(toggles.taskbar_buttons, Ordering::Relaxed);
         self.shared
@@ -307,6 +331,9 @@ impl TrayManager {
         self.shared
             .centering_mode
             .store(toggles.centering_mode, Ordering::Relaxed);
+        self.shared
+            .center_columns
+            .store(toggles.center_columns, Ordering::Relaxed);
         self.shared
             .placement_mode
             .store(toggles.placement_mode, Ordering::Relaxed);
@@ -549,6 +576,9 @@ fn run_tray_thread(
                         items
                             .focus_follows_mouse_item
                             .set_checked(shared.focus_follows_mouse.load(Ordering::Relaxed));
+                        items
+                            .keep_awake_item
+                            .set_checked(shared.keep_awake.load(Ordering::Relaxed));
                         let tb = shared.taskbar_buttons.load(Ordering::Relaxed);
                         items
                             .taskbar_hide_offscreen_item
@@ -572,6 +602,16 @@ fn run_tray_thread(
                         items
                             .centering_on_overflow_item
                             .set_checked(cm == CENTERING_ON_OVERFLOW);
+                        let cc = shared.center_columns.load(Ordering::Relaxed);
+                        items
+                            .center_columns_off_item
+                            .set_checked(cc == CENTER_COLUMNS_OFF);
+                        items
+                            .center_columns_single_item
+                            .set_checked(cc == CENTER_COLUMNS_SINGLE);
+                        items
+                            .center_columns_fit_item
+                            .set_checked(cc == CENTER_COLUMNS_FIT);
                         // Placement checkmarks and the icon badge both depend
                         // on the effective placement (once override if
                         // active, else the persistent setting) — shared with
@@ -615,6 +655,7 @@ fn menu_label(language: &str, id: &str) -> String {
         "toggle_focus_follows_mouse" => {
             crate::locale::text(language, "tray.toggle_focus_follows_mouse")
         }
+        "toggle_keep_awake" => crate::locale::text(language, "tray.toggle_keep_awake"),
         "taskbar_hide_offscreen" => crate::locale::text(language, "tray.taskbar_hide_offscreen"),
         "taskbar_hide_inactive_workspaces" => {
             crate::locale::text(language, "tray.taskbar_hide_inactive_workspaces")
@@ -624,6 +665,9 @@ fn menu_label(language: &str, id: &str) -> String {
         "centering_center" => crate::locale::text(language, "tray.centering_center"),
         "centering_just_in_view" => crate::locale::text(language, "tray.centering_just_in_view"),
         "centering_on_overflow" => crate::locale::text(language, "tray.centering_on_overflow"),
+        "center_columns_off" => crate::locale::text(language, "tray.center_columns_off"),
+        "center_columns_single" => crate::locale::text(language, "tray.center_columns_single"),
+        "center_columns_fit" => crate::locale::text(language, "tray.center_columns_fit"),
         "placement_new_column" => crate::locale::text(language, "tray.placement_new_column"),
         "placement_in_column" => crate::locale::text(language, "tray.placement_in_column"),
         "check_updates" => crate::locale::text(language, "tray.check_updates"),
@@ -636,6 +680,7 @@ fn menu_label(language: &str, id: &str) -> String {
         "exit" => crate::locale::text(language, "tray.exit"),
         "taskbar" => crate::locale::text(language, "tray.taskbar"),
         "centering" => crate::locale::text(language, "tray.centering"),
+        "center_columns" => crate::locale::text(language, "tray.center_columns"),
         "placement" => crate::locale::text(language, "tray.placement"),
         "troubleshooting" => crate::locale::text(language, "tray.troubleshooting"),
         "open_about" => crate::locale::format(
@@ -732,6 +777,15 @@ fn build_tray(initial: &QuickToggleState) -> Result<(tray_icon::TrayIcon, TrayIt
     );
     append(&focus_follows_mouse_item)?;
 
+    let keep_awake_item = CheckMenuItem::with_id(
+        menu_ids::TOGGLE_KEEP_AWAKE,
+        menu_label(&initial.language, "toggle_keep_awake"),
+        true,
+        initial.keep_awake,
+        None,
+    );
+    append(&keep_awake_item)?;
+
     let taskbar_sub = Submenu::with_id("taskbar", menu_label(&initial.language, "taskbar"), true);
     let taskbar_hide_offscreen_item = CheckMenuItem::with_id(
         menu_ids::TASKBAR_HIDE_OFFSCREEN,
@@ -810,6 +864,43 @@ fn build_tray(initial: &QuickToggleState) -> Result<(tray_icon::TrayIcon, TrayIt
         .append(&centering_on_overflow_item)
         .map_err(|e| TrayError::Menu(e.to_string()))?;
     append(&centering_sub)?;
+
+    let center_columns_sub = Submenu::with_id(
+        "center_columns",
+        menu_label(&initial.language, "center_columns"),
+        true,
+    );
+    let center_columns_off_item = CheckMenuItem::with_id(
+        menu_ids::CENTER_COLUMNS_OFF,
+        menu_label(&initial.language, "center_columns_off"),
+        true,
+        initial.center_columns == CENTER_COLUMNS_OFF,
+        None,
+    );
+    let center_columns_single_item = CheckMenuItem::with_id(
+        menu_ids::CENTER_COLUMNS_SINGLE,
+        menu_label(&initial.language, "center_columns_single"),
+        true,
+        initial.center_columns == CENTER_COLUMNS_SINGLE,
+        None,
+    );
+    let center_columns_fit_item = CheckMenuItem::with_id(
+        menu_ids::CENTER_COLUMNS_FIT,
+        menu_label(&initial.language, "center_columns_fit"),
+        true,
+        initial.center_columns == CENTER_COLUMNS_FIT,
+        None,
+    );
+    center_columns_sub
+        .append(&center_columns_off_item)
+        .map_err(|e| TrayError::Menu(e.to_string()))?;
+    center_columns_sub
+        .append(&center_columns_single_item)
+        .map_err(|e| TrayError::Menu(e.to_string()))?;
+    center_columns_sub
+        .append(&center_columns_fit_item)
+        .map_err(|e| TrayError::Menu(e.to_string()))?;
+    append(&center_columns_sub)?;
 
     let placement_sub = Submenu::with_id(
         "placement",
@@ -928,6 +1019,7 @@ fn build_tray(initial: &QuickToggleState) -> Result<(tray_icon::TrayIcon, TrayIt
         active_border_item,
         focus_new_windows_item,
         focus_follows_mouse_item,
+        keep_awake_item,
         taskbar_hide_offscreen_item,
         taskbar_hide_inactive_workspaces_item,
         taskbar_show_all_item,
@@ -935,6 +1027,9 @@ fn build_tray(initial: &QuickToggleState) -> Result<(tray_icon::TrayIcon, TrayIt
         centering_center_item,
         centering_just_in_view_item,
         centering_on_overflow_item,
+        center_columns_off_item,
+        center_columns_single_item,
+        center_columns_fit_item,
         placement_new_column_item,
         placement_in_column_item,
         update_item,
@@ -980,6 +1075,7 @@ fn map_menu_id_to_event(menu_id: &str) -> Option<TrayEvent> {
         menu_ids::TOGGLE_ACTIVE_BORDER => Some(TrayEvent::ToggleActiveBorder),
         menu_ids::TOGGLE_FOCUS_NEW_WINDOWS => Some(TrayEvent::ToggleFocusNewWindows),
         menu_ids::TOGGLE_FOCUS_FOLLOWS_MOUSE => Some(TrayEvent::ToggleFocusFollowsMouse),
+        menu_ids::TOGGLE_KEEP_AWAKE => Some(TrayEvent::ToggleKeepAwake),
         menu_ids::TASKBAR_HIDE_OFFSCREEN => Some(TrayEvent::SetTaskbarButtons(
             crate::config::TaskbarButtons::HideOffscreen,
         )),
@@ -993,6 +1089,9 @@ fn map_menu_id_to_event(menu_id: &str) -> Option<TrayEvent> {
         menu_ids::CENTERING_CENTER => Some(TrayEvent::SetCenteringCenter),
         menu_ids::CENTERING_JUST_IN_VIEW => Some(TrayEvent::SetCenteringJustInView),
         menu_ids::CENTERING_ON_OVERFLOW => Some(TrayEvent::SetCenteringOnOverflow),
+        menu_ids::CENTER_COLUMNS_OFF => Some(TrayEvent::SetCenterColumnsOff),
+        menu_ids::CENTER_COLUMNS_SINGLE => Some(TrayEvent::SetCenterColumnsSingle),
+        menu_ids::CENTER_COLUMNS_FIT => Some(TrayEvent::SetCenterColumnsFit),
         menu_ids::PLACEMENT_NEW_COLUMN => Some(TrayEvent::SetPlacementNewColumn),
         menu_ids::PLACEMENT_IN_COLUMN => Some(TrayEvent::SetPlacementInColumn),
         menu_ids::CHECK_UPDATES => Some(TrayEvent::OpenReleasesPage),
@@ -1227,9 +1326,11 @@ mod tests {
             active_border: AtomicBool::new(false),
             focus_new_windows: AtomicBool::new(false),
             focus_follows_mouse: AtomicBool::new(false),
+            keep_awake: AtomicBool::new(false),
             taskbar_buttons: AtomicU8::new(TASKBAR_HIDE_OFFSCREEN),
             auto_start: AtomicBool::new(false),
             centering_mode: AtomicU8::new(CENTERING_CENTER),
+            center_columns: AtomicU8::new(CENTER_COLUMNS_OFF),
             placement_mode: AtomicU8::new(PLACEMENT_NEW_COLUMN),
             once_placement: AtomicU8::new(ONCE_INACTIVE),
             available_update: Mutex::new(None),
@@ -1256,9 +1357,11 @@ mod tests {
             active_border: AtomicBool::new(false),
             focus_new_windows: AtomicBool::new(false),
             focus_follows_mouse: AtomicBool::new(false),
+            keep_awake: AtomicBool::new(false),
             taskbar_buttons: AtomicU8::new(TASKBAR_HIDE_OFFSCREEN),
             auto_start: AtomicBool::new(false),
             centering_mode: AtomicU8::new(CENTERING_CENTER),
+            center_columns: AtomicU8::new(CENTER_COLUMNS_OFF),
             placement_mode: AtomicU8::new(PLACEMENT_NEW_COLUMN),
             once_placement: AtomicU8::new(ONCE_INACTIVE),
             available_update: Mutex::new(None),
@@ -1376,6 +1479,18 @@ mod tests {
         assert!(matches!(
             map_menu_id_to_event(menu_ids::CENTERING_JUST_IN_VIEW),
             Some(TrayEvent::SetCenteringJustInView)
+        ));
+        assert!(matches!(
+            map_menu_id_to_event(menu_ids::CENTER_COLUMNS_OFF),
+            Some(TrayEvent::SetCenterColumnsOff)
+        ));
+        assert!(matches!(
+            map_menu_id_to_event(menu_ids::CENTER_COLUMNS_SINGLE),
+            Some(TrayEvent::SetCenterColumnsSingle)
+        ));
+        assert!(matches!(
+            map_menu_id_to_event(menu_ids::CENTER_COLUMNS_FIT),
+            Some(TrayEvent::SetCenterColumnsFit)
         ));
         for (id, expected) in [
             (

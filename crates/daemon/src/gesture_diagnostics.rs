@@ -254,7 +254,16 @@ pub fn start_capture(
                 ));
                 return;
             }
-            let mut file = match File::create(&path) {
+            let open = || -> std::io::Result<File> {
+                let directory = leopardwm_ipc::anchored_fs::AnchoredDir::for_path(
+                    path.parent().expect("capture log has a parent"),
+                )?;
+                let file = directory
+                    .open_write_shared(path.file_name().expect("capture log has a name"))?;
+                file.set_len(0)?;
+                Ok(file)
+            };
+            let mut file = match open() {
                 Ok(file) => file,
                 Err(e) => {
                     let _ = ready_tx.send(Err(e.to_string()));
@@ -766,6 +775,43 @@ mod tests {
         assert!(panic.is_err());
         let _guard = capture_test_guard();
         CAPTURE_TEST_LOCK.clear_poison();
+    }
+
+    #[test]
+    fn capture_refuses_junction_ancestor_without_creating_log() {
+        let _capture_guard = capture_test_guard();
+        leopardwm_ipc::anchored_fs::force_refuse_for_tests();
+        let root = test_dir();
+        let target = root.join("outside");
+        let link = root.join("link");
+        let target_logs = target.join("logs");
+        std::fs::create_dir_all(&target_logs).unwrap();
+        let output = std::process::Command::new("cmd")
+            .args(["/D", "/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&target)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let capture = start_capture(
+            &link.join("logs"),
+            test_header(1),
+            CaptureLimits::from_secs(1),
+        );
+        let refused = capture.is_none();
+        drop(capture);
+        let target_was_modified = std::fs::read_dir(&target_logs).unwrap().next().is_some();
+        std::fs::remove_dir(link).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(refused, "capture accepted a redirected ancestor");
+        assert!(
+            !target_was_modified,
+            "capture created a log in the junction target"
+        );
     }
 
     #[test]

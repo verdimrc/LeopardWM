@@ -5,7 +5,7 @@ use crate::enumeration::{
     should_filter_window_event_by_manageability,
 };
 use crate::recover_poisoned_mutex;
-use leopardwm_core_layout::WindowId;
+use leopardwm_core_layout::{Rect, WindowId};
 use std::sync::mpsc;
 use windows::Win32::Foundation::HWND;
 use windows::Win32::System::Threading::GetCurrentThreadId;
@@ -28,11 +28,18 @@ pub(crate) const EVENT_SYSTEM_MOVESIZESTART: u32 = 0x000A;
 pub(crate) const EVENT_SYSTEM_MOVESIZEEND: u32 = 0x000B;
 pub(crate) const EVENT_OBJECT_LOCATIONCHANGE: u32 = 0x800B;
 pub(crate) const EVENT_OBJECT_NAMECHANGE: u32 = 0x800C;
+pub(crate) const EVENT_OBJECT_UNCLOAKED: u32 = 0x8018;
 const OBJID_WINDOW: i32 = 0;
 const WINEVENT_OUTOFCONTEXT: u32 = 0x0000;
 const WINEVENT_SKIPOWNPROCESS: u32 = 0x0002;
 
 const WM_QUIT_WINEVENT_THREAD: u32 = WM_USER + 3;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MoveStartCapture {
+    pub rect: Rect,
+    pub generation: u64,
+}
 
 /// Window event types that the daemon needs to handle.
 #[derive(Debug, Clone)]
@@ -40,6 +47,8 @@ pub enum WindowEvent {
     /// A new window was created or shown, with the WinEvent timestamp in
     /// GetTickCount's domain.
     Created(WindowId, u32),
+    /// A window was uncloaked, with the WinEvent timestamp in GetTickCount's domain.
+    Uncloaked(WindowId, u32),
     /// A window was destroyed.
     Destroyed(WindowId),
     /// A window was hidden (e.g., close-to-tray apps using ShowWindow(SW_HIDE)),
@@ -59,7 +68,7 @@ pub enum WindowEvent {
     /// A window was moved or resized by the user.
     MovedOrResized(WindowId),
     /// User started dragging/resizing a window.
-    MoveSizeStart(WindowId),
+    MoveSizeStart(WindowId, Option<MoveStartCapture>),
     /// User finished dragging/resizing a window.
     MoveSizeEnd(WindowId),
     /// Display configuration changed (monitors added/removed/rearranged).
@@ -68,8 +77,8 @@ pub enum WindowEvent {
     /// taskbar toggled between auto-hide and always-on). Reconciled on a
     /// shorter debounce than `DisplayChange` since it settles quickly.
     WorkAreaChanged,
-    /// Mouse cursor entered a window (for focus-follows-mouse).
-    MouseEnterWindow(WindowId),
+    /// Mouse cursor entered a window, with focus-lock state captured on entry.
+    MouseEnterWindow(WindowId, bool),
     /// Mouse cursor left a manageable window for a non-manageable one (the
     /// taskbar, a popup, etc.). Cancels any pending focus-follows-mouse focus
     /// so a debounced focus doesn't fire on a window the cursor has left.
@@ -153,7 +162,8 @@ impl Drop for EventHookHandle {
 /// Also returns a receiver channel for the events.
 ///
 /// # Events Hooked
-/// - Window creation (EVENT_OBJECT_CREATE)
+/// - Window creation/show (EVENT_OBJECT_CREATE/SHOW)
+/// - Window uncloak (EVENT_OBJECT_UNCLOAKED)
 /// - Window destruction (EVENT_OBJECT_DESTROY)
 /// - Foreground change (EVENT_SYSTEM_FOREGROUND)
 /// - Minimize/restore (EVENT_SYSTEM_MINIMIZESTART/END)
@@ -186,6 +196,7 @@ pub fn install_event_hooks(
                     (EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE),
                     (EVENT_OBJECT_FOCUS, EVENT_OBJECT_FOCUS),
                     (EVENT_OBJECT_NAMECHANGE, EVENT_OBJECT_NAMECHANGE),
+                    (EVENT_OBJECT_UNCLOAKED, EVENT_OBJECT_UNCLOAKED),
                 ];
 
                 let mut hooks = Vec::new();
@@ -347,6 +358,7 @@ fn win_event_callback_inner(
 
     let window_event = match event {
         EVENT_OBJECT_CREATE | EVENT_OBJECT_SHOW => WindowEvent::Created(window_id, dwms_event_time),
+        EVENT_OBJECT_UNCLOAKED => WindowEvent::Uncloaked(window_id, dwms_event_time),
         EVENT_OBJECT_DESTROY => WindowEvent::Destroyed(window_id),
         EVENT_OBJECT_HIDE => WindowEvent::Hidden(window_id, dwms_event_time),
         EVENT_SYSTEM_FOREGROUND => focused_window_event(window_id, dwms_event_time),
@@ -365,7 +377,10 @@ fn win_event_callback_inner(
         }
         EVENT_SYSTEM_MINIMIZESTART => WindowEvent::Minimized(window_id, dwms_event_time),
         EVENT_SYSTEM_MINIMIZEEND => WindowEvent::Restored(window_id),
-        EVENT_SYSTEM_MOVESIZESTART => WindowEvent::MoveSizeStart(window_id),
+        EVENT_SYSTEM_MOVESIZESTART => WindowEvent::MoveSizeStart(
+            window_id,
+            crate::user_press::capture_move_size_start(window_id),
+        ),
         EVENT_SYSTEM_MOVESIZEEND => WindowEvent::MoveSizeEnd(window_id),
         EVENT_OBJECT_LOCATIONCHANGE => WindowEvent::MovedOrResized(window_id),
         EVENT_OBJECT_NAMECHANGE => WindowEvent::TitleChanged(window_id),

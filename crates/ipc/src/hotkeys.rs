@@ -4,6 +4,82 @@ use std::collections::HashMap;
 
 use serde::Serialize;
 
+/// Settings category in display order, independent of IPC and template groups.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HotkeyCategory {
+    Focus,
+    Move,
+    Resize,
+    ManageWindow,
+    Workspace,
+    Monitor,
+    #[serde(rename = "leopardwm")]
+    LeopardWM,
+}
+
+impl HotkeyCategory {
+    /// Stable identifier used by Settings and locale keys.
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Focus => "focus",
+            Self::Move => "move",
+            Self::Resize => "resize",
+            Self::ManageWindow => "manage_window",
+            Self::Workspace => "workspace",
+            Self::Monitor => "monitor",
+            Self::LeopardWM => "leopardwm",
+        }
+    }
+
+    /// English fallback heading.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Focus => "Focus",
+            Self::Move => "Move",
+            Self::Resize => "Resize",
+            Self::ManageWindow => "Manage Window",
+            Self::Workspace => "Workspace",
+            Self::Monitor => "Monitor",
+            Self::LeopardWM => "LeopardWM",
+        }
+    }
+
+    /// Whether Settings initially hides this category's rows.
+    pub fn collapsed_by_default(self) -> bool {
+        matches!(self, Self::Monitor | Self::LeopardWM)
+    }
+}
+
+/// Category metadata sent to Settings.
+#[derive(Debug, Serialize)]
+pub struct HotkeyCategoryInfo {
+    pub id: &'static str,
+    pub label: &'static str,
+    pub collapsed: bool,
+}
+
+/// Settings categories in display order.
+pub fn hotkey_categories() -> Vec<HotkeyCategoryInfo> {
+    use HotkeyCategory::*;
+    [
+        Focus,
+        Move,
+        Resize,
+        ManageWindow,
+        Workspace,
+        Monitor,
+        LeopardWM,
+    ]
+    .into_iter()
+    .map(|category| HotkeyCategoryInfo {
+        id: category.id(),
+        label: category.label(),
+        collapsed: category.collapsed_by_default(),
+    })
+    .collect()
+}
+
 /// A bindable action plus its presentation metadata.
 #[derive(Debug, Clone, Serialize)]
 pub struct HotkeyAction {
@@ -14,347 +90,558 @@ pub struct HotkeyAction {
     pub default_key: Option<String>,
     /// Human-readable label for the settings UI.
     pub label: String,
-    /// Section grouping (drives settings order and config-template comments).
+    /// Settings category.
+    pub category: HotkeyCategory,
+    /// Section grouping (drives IPC and config-template comments).
     #[serde(skip)]
     pub group: &'static str,
 }
 
-fn action(id: &str, default_key: Option<&str>, label: &str, group: &'static str) -> HotkeyAction {
+fn action(
+    id: &str,
+    default_key: Option<&str>,
+    label: &str,
+    group: &'static str,
+    category: HotkeyCategory,
+) -> HotkeyAction {
     HotkeyAction {
         id: id.to_string(),
         default_key: default_key.map(str::to_string),
         label: label.to_string(),
         group,
+        category,
     }
 }
 
 /// The ordered catalog of every bindable action. Order here is the display
-/// order in the settings UI; `group` drives section headers there and in
-/// the generated config template.
+/// order within each Settings category; `group` drives IPC and config-template sections.
 #[allow(clippy::too_many_lines)]
 pub fn hotkey_catalog() -> Vec<HotkeyAction> {
     let mut v = vec![
-        action("focus_left", Some("Ctrl+Alt+H"), "Focus left", "Focus"),
-        action("focus_right", Some("Ctrl+Alt+L"), "Focus right", "Focus"),
-        action("focus_up", Some("Ctrl+Alt+K"), "Focus up", "Focus"),
-        action("focus_down", Some("Ctrl+Alt+J"), "Focus down", "Focus"),
-        action("focus_next", None, "Focus next window", "Focus"),
-        action("focus_prev", None, "Focus previous window", "Focus"),
+        action(
+            "focus_left",
+            Some("Ctrl+Alt+H"),
+            "Focus left",
+            "Focus",
+            HotkeyCategory::Focus,
+        ),
+        action(
+            "focus_right",
+            Some("Ctrl+Alt+L"),
+            "Focus right",
+            "Focus",
+            HotkeyCategory::Focus,
+        ),
+        action(
+            "focus_up",
+            Some("Ctrl+Alt+K"),
+            "Focus up",
+            "Focus",
+            HotkeyCategory::Focus,
+        ),
+        action(
+            "focus_down",
+            Some("Ctrl+Alt+J"),
+            "Focus down",
+            "Focus",
+            HotkeyCategory::Focus,
+        ),
+        action(
+            "focus_next",
+            None,
+            "Focus next window",
+            "Focus",
+            HotkeyCategory::Focus,
+        ),
+        action(
+            "focus_prev",
+            None,
+            "Focus previous window",
+            "Focus",
+            HotkeyCategory::Focus,
+        ),
         action(
             "focus_start",
             Some("Ctrl+Alt+Home"),
             "Focus start of strip",
             "Focus",
+            HotkeyCategory::Focus,
         ),
         action(
             "focus_end",
             Some("Ctrl+Alt+End"),
             "Focus end of strip",
             "Focus",
+            HotkeyCategory::Focus,
+        ),
+        action(
+            "switch_focus_floating_tiling",
+            None,
+            "Switch focus between floating and tiled",
+            "Focus",
+            HotkeyCategory::Focus,
+        ),
+        action(
+            "focus_floating",
+            None,
+            "Focus floating window",
+            "Focus",
+            HotkeyCategory::Focus,
+        ),
+        action(
+            "focus_tiling",
+            None,
+            "Focus tiled window",
+            "Focus",
+            HotkeyCategory::Focus,
+        ),
+        action(
+            "focus_row_up",
+            None,
+            "Focus row above",
+            "Focus",
+            HotkeyCategory::Focus,
+        ),
+        action(
+            "focus_row_down",
+            None,
+            "Focus row below",
+            "Focus",
+            HotkeyCategory::Focus,
         ),
         action(
             "move_column_left",
             Some("Ctrl+Alt+Shift+H"),
             "Move column left",
             "Move column",
+            HotkeyCategory::Move,
         ),
         action(
             "move_column_right",
             Some("Ctrl+Alt+Shift+L"),
             "Move column right",
             "Move column",
+            HotkeyCategory::Move,
         ),
         action(
             "move_column_to_start",
             Some("Ctrl+Alt+Shift+Home"),
             "Move column to start",
             "Move column",
+            HotkeyCategory::Move,
         ),
         action(
             "move_column_to_end",
             Some("Ctrl+Alt+Shift+End"),
             "Move column to end",
             "Move column",
+            HotkeyCategory::Move,
         ),
         action(
             "move_window_left",
             Some("Ctrl+Alt+["),
             "Move window left",
             "Move window to adjacent column",
+            HotkeyCategory::Move,
         ),
         action(
             "move_window_right",
             Some("Ctrl+Alt+]"),
             "Move window right",
             "Move window to adjacent column",
+            HotkeyCategory::Move,
         ),
         action(
             "expel_to_left",
             Some("Ctrl+Alt+Shift+["),
             "Expel to left",
             "Expel window to a new column",
+            HotkeyCategory::Move,
         ),
         action(
             "expel_to_right",
             Some("Ctrl+Alt+Shift+]"),
             "Expel to right",
             "Expel window to a new column",
+            HotkeyCategory::Move,
         ),
         action(
             "consume_from_left",
             Some("Ctrl+Alt+,"),
             "Consume from left",
             "Stack the neighbor's window into the focused column",
+            HotkeyCategory::Move,
         ),
         action(
             "consume_from_right",
             Some("Ctrl+Alt+."),
             "Consume from right",
             "Stack the neighbor's window into the focused column",
+            HotkeyCategory::Move,
         ),
         action(
             "move_window_up",
             Some("Ctrl+Alt+Shift+K"),
             "Move window up",
             "Move window within column",
+            HotkeyCategory::Move,
         ),
         action(
             "move_window_down",
             Some("Ctrl+Alt+Shift+J"),
             "Move window down",
             "Move window within column",
+            HotkeyCategory::Move,
+        ),
+        action(
+            "move_window_to_row_up",
+            None,
+            "Move window to row above",
+            "Move window within column",
+            HotkeyCategory::Move,
+        ),
+        action(
+            "move_window_to_row_down",
+            None,
+            "Move window to row below",
+            "Move window within column",
+            HotkeyCategory::Move,
         ),
         action(
             "cycle_width_down",
             Some("Ctrl+Alt+-"),
             "Cycle width down",
             "Column width",
+            HotkeyCategory::Resize,
         ),
         action(
             "cycle_width_up",
             Some("Ctrl+Alt+="),
             "Cycle width up",
             "Column width",
+            HotkeyCategory::Resize,
         ),
-        action("cycle_width", None, "Cycle width", "Column width"),
+        action(
+            "cycle_width",
+            None,
+            "Cycle width",
+            "Column width",
+            HotkeyCategory::Resize,
+        ),
         action(
             "equalize_widths",
             Some("Ctrl+Alt+0"),
             "Equalize widths",
             "Column width",
+            HotkeyCategory::Resize,
         ),
         action(
             "cycle_height_down",
             Some("Ctrl+Alt+Shift+-"),
             "Cycle height down",
             "Window height",
+            HotkeyCategory::Resize,
         ),
         action(
             "cycle_height_up",
             Some("Ctrl+Alt+Shift+="),
             "Cycle height up",
             "Window height",
+            HotkeyCategory::Resize,
         ),
-        action("cycle_height", None, "Cycle height", "Window height"),
+        action(
+            "cycle_height",
+            None,
+            "Cycle height",
+            "Window height",
+            HotkeyCategory::Resize,
+        ),
         action(
             "equalize_heights",
             Some("Ctrl+Alt+Shift+0"),
             "Equalize heights",
             "Window height",
+            HotkeyCategory::Resize,
         ),
         action(
             "focus_monitor_left",
             Some("Ctrl+Alt+Win+,"),
             "Focus monitor left",
             "Monitor focus",
+            HotkeyCategory::Monitor,
         ),
         action(
             "focus_monitor_right",
             Some("Ctrl+Alt+Win+."),
             "Focus monitor right",
             "Monitor focus",
+            HotkeyCategory::Monitor,
         ),
         action(
             "focus_monitor_up",
             Some("Ctrl+Alt+Win+Up"),
             "Focus monitor up",
             "Monitor focus",
+            HotkeyCategory::Monitor,
         ),
         action(
             "focus_monitor_down",
             Some("Ctrl+Alt+Win+Down"),
             "Focus monitor down",
             "Monitor focus",
+            HotkeyCategory::Monitor,
         ),
         action(
             "move_to_monitor_left",
             Some("Ctrl+Alt+Win+Shift+,"),
             "Move to monitor left",
             "Move window to monitor",
+            HotkeyCategory::Monitor,
         ),
         action(
             "move_to_monitor_right",
             Some("Ctrl+Alt+Win+Shift+."),
             "Move to monitor right",
             "Move window to monitor",
+            HotkeyCategory::Monitor,
         ),
         action(
             "move_to_monitor_up",
             Some("Ctrl+Alt+Win+Shift+Up"),
             "Move to monitor up",
             "Move window to monitor",
+            HotkeyCategory::Monitor,
         ),
         action(
             "move_to_monitor_down",
             Some("Ctrl+Alt+Win+Shift+Down"),
             "Move to monitor down",
             "Move window to monitor",
+            HotkeyCategory::Monitor,
         ),
         action(
             "center_column",
             Some("Ctrl+Alt+C"),
             "Center column",
             "Column layout",
+            HotkeyCategory::Focus,
+        ),
+        action(
+            "align_column_left",
+            None,
+            "Align column left",
+            "Column layout",
+            HotkeyCategory::Focus,
+        ),
+        action(
+            "align_column_right",
+            None,
+            "Align column right",
+            "Column layout",
+            HotkeyCategory::Focus,
         ),
         action(
             "maximize_column",
             Some("Ctrl+Alt+M"),
             "Maximize column",
             "Column layout",
+            HotkeyCategory::Resize,
         ),
         action(
             "scroll_left",
             None,
             "Scroll viewport left by 100 px",
             "Column layout",
+            HotkeyCategory::LeopardWM,
         ),
         action(
             "scroll_right",
             None,
             "Scroll viewport right by 100 px",
             "Column layout",
+            HotkeyCategory::LeopardWM,
         ),
-        action("close_window", Some("Ctrl+Alt+W"), "Close window", "Window"),
+        action(
+            "nudge_left",
+            None,
+            "Nudge window left",
+            "Column layout",
+            HotkeyCategory::Move,
+        ),
+        action(
+            "nudge_right",
+            None,
+            "Nudge window right",
+            "Column layout",
+            HotkeyCategory::Move,
+        ),
+        action(
+            "close_window",
+            Some("Ctrl+Alt+W"),
+            "Close window",
+            "Window",
+            HotkeyCategory::ManageWindow,
+        ),
         action(
             "toggle_floating",
             Some("Ctrl+Alt+F"),
             "Toggle floating",
             "Window",
+            HotkeyCategory::ManageWindow,
+        ),
+        action(
+            "float",
+            None,
+            "Float window",
+            "Window",
+            HotkeyCategory::ManageWindow,
+        ),
+        action(
+            "tile",
+            None,
+            "Tile window",
+            "Window",
+            HotkeyCategory::ManageWindow,
         ),
         action(
             "toggle_fullscreen",
             Some("Ctrl+Alt+Shift+F"),
             "Toggle fullscreen",
             "Window",
+            HotkeyCategory::ManageWindow,
         ),
         action(
             "toggle_tabbed",
             Some("Ctrl+Alt+T"),
             "Toggle tabbed column",
             "Window",
+            HotkeyCategory::ManageWindow,
         ),
         action(
             "scratchpad_toggle",
             Some("Ctrl+Alt+S"),
             "Toggle scratchpad",
             "Window",
+            HotkeyCategory::ManageWindow,
         ),
         action(
             "scratchpad_stash",
             Some("Ctrl+Alt+Shift+S"),
             "Stash to scratchpad",
             "Window",
+            HotkeyCategory::ManageWindow,
         ),
         action(
             "toggle_sticky",
             Some("Ctrl+Alt+Y"),
             "Toggle sticky",
             "Window",
+            HotkeyCategory::ManageWindow,
         ),
         action(
             "toggle_new_window_placement",
             None,
             "Toggle new-window placement (new column / in column)",
             "Window",
+            HotkeyCategory::LeopardWM,
         ),
         action(
             "toggle_new_window_placement_once",
             Some("Ctrl+Alt+Shift+N"),
             "Toggle new-window placement once (next window only, press again to cancel)",
             "Window",
+            HotkeyCategory::LeopardWM,
         ),
         action(
             "toggle_ignore",
             None,
             "Toggle ignore for the foreground window",
             "Window",
+            HotkeyCategory::LeopardWM,
         ),
         action(
             "toggle_pause",
             Some("Ctrl+Alt+P"),
             "Toggle pause",
             "Session",
+            HotkeyCategory::LeopardWM,
         ),
-        action("refresh", Some("Ctrl+Alt+R"), "Refresh", "Session"),
+        action(
+            "refresh",
+            Some("Ctrl+Alt+R"),
+            "Refresh",
+            "Session",
+            HotkeyCategory::LeopardWM,
+        ),
         action(
             "reload",
             Some("Ctrl+Alt+Shift+R"),
             "Reload config",
             "Session",
+            HotkeyCategory::LeopardWM,
         ),
         action(
             "panic_revert",
             Some("Win+Ctrl+Escape"),
             "Emergency restore",
             "Session",
+            HotkeyCategory::LeopardWM,
         ),
         action(
             "toggle_desktop_peek",
             Some("Ctrl+Alt+Shift+'"),
             "Toggle desktop peek (shift focused window right)",
             "Window",
+            HotkeyCategory::ManageWindow,
         ),
         action(
             "toggle_desktop_peek_anchored",
             Some("Ctrl+Alt+'"),
             "Toggle desktop peek (keep focused window in place)",
             "Window",
+            HotkeyCategory::ManageWindow,
         ),
         action(
             "toggle_overview",
             Some("Ctrl+Alt+Space"),
             "Toggle overview",
             "Workspaces",
+            HotkeyCategory::ManageWindow,
         ),
         action(
             "toggle_overview_all",
             Some("Ctrl+Alt+Win+Space"),
             "Toggle overview on all monitors",
             "Workspaces",
+            HotkeyCategory::ManageWindow,
         ),
         action(
             "workspace_prev",
             Some("Ctrl+Alt+Shift+Left"),
             "Previous workspace",
             "Workspaces",
+            HotkeyCategory::Workspace,
         ),
         action(
             "workspace_next",
             Some("Ctrl+Alt+Shift+Right"),
             "Next workspace",
             "Workspaces",
+            HotkeyCategory::Workspace,
         ),
         action(
             "move_to_workspace_prev",
             Some("Ctrl+Alt+Shift+PageUp"),
             "Move window to previous workspace",
             "Move window to workspace",
+            HotkeyCategory::Workspace,
         ),
         action(
             "move_to_workspace_next",
             Some("Ctrl+Alt+Shift+PageDown"),
             "Move window to next workspace",
             "Move window to workspace",
+            HotkeyCategory::Workspace,
         ),
     ];
     for i in 1..=9u8 {
@@ -363,6 +650,7 @@ pub fn hotkey_catalog() -> Vec<HotkeyAction> {
             Some(&format!("Ctrl+Alt+{i}")),
             &format!("Workspace {i}"),
             "Switch to workspace",
+            HotkeyCategory::Workspace,
         ));
     }
     for i in 1..=9u8 {
@@ -371,6 +659,7 @@ pub fn hotkey_catalog() -> Vec<HotkeyAction> {
             Some(&format!("Ctrl+Alt+Shift+{i}")),
             &format!("Move to Workspace {i}"),
             "Move window to workspace",
+            HotkeyCategory::Workspace,
         ));
     }
     v
@@ -419,6 +708,13 @@ pub fn command_for_action(id: &str) -> Option<crate::IpcCommand> {
         "focus_prev" => IpcCommand::FocusPrev,
         "focus_start" => IpcCommand::FocusStart,
         "focus_end" => IpcCommand::FocusEnd,
+        "focus_floating" => IpcCommand::FocusFloating,
+        "focus_tiling" => IpcCommand::FocusTiling,
+        "switch_focus_floating_tiling" => IpcCommand::SwitchFocusFloatingTiling,
+        "focus_row_up" => IpcCommand::FocusRowUp,
+        "focus_row_down" => IpcCommand::FocusRowDown,
+        "move_window_to_row_up" => IpcCommand::MoveWindowToRowUp,
+        "move_window_to_row_down" => IpcCommand::MoveWindowToRowDown,
         "move_column_left" => IpcCommand::MoveColumnLeft,
         "move_column_right" => IpcCommand::MoveColumnRight,
         "move_column_to_start" => IpcCommand::MoveColumnToStart,
@@ -440,12 +736,16 @@ pub fn command_for_action(id: &str) -> Option<crate::IpcCommand> {
         "equalize_heights" => IpcCommand::EqualizeColumnHeights,
         "scroll_left" => IpcCommand::Scroll { delta: -100.0 },
         "scroll_right" => IpcCommand::Scroll { delta: 100.0 },
+        "nudge_left" => IpcCommand::NudgeLeft,
+        "nudge_right" => IpcCommand::NudgeRight,
         "refresh" => IpcCommand::Refresh,
         "reload" => IpcCommand::Reload,
         "panic_revert" => IpcCommand::PanicRevert,
         "toggle_pause" => IpcCommand::TogglePause,
         "close_window" => IpcCommand::CloseWindow,
         "toggle_floating" => IpcCommand::ToggleFloating,
+        "float" => IpcCommand::Float,
+        "tile" => IpcCommand::Tile,
         "toggle_fullscreen" => IpcCommand::ToggleFullscreen,
         "scratchpad_stash" => IpcCommand::ScratchpadStash,
         "scratchpad_toggle" => IpcCommand::ScratchpadToggle,
@@ -458,6 +758,8 @@ pub fn command_for_action(id: &str) -> Option<crate::IpcCommand> {
         "width_half" => IpcCommand::SetColumnWidth { fraction: 0.5 },
         "width_two_thirds" => IpcCommand::SetColumnWidth { fraction: 0.667 },
         "center_column" => IpcCommand::CenterColumn,
+        "align_column_left" => IpcCommand::AlignColumnLeft,
+        "align_column_right" => IpcCommand::AlignColumnRight,
         "maximize_column" => IpcCommand::MaximizeColumn,
         "equalize_widths" => IpcCommand::EqualizeColumnWidths,
         "move_window_left" => IpcCommand::MoveWindowLeft,
@@ -504,6 +806,52 @@ mod tests {
     use crate::IpcCommand;
 
     #[test]
+    fn settings_categories_cover_catalog_and_have_expected_defaults() {
+        use HotkeyCategory::*;
+        let catalog = hotkey_catalog();
+        let categories = hotkey_categories();
+        let expected = [
+            Focus,
+            Move,
+            Resize,
+            ManageWindow,
+            Workspace,
+            Monitor,
+            LeopardWM,
+        ];
+        assert_eq!(categories.len(), expected.len());
+        for (info, category) in categories.iter().zip(expected) {
+            assert_eq!(info.id, category.id());
+            assert_eq!(serde_json::to_value(category).unwrap(), info.id);
+            assert_eq!(info.collapsed, matches!(category, Monitor | LeopardWM));
+            assert!(
+                catalog.iter().any(|action| action.category == category),
+                "{}",
+                info.id
+            );
+        }
+        for (id, category) in [
+            ("align_column_left", Focus),
+            ("nudge_left", Move),
+            ("maximize_column", Resize),
+            ("toggle_overview", ManageWindow),
+            ("workspace_next", Workspace),
+            ("focus_monitor_left", Monitor),
+            ("panic_revert", LeopardWM),
+        ] {
+            assert_eq!(
+                catalog
+                    .iter()
+                    .find(|action| action.id == id)
+                    .unwrap()
+                    .category,
+                category,
+                "{id}"
+            );
+        }
+    }
+
+    #[test]
     fn test_wrap_cycle_actions_are_unbound_and_parse() {
         let catalog = hotkey_catalog();
         for (id, expected) in [
@@ -521,6 +869,68 @@ mod tests {
     }
 
     #[test]
+    fn test_layer_focus_catalog_and_wire_contract() {
+        let catalog = hotkey_catalog();
+        let end = catalog
+            .iter()
+            .position(|action| action.id == "focus_end")
+            .unwrap();
+        for (offset, id, label, expected) in [
+            (
+                1,
+                "switch_focus_floating_tiling",
+                "Switch focus between floating and tiled",
+                IpcCommand::SwitchFocusFloatingTiling,
+            ),
+            (
+                2,
+                "focus_floating",
+                "Focus floating window",
+                IpcCommand::FocusFloating,
+            ),
+            (
+                3,
+                "focus_tiling",
+                "Focus tiled window",
+                IpcCommand::FocusTiling,
+            ),
+        ] {
+            let action = &catalog[end + offset];
+            assert_eq!(action.id, id);
+            assert_eq!(action.label, label);
+            assert_eq!(action.group, "Focus");
+            assert_eq!(action.default_key, None);
+            assert_eq!(command_for_action(id), Some(expected.clone()));
+            let wire = format!(r#"{{"type":"{id}"}}"#);
+            assert_eq!(serde_json::to_string(&expected).unwrap(), wire);
+            assert_eq!(serde_json::from_str::<IpcCommand>(&wire).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn test_float_tile_catalog_and_wire_contract() {
+        let catalog = hotkey_catalog();
+        let toggle = catalog
+            .iter()
+            .position(|action| action.id == "toggle_floating")
+            .unwrap();
+        for (offset, id, label, expected) in [
+            (1, "float", "Float window", IpcCommand::Float),
+            (2, "tile", "Tile window", IpcCommand::Tile),
+        ] {
+            let action = &catalog[toggle + offset];
+            assert_eq!(action.id, id);
+            assert_eq!(action.label, label);
+            assert_eq!(action.group, "Window");
+            assert_eq!(action.default_key, None);
+            assert_eq!(command_for_action(id), Some(expected.clone()));
+            let wire = format!(r#"{{"type":"{id}"}}"#);
+            assert_eq!(serde_json::to_string(&expected).unwrap(), wire);
+            assert_eq!(serde_json::from_str::<IpcCommand>(&wire).unwrap(), expected);
+        }
+    }
+
+    #[test]
     fn test_gesture_actions_are_catalogued_without_default_bindings() {
         let catalog = hotkey_catalog();
         for (id, expected) in [
@@ -528,10 +938,83 @@ mod tests {
             ("focus_prev", IpcCommand::FocusPrev),
             ("scroll_left", IpcCommand::Scroll { delta: -100.0 }),
             ("scroll_right", IpcCommand::Scroll { delta: 100.0 }),
+            ("align_column_left", IpcCommand::AlignColumnLeft),
+            ("align_column_right", IpcCommand::AlignColumnRight),
+            ("nudge_left", IpcCommand::NudgeLeft),
+            ("nudge_right", IpcCommand::NudgeRight),
         ] {
             let action = catalog.iter().find(|action| action.id == id).expect(id);
             assert!(action.default_key.is_none(), "{id} must remain unbound");
             assert_eq!(command_for_action(id), Some(expected));
+        }
+    }
+
+    #[test]
+    fn alignment_catalog_and_wire_contract() {
+        let catalog = hotkey_catalog();
+        let center = catalog
+            .iter()
+            .position(|action| action.id == "center_column")
+            .unwrap();
+        for (offset, id, label, command) in [
+            (
+                1,
+                "align_column_left",
+                "Align column left",
+                IpcCommand::AlignColumnLeft,
+            ),
+            (
+                2,
+                "align_column_right",
+                "Align column right",
+                IpcCommand::AlignColumnRight,
+            ),
+        ] {
+            let action = &catalog[center + offset];
+            assert_eq!(
+                (
+                    &*action.id,
+                    &*action.label,
+                    action.group,
+                    &action.default_key
+                ),
+                (id, label, "Column layout", &None)
+            );
+            let wire = format!(r#"{{"type":"{id}"}}"#);
+            assert_eq!(serde_json::to_string(&command).unwrap(), wire);
+            assert_eq!(serde_json::from_str::<IpcCommand>(&wire).unwrap(), command);
+        }
+    }
+
+    #[test]
+    fn nudge_catalog_and_wire_contract() {
+        let catalog = hotkey_catalog();
+        let scroll_right = catalog
+            .iter()
+            .position(|action| action.id == "scroll_right")
+            .unwrap();
+        for (offset, id, label, command) in [
+            (1, "nudge_left", "Nudge window left", IpcCommand::NudgeLeft),
+            (
+                2,
+                "nudge_right",
+                "Nudge window right",
+                IpcCommand::NudgeRight,
+            ),
+        ] {
+            let action = &catalog[scroll_right + offset];
+            assert_eq!(
+                (
+                    &*action.id,
+                    &*action.label,
+                    action.group,
+                    &action.default_key
+                ),
+                (id, label, "Column layout", &None)
+            );
+            let wire = format!(r#"{{"type":"{id}"}}"#);
+            assert_eq!(serde_json::to_string(&command).unwrap(), wire);
+            assert_eq!(serde_json::from_str::<IpcCommand>(&wire).unwrap(), command);
         }
     }
 
